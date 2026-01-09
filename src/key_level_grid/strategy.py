@@ -163,6 +163,7 @@ class KeyLevelGridStrategy:
         
         # Telegram 通知
         self._notifier: Optional["NotificationManager"] = None
+        self._tg_bot = None  # Telegram Bot 实例
         self._init_notifier()
     
     def _init_executor(self) -> None:
@@ -246,9 +247,9 @@ class KeyLevelGridStrategy:
             )
             
             # 创建 Bot 和通知管理器
-            bot = KeyLevelTelegramBot(tg_config, strategy=self)
+            self._tg_bot = KeyLevelTelegramBot(tg_config, strategy=self)
             self._notifier = NotificationManager(
-                bot=bot, 
+                bot=self._tg_bot, 
                 config=notify_config,
                 bot_token=config.tg_bot_token,
                 chat_id=config.tg_chat_id,
@@ -377,6 +378,14 @@ class KeyLevelGridStrategy:
         # 启动 WebSocket 订阅
         self.kline_feed.start_ws_subscription(self._on_kline_close)
         
+        # 启动 Telegram Bot（如果已配置）
+        if self._tg_bot:
+            try:
+                await self._tg_bot.start()
+                self.logger.info("📱 Telegram Bot 已启动，可响应命令")
+            except Exception as e:
+                self.logger.error(f"Telegram Bot 启动失败: {e}")
+        
         # 标记是否已发送启动通知
         self._startup_notified = False
         
@@ -405,6 +414,15 @@ class KeyLevelGridStrategy:
         """停止策略"""
         self._running = False
         await self.kline_feed.stop()
+        
+        # 停止 Telegram Bot
+        if self._tg_bot:
+            try:
+                await self._tg_bot.stop()
+                self.logger.info("📱 Telegram Bot 已停止")
+            except Exception as e:
+                self.logger.error(f"Telegram Bot 停止失败: {e}")
+        
         self.logger.info("策略已停止")
         
         # 发送停止通知
