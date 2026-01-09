@@ -373,10 +373,17 @@ async def run_strategy(config_path: str):
     # 加载策略
     strategy = KeyLevelGridStrategy.from_yaml(config_path)
     
+    # 显示配置信息（包括周期）
+    kline_cfg = strategy.config.kline_config
+    primary_tf = kline_cfg.primary_timeframe.value
+    aux_tfs = [tf.value for tf in kline_cfg.auxiliary_timeframes]
+    
     console.print(Panel.fit(
         f"Symbol: {strategy.config.symbol}\n"
         f"Exchange: {strategy.config.exchange}\n"
-        f"Mode: {'Dry Run' if strategy.config.dry_run else 'Live'}",
+        f"Mode: {'Dry Run' if strategy.config.dry_run else 'Live'}\n"
+        f"主周期: {primary_tf}\n"
+        f"辅助周期: {', '.join(aux_tfs)}",
         title="✅ 策略已加载"
     ))
     
