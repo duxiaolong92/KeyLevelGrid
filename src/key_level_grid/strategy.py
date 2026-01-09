@@ -1048,9 +1048,11 @@ class KeyLevelGridStrategy:
         3. 无持仓 → 取消止损单
         """
         if self.config.dry_run or not self._executor:
+            self.logger.debug("止损单检查: dry_run 或无执行器，跳过")
             return
         
         if not self.position_manager.state:
+            self.logger.debug("止损单检查: 无 position_manager.state，跳过")
             return
         
         import time
@@ -1061,8 +1063,13 @@ class KeyLevelGridStrategy:
         # 获取网格底线（止损价）
         grid_floor = self.position_manager.state.grid_floor if self.position_manager.state else 0
         
+        self.logger.debug(
+            f"止损单检查: current_contracts={current_contracts}, grid_floor={grid_floor}, "
+            f"sl_order_id={self._stop_loss_order_id}, sl_contracts={self._stop_loss_contracts}"
+        )
+        
         if grid_floor <= 0:
-            self.logger.debug("无有效网格底线，跳过止损单更新")
+            self.logger.warning(f"⚠️ 网格底线无效 (grid_floor={grid_floor})，跳过止损单更新")
             return
         
         # 情况1: 无持仓，但有止损单 → 取消止损单
@@ -1082,15 +1089,19 @@ class KeyLevelGridStrategy:
         
         # 情况4: 有持仓，持仓变化或无止损单 → 创建/更新止损单
         self.logger.info(
-            f"🛡️ 更新止损单: {self._stop_loss_contracts}张 → {current_contracts}张 @ {grid_floor:.2f}"
+            f"🛡️ 准备更新止损单: {self._stop_loss_contracts}张 → {current_contracts}张 @ {grid_floor:.2f}"
         )
         
         # 先取消旧止损单
         if self._stop_loss_order_id:
+            self.logger.info(f"🔄 取消旧止损单: ID={self._stop_loss_order_id}")
             await self._cancel_stop_loss_order()
         
         # 提交新止损单
-        await self._submit_stop_loss_order(current_contracts, grid_floor)
+        self.logger.info(f"📤 开始提交新止损单: {current_contracts}张 @ {grid_floor:.2f}")
+        success = await self._submit_stop_loss_order(current_contracts, grid_floor)
+        if not success:
+            self.logger.error(f"❌ 止损单提交失败，将在下次循环重试")
     
     async def _submit_stop_loss_order(self, contracts: int, trigger_price: float) -> bool:
         """
