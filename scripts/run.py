@@ -407,6 +407,11 @@ async def run_strategy(config_path: str):
 
 
 def main():
+    # 初始化日志文件
+    from key_level_grid.utils.logger import setup_file_logging
+    log_file = setup_file_logging()
+    console.print(f"[dim]📝 日志文件: {log_file}[/dim]")
+    
     parser = argparse.ArgumentParser(description="Key Level Grid Strategy Runner")
     parser.add_argument(
         "--config", "-c",
