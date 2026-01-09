@@ -1122,17 +1122,20 @@ class KeyLevelGridStrategy:
         gate_symbol = self._convert_to_gate_symbol(self.config.symbol)
         
         try:
-            # 创建止损订单
+            import uuid
+            
+            # 创建止损订单（使用 Order.create 或手动提供 order_id）
             sl_order = Order(
+                order_id=f"sl_{uuid.uuid4().hex[:8]}",  # 生成唯一订单ID
                 symbol=gate_symbol,
                 side=OrderSide.SELL,
                 order_type=OrderType.MARKET,  # 触发后市价卖出
-                amount=contracts,
+                quantity=contracts,  # 修正: 使用 quantity 而非 amount
                 price=0,  # 市价止损，价格为 0
                 reduce_only=True,
             )
             
-            # 设置触发参数
+            # 设置触发参数（计划委托）
             sl_order.metadata['order_mode'] = 'trigger'  # 标记为计划委托
             sl_order.metadata['triggerPrice'] = trigger_price
             sl_order.metadata['rule'] = 2  # 2 = <= (价格跌破触发)
