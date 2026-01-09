@@ -123,3 +123,37 @@ api:
   key_env: "GATE_KLG_API_KEY"
   secret_env: "GATE_KLG_API_SECRET"
   passphrase_env: ""          # 若有子账户/额外口令可填，否则留空
+
+# ============================================
+# Telegram 通知配置
+# ============================================
+telegram:
+  # 基础配置（从环境变量读取）
+  enabled: false              # 是否启用 Telegram 通知
+  bot_token_env: "TG_BOT_TOKEN"
+  chat_id_env: "TG_CHAT_ID"
+  
+  # 通知开关
+  notifications:
+    # 必要通知（建议开启）
+    startup: true             # 启动通知
+    shutdown: true            # 停止通知
+    error: true               # 错误通知
+    order_filled: true        # 成交通知
+    
+    # 可选通知
+    order_placed: false       # 挂单通知（较频繁，建议关闭）
+    grid_rebuild: true        # 网格重建通知
+    orders_summary: true      # 挂单汇总（启动时发送）
+    
+    # 风险通知
+    risk_warning: true        # 风险预警
+    near_stop_loss_pct: 0.02  # 距止损预警阈值 2%
+    
+    # 汇总通知
+    daily_summary: true       # 每日汇总
+    daily_summary_time: "20:00"
+    
+    # 心跳（可选）
+    heartbeat: false          # 心跳通知
+    heartbeat_interval_hours: 4

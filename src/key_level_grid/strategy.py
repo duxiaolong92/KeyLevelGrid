@@ -55,9 +55,12 @@ class KeyLevelGridConfig:
     auto_trade: bool = False              # 自动交易 (需TG确认)
     
     # Telegram
-    tg_enabled: bool = True
+    tg_enabled: bool = False
     tg_confirmation: bool = True
     tg_timeout_sec: int = 60
+    tg_bot_token: str = ""
+    tg_chat_id: str = ""
+    tg_notify_config: dict = None  # 通知配置
     
     def __post_init__(self):
         if self.kline_config is None:
@@ -157,6 +160,10 @@ class KeyLevelGridStrategy:
         # 回调
         self._on_signal_callback = None
         self._on_trade_callback = None
+        
+        # Telegram 通知
+        self._notifier: Optional["NotificationManager"] = None
+        self._init_notifier()
     
     def _init_executor(self) -> None:
         """初始化交易所执行器"""
@@ -197,6 +204,56 @@ class KeyLevelGridStrategy:
                 f"(exchange={config.exchange}, api_key_env={config.api_key_env})"
             )
             self._executor = GateExecutor(paper_trading=True, safety_config=safety_config)
+    
+    def _init_notifier(self) -> None:
+        """初始化 Telegram 通知器"""
+        config = self.config
+        
+        if not config.tg_enabled:
+            self.logger.info("📵 Telegram 通知未启用")
+            return
+        
+        if not config.tg_bot_token or not config.tg_chat_id:
+            self.logger.warning("⚠️ Telegram 配置不完整，通知功能已禁用")
+            return
+        
+        try:
+            from key_level_grid.telegram.notify import NotificationManager, NotifyConfig
+            from key_level_grid.telegram.bot import KeyLevelTelegramBot, TelegramConfig
+            
+            # 创建通知配置
+            notify_raw = config.tg_notify_config or {}
+            notify_config = NotifyConfig(
+                startup=notify_raw.get('startup', True),
+                shutdown=notify_raw.get('shutdown', True),
+                error=notify_raw.get('error', True),
+                order_filled=notify_raw.get('order_filled', True),
+                order_placed=notify_raw.get('order_placed', False),
+                grid_rebuild=notify_raw.get('grid_rebuild', True),
+                orders_summary=notify_raw.get('orders_summary', True),
+                risk_warning=notify_raw.get('risk_warning', True),
+                near_stop_loss_pct=notify_raw.get('near_stop_loss_pct', 0.02),
+                daily_summary=notify_raw.get('daily_summary', True),
+                daily_summary_time=notify_raw.get('daily_summary_time', '20:00'),
+                heartbeat=notify_raw.get('heartbeat', False),
+                heartbeat_interval_hours=notify_raw.get('heartbeat_interval_hours', 4),
+            )
+            
+            # 创建 Bot 配置
+            tg_config = TelegramConfig(
+                bot_token=config.tg_bot_token,
+                chat_id=config.tg_chat_id,
+            )
+            
+            # 创建 Bot 和通知管理器
+            bot = KeyLevelTelegramBot(tg_config, strategy=self)
+            self._notifier = NotificationManager(bot, notify_config)
+            
+            self.logger.info("📱 Telegram 通知已启用")
+        except ImportError as e:
+            self.logger.warning(f"⚠️ Telegram 模块导入失败: {e}")
+        except Exception as e:
+            self.logger.error(f"❌ 初始化 Telegram 通知失败: {e}")
     
     @classmethod
     def from_yaml(cls, config_path: str) -> "KeyLevelGridStrategy":
@@ -269,6 +326,13 @@ class KeyLevelGridStrategy:
         # API 配置
         api_config = raw_config.get('api', {})
         
+        # Telegram 配置
+        tg_config = raw_config.get('telegram', {})
+        tg_enabled = tg_config.get('enabled', False)
+        tg_bot_token = os.getenv(tg_config.get('bot_token_env', 'TG_BOT_TOKEN'), '')
+        tg_chat_id = os.getenv(tg_config.get('chat_id_env', 'TG_CHAT_ID'), '')
+        tg_notify_config = tg_config.get('notifications', {})
+        
         config = KeyLevelGridConfig(
             symbol=symbol,
             exchange=trading.get('exchange', 'binance'),
@@ -283,6 +347,10 @@ class KeyLevelGridStrategy:
             position_config=position_config,
             grid_config=grid_config,
             dry_run=raw_config.get('dry_run', True),
+            tg_enabled=tg_enabled,
+            tg_bot_token=tg_bot_token,
+            tg_chat_id=tg_chat_id,
+            tg_notify_config=tg_notify_config,
         )
         
         return cls(config)
@@ -304,24 +372,38 @@ class KeyLevelGridStrategy:
         # 启动 WebSocket 订阅
         self.kline_feed.start_ws_subscription(self._on_kline_close)
         
+        # 标记是否已发送启动通知
+        self._startup_notified = False
+        
         # 主循环
         while self._running:
             try:
                 await self._update_cycle()
+                
+                # 首次运行后发送启动通知
+                if not self._startup_notified and self._current_state:
+                    await self._send_startup_notification()
+                    self._startup_notified = True
+                
                 await asyncio.sleep(self.config.kline_config.update_interval_sec)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 self.logger.error(f"策略更新异常: {e}", exc_info=True)
+                # 发送错误通知
+                await self._notify_error("StrategyError", str(e), "主循环更新")
                 await asyncio.sleep(5)
         
         await self.stop()
     
-    async def stop(self) -> None:
+    async def stop(self, reason: str = "手动停止") -> None:
         """停止策略"""
         self._running = False
         await self.kline_feed.stop()
         self.logger.info("策略已停止")
+        
+        # 发送停止通知
+        await self._send_shutdown_notification(reason)
     
     async def _update_cycle(self) -> None:
         """更新周期"""
@@ -1964,4 +2046,180 @@ class KeyLevelGridStrategy:
         
         # 无信号无仓位，返回空
         return {}
+    
+    # ===== Telegram 通知方法 =====
+    
+    async def _send_startup_notification(self) -> None:
+        """发送启动通知"""
+        if not self._notifier:
+            return
+        
+        try:
+            # 获取显示数据
+            data = self.get_display_data()
+            
+            # 当前价格
+            price_obj = data.get("price", {})
+            current_price = price_obj.get("current", 0) if isinstance(price_obj, dict) else 0
+            
+            # 账户信息
+            account_data = data.get("account", {})
+            account = {
+                "total_balance": account_data.get("total_balance", 0),
+                "available": account_data.get("available", 0),
+                "frozen": account_data.get("frozen", 0),
+            }
+            
+            # 持仓信息
+            pos_data = data.get("position", {})
+            position = {
+                "value": pos_data.get("value", pos_data.get("notional", 0)),
+                "avg_price": pos_data.get("avg_entry_price", pos_data.get("avg_price", 0)),
+                "unrealized_pnl": pos_data.get("unrealized_pnl", 0),
+                "pnl_pct": 0,
+            }
+            if position["value"] > 0 and position["unrealized_pnl"] != 0:
+                position["pnl_pct"] = position["unrealized_pnl"] / position["value"]
+            
+            # 挂单信息
+            pending_orders = data.get("pending_orders", [])
+            orders = []
+            for o in pending_orders:
+                orders.append({
+                    "side": o.get("side", ""),
+                    "price": o.get("price", 0),
+                    "amount": o.get("amount", 0),
+                })
+            
+            # 网格配置
+            grid_cfg = account_data.get("grid_config", {})
+            grid_config = {
+                "max_position": grid_cfg.get("max_position", 0),
+                "leverage": self.config.leverage,
+                "num_grids": self.position_manager.grid_config.max_grids,
+            }
+            
+            await self._notifier.notify_startup(
+                symbol=self.config.symbol,
+                exchange=self.config.exchange,
+                current_price=current_price,
+                account=account,
+                position=position,
+                pending_orders=orders,
+                grid_config=grid_config,
+            )
+        except Exception as e:
+            self.logger.error(f"发送启动通知失败: {e}")
+    
+    async def _send_shutdown_notification(self, reason: str = "手动停止") -> None:
+        """发送停止通知"""
+        if not self._notifier:
+            return
+        
+        try:
+            # 获取持仓信息
+            position = None
+            if self._gate_position and self._gate_position.get("contracts", 0) > 0:
+                position = {
+                    "value": self._gate_position.get("notional", 0),
+                }
+            
+            await self._notifier.notify_shutdown(
+                reason=reason,
+                position=position,
+                total_pnl=self._notifier._stats.get("realized_pnl", 0) if self._notifier else 0,
+            )
+        except Exception as e:
+            self.logger.error(f"发送停止通知失败: {e}")
+    
+    async def _notify_order_filled(
+        self,
+        side: str,
+        fill_price: float,
+        fill_amount: float,
+        grid_index: int = 0,
+        total_grids: int = 0,
+        realized_pnl: float = 0,
+    ) -> None:
+        """发送成交通知"""
+        if not self._notifier:
+            return
+        
+        try:
+            # 获取成交后持仓
+            position_after = None
+            if self._gate_position and self._gate_position.get("contracts", 0) > 0:
+                gate_pos = self._gate_position
+                value = gate_pos.get("notional", 0)
+                unrealized_pnl = gate_pos.get("unrealized_pnl", 0)
+                position_after = {
+                    "value": value,
+                    "avg_price": gate_pos.get("entry_price", 0),
+                    "unrealized_pnl": unrealized_pnl,
+                    "pnl_pct": unrealized_pnl / value if value > 0 else 0,
+                }
+            
+            await self._notifier.notify_order_filled(
+                side=side,
+                symbol=self.config.symbol,
+                fill_price=fill_price,
+                fill_amount=fill_amount,
+                grid_index=grid_index,
+                total_grids=total_grids,
+                position_after=position_after,
+                realized_pnl=realized_pnl,
+            )
+        except Exception as e:
+            self.logger.error(f"发送成交通知失败: {e}")
+    
+    async def _notify_grid_rebuild(
+        self,
+        reason: str,
+        old_anchor: float,
+        new_anchor: float,
+        new_orders: list,
+    ) -> None:
+        """发送网格重建通知"""
+        if not self._notifier:
+            return
+        
+        try:
+            orders = []
+            for o in new_orders:
+                orders.append({
+                    "side": o.get("side", "buy"),
+                    "price": o.get("price", 0),
+                    "amount": o.get("amount", 0),
+                })
+            
+            await self._notifier.notify_grid_rebuild(
+                symbol=self.config.symbol,
+                reason=reason,
+                old_anchor=old_anchor,
+                new_anchor=new_anchor,
+                new_orders=orders,
+            )
+        except Exception as e:
+            self.logger.error(f"发送网格重建通知失败: {e}")
+    
+    async def _notify_error(
+        self,
+        error_type: str,
+        error_msg: str,
+        context: str = "",
+        suggestion: str = "",
+    ) -> None:
+        """发送错误通知"""
+        if not self._notifier:
+            return
+        
+        try:
+            await self._notifier.notify_error(
+                error_type=error_type,
+                error_msg=error_msg,
+                context=context,
+                suggestion=suggestion,
+            )
+        except Exception as e:
+            self.logger.error(f"发送错误通知失败: {e}")
 
