@@ -2233,6 +2233,10 @@ class KeyLevelGridStrategy:
                 "num_grids": self.position_manager.grid_config.max_grids,
             }
             
+            # 关键价位
+            resistance_levels = data.get("resistance_levels", [])
+            support_levels = data.get("support_levels", [])
+            
             await self._notifier.notify_startup(
                 symbol=self.config.symbol,
                 exchange=self.config.exchange,
@@ -2241,6 +2245,8 @@ class KeyLevelGridStrategy:
                 position=position,
                 pending_orders=orders,
                 grid_config=grid_config,
+                resistance_levels=resistance_levels,
+                support_levels=support_levels,
             )
         except Exception as e:
             self.logger.error(f"发送启动通知失败: {e}")

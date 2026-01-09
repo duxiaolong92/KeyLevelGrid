@@ -154,6 +154,8 @@ class NotificationManager:
         position: Dict[str, Any],
         pending_orders: List[Dict[str, Any]],
         grid_config: Dict[str, Any],
+        resistance_levels: List[Dict[str, Any]] = None,
+        support_levels: List[Dict[str, Any]] = None,
     ) -> None:
         """
         策略启动通知
@@ -166,9 +168,14 @@ class NotificationManager:
             position: 持仓信息 {value, avg_price, unrealized_pnl, pnl_pct}
             pending_orders: 挂单列表 [{side, price, amount}, ...]
             grid_config: 网格配置 {max_position, leverage, num_grids}
+            resistance_levels: 阻力位列表 [{price, strength, source}, ...]
+            support_levels: 支撑位列表 [{price, strength, source}, ...]
         """
         if not self.config.startup:
             return
+        
+        resistance_levels = resistance_levels or []
+        support_levels = support_levels or []
         
         # 账户信息
         total_balance = account.get("total_balance", 0)
@@ -189,6 +196,26 @@ class NotificationManager:
 └ 杠杆: {leverage}x
 """
         
+        # 关键价位 - 阻力位（按价格降序）
+        if resistance_levels:
+            resistance_sorted = sorted(resistance_levels, key=lambda x: -x.get("price", 0))
+            text += f"\n🔴 <b>阻力位</b> ({len(resistance_sorted)}个)\n"
+            for i, r in enumerate(resistance_sorted, 1):
+                r_price = r.get("price", 0)
+                strength = r.get("strength", 0)
+                pct = ((r_price - current_price) / current_price * 100) if current_price > 0 else 0
+                text += f"├ R{i}: ${r_price:,.2f} (+{pct:.1f}%) 强度:{strength:.0f}\n"
+        
+        # 关键价位 - 支撑位（按价格降序）
+        if support_levels:
+            support_sorted = sorted(support_levels, key=lambda x: -x.get("price", 0))
+            text += f"\n🟢 <b>支撑位</b> ({len(support_sorted)}个)\n"
+            for i, s in enumerate(support_sorted, 1):
+                s_price = s.get("price", 0)
+                strength = s.get("strength", 0)
+                pct = ((current_price - s_price) / current_price * 100) if current_price > 0 else 0
+                text += f"├ S{i}: ${s_price:,.2f} (-{pct:.1f}%) 强度:{strength:.0f}\n"
+        
         # 挂单信息
         buy_orders = [o for o in pending_orders if o.get("side") == "buy"]
         sell_orders = [o for o in pending_orders if o.get("side") == "sell"]
@@ -198,23 +225,21 @@ class NotificationManager:
             text += f"\n📋 <b>买单挂单</b> ({len(buy_orders)}个, 共 {total_buy:,.0f} USDT)\n"
             # 按价格降序排列
             buy_orders_sorted = sorted(buy_orders, key=lambda x: -x.get("price", 0))
-            for i, order in enumerate(buy_orders_sorted[:6], 1):
+            for i, order in enumerate(buy_orders_sorted, 1):
                 price = order.get("price", 0)
                 amount = order.get("amount", 0)
-                text += f"├ #{i}: ${price:,.2f} | {amount:,.0f} USDT\n"
-            if len(buy_orders) > 6:
-                text += f"└ ... 还有 {len(buy_orders) - 6} 个\n"
+                pct = ((price - current_price) / current_price * 100) if current_price > 0 else 0
+                text += f"├ #{i}: ${price:,.2f} ({pct:+.1f}%) | {amount:,.0f} USDT\n"
         
         if sell_orders:
             total_sell = sum(o.get("amount", 0) for o in sell_orders)
             text += f"\n📋 <b>卖单挂单</b> ({len(sell_orders)}个, 共 {total_sell:,.0f} USDT)\n"
             sell_orders_sorted = sorted(sell_orders, key=lambda x: x.get("price", 0))
-            for i, order in enumerate(sell_orders_sorted[:6], 1):
+            for i, order in enumerate(sell_orders_sorted, 1):
                 price = order.get("price", 0)
                 amount = order.get("amount", 0)
-                text += f"├ #{i}: ${price:,.2f} | {amount:,.0f} USDT\n"
-            if len(sell_orders) > 6:
-                text += f"└ ... 还有 {len(sell_orders) - 6} 个\n"
+                pct = ((price - current_price) / current_price * 100) if current_price > 0 else 0
+                text += f"├ #{i}: ${price:,.2f} ({pct:+.1f}%) | {amount:,.0f} USDT\n"
         
         # 持仓信息
         pos_value = position.get("value", 0)
