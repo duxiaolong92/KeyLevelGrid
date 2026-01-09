@@ -120,14 +120,21 @@ class KeyLevelTelegramBot:
         await self.app.initialize()
         await self.app.start()
         
-        # 启动 polling（使用简化参数，兼容性更好）
+        # 删除可能存在的 webhook（webhook 会阻止 polling）
+        self.logger.info("清除可能存在的 webhook...")
+        await self.app.bot.delete_webhook(drop_pending_updates=True)
+        
+        # 启动 polling
         self.logger.info("正在启动 Telegram polling...")
         await self.app.updater.start_polling(
-            drop_pending_updates=True,  # 忽略启动前的消息
             allowed_updates=Update.ALL_TYPES,  # 接收所有类型的更新
         )
         
-        self.logger.info(f"✅ Telegram Bot 已启动，chat_id={self.config.chat_id}")
+        # 验证 polling 状态
+        if self.app.updater.running:
+            self.logger.info(f"✅ Telegram Bot polling 已启动，chat_id={self.config.chat_id}")
+        else:
+            self.logger.error("❌ Telegram Bot polling 启动失败")
     
     async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理 Bot 错误"""
