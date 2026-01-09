@@ -115,7 +115,15 @@ def create_position_panel(data: dict) -> Panel:
     table.add_row("数量", f"{qty:.6f} BTC")
     table.add_row("价值", f"{value:.2f} USDT")
     table.add_row("均价", f"{format_price(avg_price)}")
-    table.add_row("未实现盈亏", format_pct(pnl_pct))
+    
+    # 未实现盈亏：USDT + 百分比
+    if unrealized_pnl > 0:
+        pnl_text = f"[green]+{unrealized_pnl:.2f} USDT ({pnl_pct:+.2%})[/green]"
+    elif unrealized_pnl < 0:
+        pnl_text = f"[red]{unrealized_pnl:.2f} USDT ({pnl_pct:+.2%})[/red]"
+    else:
+        pnl_text = "0.00 USDT (0.00%)"
+    table.add_row("未实现盈亏", pnl_text)
     if grid_floor > 0:
         table.add_row("网格底线", f"{format_price(grid_floor)}")
     
