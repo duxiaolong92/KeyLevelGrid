@@ -313,7 +313,10 @@ class KeyLevelTelegramBot:
             if signal_id in self._pending_confirmations:
                 self._pending_confirmations[signal_id]["confirmed"] = True
                 await self._confirm_signal(signal_id)
-                await query.edit_message_text("✅ 已确认开仓")
+                try:
+                    await query.edit_message_text("✅ 已确认开仓")
+                except Exception:
+                    pass
                 del self._pending_confirmations[signal_id]
         
         elif data.startswith("reject_"):
@@ -321,7 +324,10 @@ class KeyLevelTelegramBot:
             if signal_id in self._pending_confirmations:
                 self._pending_confirmations[signal_id]["rejected"] = True
                 await self._reject_signal(signal_id)
-                await query.edit_message_text("❌ 已拒绝信号")
+                try:
+                    await query.edit_message_text("❌ 已拒绝信号")
+                except Exception:
+                    pass
                 del self._pending_confirmations[signal_id]
         
         elif data.startswith("detail_"):
@@ -332,7 +338,11 @@ class KeyLevelTelegramBot:
                 await query.message.reply_text(detail_text, parse_mode="HTML")
         
         elif data == "rebuild_confirm":
-            await query.edit_message_text("🔄 正在更新网格...")
+            try:
+                await query.edit_message_text("🔄 正在更新网格...")
+            except Exception:
+                pass  # 忽略消息未修改的错误
+            
             if self.strategy:
                 try:
                     result = await self.strategy.force_rebuild_grid()
@@ -348,10 +358,17 @@ class KeyLevelTelegramBot:
                     await query.message.reply_text(f"❌ 更新失败: {e}")
         
         elif data == "rebuild_cancel":
-            await query.edit_message_text("❌ 已取消更新网格")
+            try:
+                await query.edit_message_text("❌ 已取消更新网格")
+            except Exception:
+                pass
         
         elif data == "closeall_confirm":
-            await query.edit_message_text("🔄 正在平仓...")
+            try:
+                await query.edit_message_text("🔄 正在平仓...")
+            except Exception:
+                pass
+            
             if self.strategy:
                 try:
                     # TODO: 实现平仓逻辑
@@ -360,7 +377,10 @@ class KeyLevelTelegramBot:
                     await query.message.reply_text(f"❌ 平仓失败: {e}")
         
         elif data == "closeall_cancel":
-            await query.edit_message_text("❌ 已取消平仓")
+            try:
+                await query.edit_message_text("❌ 已取消平仓")
+            except Exception:
+                pass
     
     def _format_signal_detail(self, signal_data: dict) -> str:
         """格式化信号详情"""

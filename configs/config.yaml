@@ -16,9 +16,9 @@ trading:
   market_type: "futures"      # 合约市场 (USDT 永续)
   margin_mode: "cross"        # 保证金模式: cross (全仓) | isolated (逐仓)
   leverage: 10                 # 杠杆倍数 (建议 3-5x，与 position.max_leverage 保持一致)
-  timeframe: "4h"             # 主交易周期
+  timeframe: "15m"             # 主交易周期
   aux_timeframes:             # 辅助周期 (多周期融合)
-    - "1d"
+    - "1h"
 
 # K线数据源配置
 kline_feed:
@@ -34,8 +34,8 @@ kline_feed:
 grid:
   # 网格区间
   range_mode: "auto"          # auto: 基于 S/R 自动计算 | manual: 手动设置
-  manual_upper: 110000        # manual 模式: 上边界
-  manual_lower: 80000         # manual 模式: 下边界
+  manual_upper: 95000        # manual 模式: 上边界
+  manual_lower: 87000         # manual 模式: 下边界
   
   # 网格数量
   count_mode: "by_levels"     # by_levels: 按有效支撑位数量 | fixed: 固定数量
