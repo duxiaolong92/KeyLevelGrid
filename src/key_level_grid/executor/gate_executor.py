@@ -450,20 +450,17 @@ class GateExecutor(ExchangeExecutor):
                     return True
                 else:
                     # ✅ 检查是否为不可重试错误（余额不足、参数错误等）
-                    from arbstream.execution.order_errors import OrderErrorType
-                    if hasattr(order, 'error_type') and order.error_type in (
-                        OrderErrorType.INSUFFICIENT_BALANCE,
-                        OrderErrorType.INVALID_PARAMS,
-                        OrderErrorType.INVALID_SYMBOL,
-                        OrderErrorType.INVALID_ORDER_SIZE,
-                        OrderErrorType.API_PERMISSION,
-                        OrderErrorType.IP_WHITELIST,
-                    ):
+                    reject_reason = getattr(order, 'reject_reason', '') or ''
+                    is_non_retryable = any(keyword in reject_reason.lower() for keyword in [
+                        'insufficient', 'balance', 'margin', 'invalid', 'permission', 'whitelist'
+                    ])
+                    
+                    if is_non_retryable:
                         # 不可重试错误，直接返回
                         order.status = OrderStatus.FAILED
                         self._stats["orders_failed"] += 1
                         self.logger.warning(
-                            f"⚠️ 订单因不可重试错误失败 ({order.error_type.value}): {order.reject_reason}"
+                            f"⚠️ 订单因不可重试错误失败: {order.reject_reason}"
                         )
                         return False
                     
@@ -1066,29 +1063,27 @@ class GateExecutor(ExchangeExecutor):
             return True
             
         except Exception as e:
-            # ✅ 使用智能错误分类器
-            from arbstream.execution.order_errors import OrderErrorClassifier
+            # ✅ 简单错误分类
+            error_msg = str(e)
             
-            error_type, is_retryable, retry_delay = OrderErrorClassifier.classify_error(e)
-            friendly_msg = OrderErrorClassifier.get_friendly_message(error_type)
+            # 判断是否为余额不足等不可重试错误
+            is_retryable = not any(keyword in error_msg.lower() for keyword in [
+                'insufficient', 'balance', 'margin', 'invalid', 'permission', 'whitelist'
+            ])
             
             # 保存错误信息到订单对象
-            order.reject_reason = friendly_msg
-            order.error_type = error_type
+            order.reject_reason = error_msg[:200]
             order.is_retryable = is_retryable
-            order.retry_after_sec = retry_delay
             
             self.logger.error(
-                f"❌ 真实订单提交失败: {friendly_msg}",
+                f"❌ 真实订单提交失败: {error_msg[:200]}",
                 exc_info=True,
                 extra={
                     'symbol': order.symbol,
                     'side': order.side.value,
                     'quantity': order.quantity,
-                    'error_type': error_type.value,
                     'is_retryable': is_retryable,
-                    'retry_delay': retry_delay,
-                    'original_error': str(e)[:200]
+                    'original_error': error_msg[:200]
                 }
             )
             return False
