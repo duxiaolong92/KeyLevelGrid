@@ -297,9 +297,21 @@ class KeyLevelGridStrategy:
         
         # V2.3: 仓位配置 (网格模式)
         pos_raw = raw_config.get('position', {})
+        # 杠杆优先使用 trading.leverage，确保两者一致
+        trading_leverage = trading.get('leverage', 3)
+        position_leverage = pos_raw.get('max_leverage', trading_leverage)
+        # 如果 position.max_leverage 未设置或与 trading.leverage 不同，使用 trading.leverage
+        if position_leverage != trading_leverage:
+            import logging
+            logging.warning(
+                f"[Config] position.max_leverage({position_leverage}) 与 trading.leverage({trading_leverage}) 不一致，"
+                f"使用 trading.leverage={trading_leverage}"
+            )
+            position_leverage = trading_leverage
+        
         position_config = PositionConfig(
             total_capital=pos_raw.get('total_capital', 5000),
-            max_leverage=pos_raw.get('max_leverage', 3),
+            max_leverage=position_leverage,
             max_capital_usage=pos_raw.get('max_capital_usage', 0.8),
             allocation_mode=pos_raw.get('allocation_mode', 'equal'),
         )
