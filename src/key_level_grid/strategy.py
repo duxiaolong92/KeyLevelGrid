@@ -164,6 +164,7 @@ class KeyLevelGridStrategy:
         # Telegram 通知
         self._notifier: Optional["NotificationManager"] = None
         self._tg_bot = None  # Telegram Bot 实例
+        self._tg_bot_checked_at: float = 0  # Bot 健康检查时间戳
         self._init_notifier()
     
     def _init_executor(self) -> None:
@@ -490,6 +491,8 @@ class KeyLevelGridStrategy:
         # 定期同步 Gate 成交记录 (每 60 秒)
         if time.time() - self._trades_updated_at > 60:
             await self._update_gate_trades()
+        # 定期检查 Telegram Bot 状态 (每 5 分钟)
+        await self._check_telegram_bot()
         
         # 首次创建网格 (需要价格数据和支撑/阻力位计算完成)
         if not self._grid_created and self._current_state:
@@ -2332,6 +2335,27 @@ class KeyLevelGridStrategy:
             )
         except Exception as e:
             self.logger.error(f"发送网格重建通知失败: {e}")
+    
+    async def _check_telegram_bot(self) -> None:
+        """定期检查 Telegram Bot 状态，如果断开则重连"""
+        import time
+        
+        # 每 5 分钟检查一次
+        if time.time() - self._tg_bot_checked_at < 300:
+            return
+        
+        self._tg_bot_checked_at = time.time()
+        
+        if not self._tg_bot:
+            return
+        
+        try:
+            if not self._tg_bot.is_running():
+                self.logger.warning("⚠️ Telegram Bot 已断开，正在重连...")
+                await self._tg_bot.restart()
+                self.logger.info("✅ Telegram Bot 重连成功")
+        except Exception as e:
+            self.logger.error(f"Telegram Bot 重连失败: {e}")
     
     async def _notify_error(
         self,

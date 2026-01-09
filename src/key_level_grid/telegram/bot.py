@@ -112,12 +112,31 @@ class KeyLevelTelegramBot:
             self._handle_menu_button
         ))
         
+        # 注册错误处理器
+        self.app.add_error_handler(self._error_handler)
+        
         # 启动 Bot
+        self.logger.info("正在初始化 Telegram Bot...")
         await self.app.initialize()
         await self.app.start()
-        await self.app.updater.start_polling()
         
-        self.logger.info("Telegram Bot 已启动")
+        # 启动 polling（使用简化参数，兼容性更好）
+        self.logger.info("正在启动 Telegram polling...")
+        await self.app.updater.start_polling(
+            drop_pending_updates=True,  # 忽略启动前的消息
+            allowed_updates=Update.ALL_TYPES,  # 接收所有类型的更新
+        )
+        
+        self.logger.info(f"✅ Telegram Bot 已启动，chat_id={self.config.chat_id}")
+    
+    async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """处理 Bot 错误"""
+        self.logger.error(f"Telegram Bot 错误: {context.error}", exc_info=context.error)
+        
+        # 如果是网络错误，尝试重新发送
+        import telegram.error
+        if isinstance(context.error, (telegram.error.NetworkError, telegram.error.TimedOut)):
+            self.logger.warning("网络错误，Bot 将自动重试...")
     
     def _get_main_menu(self) -> ReplyKeyboardMarkup:
         """获取主菜单键盘"""
@@ -136,6 +155,24 @@ class KeyLevelTelegramBot:
             await self.app.shutdown()
         
         self.logger.info("Telegram Bot 已停止")
+    
+    def is_running(self) -> bool:
+        """检查 Bot 是否正在运行"""
+        if not self.app or not self.app.updater:
+            return False
+        return self.app.updater.running
+    
+    async def restart(self) -> None:
+        """重启 Bot"""
+        self.logger.info("正在重启 Telegram Bot...")
+        try:
+            await self.stop()
+        except Exception as e:
+            self.logger.warning(f"停止 Bot 时出错: {e}")
+        
+        await asyncio.sleep(2)
+        await self.start()
+        self.logger.info("Telegram Bot 已重启")
     
     async def send_message(self, text: str, parse_mode: str = "HTML") -> None:
         """发送消息"""
@@ -338,6 +375,9 @@ class KeyLevelTelegramBot:
     
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理 /start 命令"""
+        user = update.effective_user
+        self.logger.info(f"收到 /start 命令，用户: {user.id} ({user.username})")
+        
         text = """
 🎰 <b>Key Level Grid Strategy Bot</b>
 
@@ -355,6 +395,7 @@ class KeyLevelTelegramBot:
             parse_mode="HTML",
             reply_markup=self._get_main_menu()
         )
+        self.logger.info("已发送欢迎消息和菜单")
     
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理 /help 命令"""
@@ -597,6 +638,7 @@ class KeyLevelTelegramBot:
     async def _handle_menu_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理菜单按钮点击"""
         text = update.message.text
+        self.logger.info(f"收到菜单按钮: {text}")
         
         if text == "📊 当前持仓":
             await self._cmd_position(update, context)
@@ -610,7 +652,8 @@ class KeyLevelTelegramBot:
             await self._cmd_indicators(update, context)
         elif text == "❓ 帮助":
             await self._cmd_help(update, context)
-        # 其他消息忽略
+        else:
+            self.logger.debug(f"忽略未知消息: {text}")
     
     async def _cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理 /orders 命令 - 查看当前挂单"""
