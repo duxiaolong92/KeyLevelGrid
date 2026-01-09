@@ -145,6 +145,11 @@ class KeyLevelGridStrategy:
         self._last_position_usdt: float = 0  # 上次持仓价值（用于检测变化）
         self._tp_orders_submitted: bool = False  # 止盈单是否已提交
         
+        # 止损单状态
+        self._stop_loss_order_id: Optional[str] = None  # 当前止损单 ID
+        self._stop_loss_contracts: float = 0  # 止损单覆盖的张数
+        self._sl_order_updated_at: float = 0  # 止损单更新时间
+        
         # Gate 成交记录缓存
         self._gate_trades: List[Dict] = []
         self._trades_updated_at: float = 0
@@ -517,6 +522,9 @@ class KeyLevelGridStrategy:
         # 检测持仓变化，提交止盈挂单
         await self._check_and_submit_take_profit_orders()
         
+        # 检测持仓变化，更新止损单
+        await self._check_and_update_stop_loss_order()
+        
         # 更新仓位 (如果有)
         if self.position_manager.state:
             result = self.position_manager.update_position(
@@ -632,6 +640,8 @@ class KeyLevelGridStrategy:
 
         # 重建后允许重新提交 TP（但会被“已挂止盈覆盖”逻辑挡住重复）
         self._tp_orders_submitted = False
+        self._stop_loss_order_id = None  # 重置止损单状态（已被全部撤销）
+        self._stop_loss_contracts = 0
 
         # 5) 提交买单：重建模式跳过均价保护（方案A）
         await self._submit_grid_orders(new_grid, rebuild_mode=True)
@@ -722,8 +732,10 @@ class KeyLevelGridStrategy:
             new_grid.anchor_ts = int(time.time())
             self.position_manager._save_state()
             
-            # 重建后允许重新提交 TP
+            # 重建后允许重新提交 TP 和 SL
             self._tp_orders_submitted = False
+            self._stop_loss_order_id = None  # 重置止损单状态（已被全部撤销）
+            self._stop_loss_contracts = 0
             
             # 7) 提交买单
             await self._submit_grid_orders(new_grid, rebuild_mode=True)
@@ -1025,6 +1037,150 @@ class KeyLevelGridStrategy:
             if order.get("side") == "sell":
                 return True
         return False
+    
+    async def _check_and_update_stop_loss_order(self) -> None:
+        """
+        检查并更新止损单
+        
+        逻辑：
+        1. 有持仓 → 需要止损单
+        2. 持仓张数变化 → 更新止损单
+        3. 无持仓 → 取消止损单
+        """
+        if self.config.dry_run or not self._executor:
+            return
+        
+        if not self.position_manager.state:
+            return
+        
+        import time
+        
+        # 获取当前持仓张数
+        current_contracts = int(float(self._gate_position.get("raw_contracts", 0) or 0))
+        
+        # 获取网格底线（止损价）
+        grid_floor = self.position_manager.state.grid_floor if self.position_manager.state else 0
+        
+        if grid_floor <= 0:
+            self.logger.debug("无有效网格底线，跳过止损单更新")
+            return
+        
+        # 情况1: 无持仓，但有止损单 → 取消止损单
+        if current_contracts == 0 and self._stop_loss_order_id:
+            self.logger.info("📭 持仓已清空，取消止损单")
+            await self._cancel_stop_loss_order()
+            return
+        
+        # 情况2: 无持仓，无止损单 → 无需操作
+        if current_contracts == 0:
+            return
+        
+        # 情况3: 有持仓，持仓张数未变化且已有止损单 → 无需更新
+        if current_contracts == self._stop_loss_contracts and self._stop_loss_order_id:
+            self.logger.debug(f"止损单无需更新: {current_contracts}张 @ {grid_floor:.2f}")
+            return
+        
+        # 情况4: 有持仓，持仓变化或无止损单 → 创建/更新止损单
+        self.logger.info(
+            f"🛡️ 更新止损单: {self._stop_loss_contracts}张 → {current_contracts}张 @ {grid_floor:.2f}"
+        )
+        
+        # 先取消旧止损单
+        if self._stop_loss_order_id:
+            await self._cancel_stop_loss_order()
+        
+        # 提交新止损单
+        await self._submit_stop_loss_order(current_contracts, grid_floor)
+    
+    async def _submit_stop_loss_order(self, contracts: int, trigger_price: float) -> bool:
+        """
+        提交止损单到 Gate.io
+        
+        Args:
+            contracts: 止损张数
+            trigger_price: 触发价格（网格底线）
+        
+        Returns:
+            bool: 是否成功
+        """
+        from key_level_grid.executor.base import Order, OrderSide, OrderType
+        
+        if contracts <= 0 or trigger_price <= 0:
+            return False
+        
+        gate_symbol = self._convert_to_gate_symbol(self.config.symbol)
+        
+        try:
+            # 创建止损订单
+            sl_order = Order(
+                symbol=gate_symbol,
+                side=OrderSide.SELL,
+                order_type=OrderType.MARKET,  # 触发后市价卖出
+                amount=contracts,
+                price=0,  # 市价止损，价格为 0
+                reduce_only=True,
+            )
+            
+            # 设置触发参数
+            sl_order.metadata['order_mode'] = 'trigger'  # 标记为计划委托
+            sl_order.metadata['triggerPrice'] = trigger_price
+            sl_order.metadata['rule'] = 2  # 2 = <= (价格跌破触发)
+            sl_order.metadata['is_stop_loss'] = True
+            
+            self.logger.info(
+                f"📤 提交止损单: {contracts}张, 触发价={trigger_price:.2f}, "
+                f"symbol={gate_symbol}"
+            )
+            
+            success = await self._executor.submit_order(sl_order)
+            
+            if success:
+                # 获取订单 ID（从 executor 或 order 中获取）
+                order_id = getattr(sl_order, 'exchange_order_id', None) or sl_order.metadata.get('order_id', '')
+                self._stop_loss_order_id = str(order_id) if order_id else "pending"
+                self._stop_loss_contracts = contracts
+                self._sl_order_updated_at = time.time()
+                self.logger.info(f"✅ 止损单提交成功: ID={self._stop_loss_order_id}")
+                return True
+            else:
+                self.logger.error(f"❌ 止损单提交失败: {sl_order.reject_reason}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"❌ 提交止损单异常: {e}", exc_info=True)
+            return False
+    
+    async def _cancel_stop_loss_order(self) -> bool:
+        """取消当前止损单"""
+        if not self._stop_loss_order_id:
+            return True
+        
+        gate_symbol = self._convert_to_gate_symbol(self.config.symbol)
+        
+        try:
+            # 尝试取消计划委托
+            if hasattr(self._executor, 'cancel_plan_order'):
+                success = await self._executor.cancel_plan_order(gate_symbol, self._stop_loss_order_id)
+            else:
+                # 回退到普通取消
+                success = await self._executor.cancel_order(gate_symbol, self._stop_loss_order_id)
+            
+            if success:
+                self.logger.info(f"✅ 止损单已取消: ID={self._stop_loss_order_id}")
+            else:
+                self.logger.warning(f"⚠️ 取消止损单失败: ID={self._stop_loss_order_id}")
+            
+            # 无论成功与否，清除本地状态
+            self._stop_loss_order_id = None
+            self._stop_loss_contracts = 0
+            
+            return success
+            
+        except Exception as e:
+            self.logger.error(f"❌ 取消止损单异常: {e}")
+            self._stop_loss_order_id = None
+            self._stop_loss_contracts = 0
+            return False
     
     async def _submit_take_profit_orders(self, position_usdt: float) -> None:
         """
