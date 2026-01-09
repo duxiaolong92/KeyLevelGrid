@@ -57,6 +57,22 @@ def create_account_panel(data: dict) -> Panel:
     account = data.get("account", {})
     grid_cfg = account.get("grid_config", {})
     
+    # 获取止损价格 (兼容多种字段名)
+    floor_price = grid_cfg.get("grid_floor", 0) or grid_cfg.get("stop_loss_price", 0) or grid_cfg.get("floor_price", 0)
+    
+    # 计算距止损距离
+    current_price = data.get("current_price", 0)
+    if current_price > 0 and floor_price > 0:
+        distance_to_floor = (floor_price - current_price) / current_price
+    else:
+        distance_to_floor = grid_cfg.get("distance_to_floor", 0)
+    
+    # 获取最大亏损百分比
+    max_loss_pct = grid_cfg.get("max_loss_pct", 0)
+    # 如果是百分比形式 (如 15.5 表示 15.5%)，需要转换
+    if max_loss_pct > 1:
+        max_loss_pct = max_loss_pct / 100
+    
     table.add_row("总余额", f"{account.get('total_balance', 0):.2f} USDT")
     table.add_row("可用", f"{account.get('available', 0):.2f} USDT")
     table.add_row("冻结", f"{account.get('frozen', 0):.2f} USDT")
@@ -64,9 +80,9 @@ def create_account_panel(data: dict) -> Panel:
     table.add_row("网格配置", "")
     table.add_row("最大仓位", f"{grid_cfg.get('max_position', 0):.0f} USDT")
     table.add_row("杠杆", f"{grid_cfg.get('max_leverage', 0)}x")
-    table.add_row("止损线", f"{format_price(grid_cfg.get('floor_price', 0))}")
-    table.add_row("距止损", format_pct(grid_cfg.get('distance_to_floor', 0)))
-    table.add_row("预计最大亏损", f"{grid_cfg.get('max_loss', 0):.0f} USDT ({grid_cfg.get('max_loss_pct', 0):.1%})")
+    table.add_row("止损线", f"{format_price(floor_price)}")
+    table.add_row("距止损", format_pct(distance_to_floor))
+    table.add_row("预计最大亏损", f"{grid_cfg.get('max_loss', 0):.0f} USDT ({max_loss_pct:.1%})")
     
     return Panel(table, title="💰 账户信息", border_style="blue")
 
@@ -82,11 +98,26 @@ def create_position_panel(data: dict) -> Panel:
     side = pos.get("side", "无")
     side_text = "[green]多头[/green]" if side == "long" else "[red]空头[/red]" if side == "short" else "无"
     
+    # 获取持仓数据 (兼容两种字段名)
+    qty = pos.get("qty", pos.get("contracts", 0))
+    value = pos.get("value", pos.get("notional", 0))
+    avg_price = pos.get("avg_entry_price", pos.get("avg_price", 0))
+    unrealized_pnl = pos.get("unrealized_pnl", 0)
+    grid_floor = pos.get("grid_floor", 0)
+    
+    # 计算盈亏百分比
+    if value > 0 and unrealized_pnl != 0:
+        pnl_pct = unrealized_pnl / value
+    else:
+        pnl_pct = pos.get("unrealized_pnl_pct", 0)
+    
     table.add_row("方向", side_text)
-    table.add_row("数量", f"{pos.get('contracts', 0):.6f} BTC")
-    table.add_row("价值", f"{pos.get('notional', 0):.2f} USDT")
-    table.add_row("均价", f"{format_price(pos.get('avg_price', 0))}")
-    table.add_row("未实现盈亏", format_pct(pos.get('unrealized_pnl_pct', 0)))
+    table.add_row("数量", f"{qty:.6f} BTC")
+    table.add_row("价值", f"{value:.2f} USDT")
+    table.add_row("均价", f"{format_price(avg_price)}")
+    table.add_row("未实现盈亏", format_pct(pnl_pct))
+    if grid_floor > 0:
+        table.add_row("网格底线", f"{format_price(grid_floor)}")
     
     return Panel(table, title="📊 当前持仓", border_style="green")
 
@@ -109,7 +140,7 @@ def create_orders_panel(data: dict) -> Panel:
     table.add_column("价格", justify="right")
     table.add_column("BTC", justify="right")
     table.add_column("USDT", justify="right")
-    table.add_column("状态", justify="center")
+    table.add_column("距当前", justify="center")
     
     current_price = data.get("current_price", 0)
     
@@ -150,6 +181,66 @@ def create_orders_panel(data: dict) -> Panel:
     return Panel(table, title="📋 当前挂单", border_style="yellow")
 
 
+def translate_source(source: str) -> str:
+    """将来源标识转换为中文"""
+    if not source:
+        return ""
+    
+    # 处理复合来源 (如 "swing_5+fib_0.236")
+    if "+" in source:
+        parts = source.split("+")
+        return "+".join(translate_source(p) for p in parts)
+    
+    # 单一来源映射
+    source_map = {
+        "swing_5": "摆动点",
+        "swing_13": "摆动点",
+        "swing_21": "摆动点",
+        "volume_node": "密集区",
+        "round_number": "心理关口",
+    }
+    
+    # 直接匹配
+    if source in source_map:
+        return source_map[source]
+    
+    # 斐波那契
+    if source.startswith("fib_"):
+        ratio = source.replace("fib_", "")
+        return f"斐波{ratio}"
+    
+    # 摆动点 (通用)
+    if source.startswith("swing_"):
+        return "摆动点"
+    
+    return source
+
+
+def translate_timeframe(tf: str) -> str:
+    """将周期转换为中文"""
+    tf_map = {
+        "1m": "1分钟",
+        "5m": "5分钟",
+        "15m": "15分钟",
+        "30m": "30分钟",
+        "1h": "1小时",
+        "2h": "2小时",
+        "4h": "4小时",
+        "6h": "6小时",
+        "8h": "8小时",
+        "12h": "12小时",
+        "1d": "日线",
+        "1D": "日线",
+        "D1": "日线",
+        "1w": "周线",
+        "1W": "周线",
+        "W1": "周线",
+        "1M": "月线",
+        "multi": "多周期",
+    }
+    return tf_map.get(tf, tf)
+
+
 def create_levels_panel(data: dict) -> Panel:
     """创建关键价位面板"""
     table = Table(box=None, padding=(0, 1))
@@ -161,17 +252,19 @@ def create_levels_panel(data: dict) -> Panel:
     
     current_price = data.get("current_price", 0)
     
-    # 阻力位
+    # 阻力位（按价格降序，高价在上）
     table.add_row("阻力位", "", "", "", "", style="bold red")
-    resistances = data.get("resistance_levels", [])[:10]
+    resistances = sorted(data.get("resistance_levels", []), key=lambda x: -x.get("price", 0))[:10]
     for r in resistances:
         price = r.get("price", 0)
         pct = (price - current_price) / current_price if current_price > 0 else 0
+        source_cn = translate_source(r.get("source", ""))
+        tf_cn = translate_timeframe(r.get("timeframe", ""))
         table.add_row(
-            f"  {r.get('source', '')}",
+            f"  {source_cn}",
             f"[red]{format_price(price)}[/red]",
             format_pct(pct),
-            r.get("timeframe", ""),
+            tf_cn,
             f"{r.get('strength', 0):.0f}"
         )
     
@@ -179,26 +272,47 @@ def create_levels_panel(data: dict) -> Panel:
     table.add_row("当前价格", f"[bold]{format_price(current_price)}[/bold]", "基准", "", "")
     table.add_row("──────────", "──────────", "───────", "────────", "─────")
     
-    # 支撑位
+    # 支撑位（按价格降序，高价在上，靠近当前价的在前）
     table.add_row("支撑位", "", "", "", "", style="bold green")
-    supports = data.get("support_levels", [])[:10]
+    supports = sorted(data.get("support_levels", []), key=lambda x: -x.get("price", 0))[:10]
     for s in supports:
         price = s.get("price", 0)
         pct = (price - current_price) / current_price if current_price > 0 else 0
+        source_cn = translate_source(s.get("source", ""))
+        tf_cn = translate_timeframe(s.get("timeframe", ""))
         table.add_row(
-            f"  {s.get('source', '')}",
+            f"  {source_cn}",
             f"[green]{format_price(price)}[/green]",
             format_pct(pct),
-            s.get("timeframe", ""),
+            tf_cn,
             f"{s.get('strength', 0):.0f}"
         )
     
     return Panel(table, title="📍 关键价位", border_style="cyan")
 
 
+def get_current_price(data: dict) -> float:
+    """从 data 中获取当前价格（兼容多种格式）"""
+    # 优先尝试直接的 current_price
+    price = data.get("current_price")
+    if price and price > 0:
+        return float(price)
+    # 尝试 price.current 格式
+    price_obj = data.get("price", {})
+    if isinstance(price_obj, dict):
+        price = price_obj.get("current", 0)
+        if price and price > 0:
+            return float(price)
+    return 0.0
+
+
 def create_display(strategy: KeyLevelGridStrategy) -> Layout:
     """创建显示布局"""
     data = strategy.get_display_data()
+    
+    # 统一获取当前价格并注入到 data 中
+    current_price = get_current_price(data)
+    data["current_price"] = current_price
     
     layout = Layout()
     layout.split_column(
@@ -207,7 +321,6 @@ def create_display(strategy: KeyLevelGridStrategy) -> Layout:
     )
     
     # 头部
-    current_price = data.get("current_price", 0)
     symbol = strategy.config.symbol
     timeframe = strategy.config.kline_config.primary_timeframe.value
     aux_tfs = [tf.value for tf in strategy.config.kline_config.auxiliary_timeframes]
