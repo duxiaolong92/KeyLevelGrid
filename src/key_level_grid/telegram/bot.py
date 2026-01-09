@@ -420,30 +420,46 @@ class KeyLevelTelegramBot:
             await update.message.reply_text("❌ 策略未连接")
             return
         
-        status = self.strategy.get_status()
-        position = status.get("position", {})
+        # 使用 get_display_data 获取真实持仓数据
+        data = self.strategy.get_display_data()
+        position = data.get("position", {})
         
-        if not position.get("has_position"):
+        # 检查是否有持仓 (value > 0 或 qty > 0)
+        value = position.get("value", 0)
+        qty = position.get("qty", 0)
+        if not position or (value <= 0 and qty <= 0):
             await update.message.reply_text("📭 当前无持仓")
             return
         
-        direction = position.get("direction", "none")
+        direction = position.get("side", "long")
         dir_emoji = "🟢" if direction == "long" else "🔴"
         
         pnl = position.get("unrealized_pnl", 0)
         pnl_emoji = "📈" if pnl >= 0 else "📉"
         
+        # 获取当前价格
+        price_obj = data.get("price", {})
+        current_price = price_obj.get("current", 0) if isinstance(price_obj, dict) else 0
+        
+        # 计算盈亏百分比
+        entry_price = position.get("avg_entry_price", 0)
+        if entry_price > 0 and current_price > 0:
+            pnl_pct = (current_price - entry_price) / entry_price if direction == "long" else (entry_price - current_price) / entry_price
+        else:
+            pnl_pct = 0
+        
+        grid_floor = position.get("grid_floor", 0)
+        
         text = f"""
 💼 <b>当前持仓</b>
 
 ├ 方向: {dir_emoji} {direction.upper()}
-├ 入场价: {position.get('entry_price', 0):.4f}
-├ 当前价格: {position.get('current_price', 0):.4f}
-├ 仓位: {position.get('position_usdt', 0):.2f} USDT
-├ 未实现盈亏: {pnl_emoji} {pnl:.2f} USDT
-├ R倍数: {position.get('risk_reward', 0):.2f}R
-├ 止损价: {position.get('stop_loss', 0):.4f}
-└ 止损类型: {position.get('stop_type', 'N/A')}
+├ 数量: {qty:.6f} BTC
+├ 价值: {value:,.2f} USDT
+├ 均价: ${entry_price:,.2f}
+├ 当前价: ${current_price:,.2f}
+├ 未实现盈亏: {pnl_emoji} {pnl:+,.2f} USDT ({pnl_pct:+.2%})
+└ 网格底线: ${grid_floor:,.2f}
 """
         await update.message.reply_text(text, parse_mode="HTML")
     
@@ -501,22 +517,27 @@ class KeyLevelTelegramBot:
         
         data = self.strategy.get_display_data()
         price = data.get("price", {}).get("current", 0)
-        resistance = data.get("resistance_levels", [])[:5]
-        support = data.get("support_levels", [])[:5]
+        resistance = data.get("resistance_levels", [])
+        support = data.get("support_levels", [])
         
-        text = f"📍 <b>关键价位</b>\n\n当前价: {price:.4f}\n\n"
+        # 阻力位按价格降序排列（高价在前）
+        resistance = sorted(resistance, key=lambda x: -x.get("price", 0))[:5]
+        # 支撑位按价格降序排列（高价在前）
+        support = sorted(support, key=lambda x: -x.get("price", 0))[:5]
+        
+        text = f"📍 <b>关键价位</b>\n\n当前价: ${price:,.2f}\n\n"
         
         text += "<b>阻力位:</b>\n"
         for i, r in enumerate(resistance):
             r_price = r.get("price", 0)
             pct = ((r_price - price) / price * 100) if price > 0 else 0
-            text += f"├ R{i+1}: {r_price:.4f} (+{pct:.1f}%)\n"
+            text += f"├ R{i+1}: ${r_price:,.2f} (+{pct:.1f}%)\n"
         
         text += "\n<b>支撑位:</b>\n"
         for i, s in enumerate(support):
             s_price = s.get("price", 0)
             pct = ((price - s_price) / price * 100) if price > 0 else 0
-            text += f"├ S{i+1}: {s_price:.4f} (-{pct:.1f}%)\n"
+            text += f"├ S{i+1}: ${s_price:,.2f} (-{pct:.1f}%)\n"
         
         await update.message.reply_text(text, parse_mode="HTML")
     
