@@ -603,11 +603,12 @@ class KeyLevelGridStrategy:
             klines_1d = self.kline_feed.get_cached_klines(Timeframe.D1)
 
         resistance_calc = self.position_manager.resistance_calc
+        primary_tf = self.config.kline_config.primary_timeframe.value
         resistances = resistance_calc.calculate_resistance_levels(
-            current_price, klines, "long", klines_1d=klines_1d
+            current_price, klines, "long", klines_1d=klines_1d, primary_timeframe=primary_tf
         )
         supports = resistance_calc.calculate_support_levels(
-            current_price, klines, klines_1d=klines_1d
+            current_price, klines, klines_1d=klines_1d, primary_timeframe=primary_tf
         )
 
         if not supports:
@@ -689,11 +690,12 @@ class KeyLevelGridStrategy:
                 klines_1d = self.kline_feed.get_cached_klines(Timeframe.D1)
             
             resistance_calc = self.position_manager.resistance_calc
+            primary_tf = self.config.kline_config.primary_timeframe.value
             resistances = resistance_calc.calculate_resistance_levels(
-                current_price, klines, "long", klines_1d=klines_1d
+                current_price, klines, "long", klines_1d=klines_1d, primary_timeframe=primary_tf
             )
             supports = resistance_calc.calculate_support_levels(
-                current_price, klines, klines_1d=klines_1d
+                current_price, klines, klines_1d=klines_1d, primary_timeframe=primary_tf
             )
             
             if not supports:
@@ -1262,12 +1264,13 @@ class KeyLevelGridStrategy:
         
         # 计算支撑位和阻力位
         resistance_calc = self.position_manager.resistance_calc
+        primary_tf = self.config.kline_config.primary_timeframe.value
         
         resistances = resistance_calc.calculate_resistance_levels(
-            current_price, klines, "long", klines_1d=klines_1d
+            current_price, klines, "long", klines_1d=klines_1d, primary_timeframe=primary_tf
         )
         supports = resistance_calc.calculate_support_levels(
-            current_price, klines, klines_1d=klines_1d
+            current_price, klines, klines_1d=klines_1d, primary_timeframe=primary_tf
         )
         
         if not supports:
@@ -1781,14 +1784,15 @@ class KeyLevelGridStrategy:
             
             if len(klines) >= 50:
                 resistance_calc = self.position_manager.resistance_calc
+                primary_tf = self.config.kline_config.primary_timeframe.value
                 
                 # 阻力位始终是当前价格上方，支撑位始终是当前价格下方
                 # 不管趋势方向如何
                 resistances = resistance_calc.calculate_resistance_levels(
-                    state.close, klines, "long", klines_1d=klines_1d
+                    state.close, klines, "long", klines_1d=klines_1d, primary_timeframe=primary_tf
                 )
                 supports = resistance_calc.calculate_support_levels(
-                    state.close, klines, klines_1d=klines_1d
+                    state.close, klines, klines_1d=klines_1d, primary_timeframe=primary_tf
                 )
                 
                 data["resistance_levels"] = [

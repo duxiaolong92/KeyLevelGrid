@@ -106,28 +106,30 @@ class ResistanceCalculator:
         klines: List[Kline],
         direction: str = "long",
         klines_1d: Optional[List[Kline]] = None,
-        stop_loss: Optional[float] = None
+        stop_loss: Optional[float] = None,
+        primary_timeframe: str = "4h"
     ) -> List[PriceLevel]:
         """
         计算阻力位 (多周期融合版)
         
         Args:
             current_price: 当前价格
-            klines: 4H K线列表
+            klines: 主周期 K线列表
             direction: 交易方向 "long" | "short"
-            klines_1d: 1D K线列表 (可选，用于多周期融合)
+            klines_1d: 辅助周期 K线列表 (可选，用于多周期融合)
             stop_loss: 止损价 (可选，用于过滤低盈亏比)
+            primary_timeframe: 主周期名称 (如 "15m", "1h", "4h")
             
         Returns:
             按综合得分排序的阻力位列表
         """
         all_levels: List[PriceLevel] = []
         
-        # === 4H 周期阻力位 ===
-        levels_4h = self._calculate_single_timeframe(
-            klines, current_price, direction, "4h"
+        # === 主周期阻力位 ===
+        levels_primary = self._calculate_single_timeframe(
+            klines, current_price, direction, primary_timeframe
         )
-        all_levels.extend(levels_4h)
+        all_levels.extend(levels_primary)
         
         # === 1D 周期阻力位 ===
         if self.config.multi_timeframe and klines_1d:
@@ -156,7 +158,8 @@ class ResistanceCalculator:
         self,
         current_price: float,
         klines: List[Kline],
-        klines_1d: Optional[List[Kline]] = None
+        klines_1d: Optional[List[Kline]] = None,
+        primary_timeframe: str = "4h"
     ) -> List[PriceLevel]:
         """
         计算支撑位 (做多止损参考)
@@ -165,19 +168,20 @@ class ResistanceCalculator:
         
         Args:
             current_price: 当前价格
-            klines: K线列表
-            klines_1d: 1D K线列表
+            klines: 主周期 K线列表
+            klines_1d: 辅助周期 K线列表
+            primary_timeframe: 主周期名称 (如 "15m", "1h", "4h")
             
         Returns:
             按价格排序的支撑位列表 (从高到低)
         """
         all_levels: List[PriceLevel] = []
         
-        # === 4H 周期支撑位 ===
-        levels_4h = self._calculate_single_timeframe(
-            klines, current_price, "short", "4h"  # short 方向找下方支撑
+        # === 主周期支撑位 ===
+        levels_primary = self._calculate_single_timeframe(
+            klines, current_price, "short", primary_timeframe  # short 方向找下方支撑
         )
-        all_levels.extend([l for l in levels_4h if l.price < current_price])
+        all_levels.extend([l for l in levels_primary if l.price < current_price])
         
         # === 1D 周期支撑位 ===
         if self.config.multi_timeframe and klines_1d:
