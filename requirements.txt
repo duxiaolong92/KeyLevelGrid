@@ -1,0 +1,25 @@
+# Key Level Grid Strategy Dependencies
+# Python 3.10+
+
+# 交易所 API
+ccxt>=4.0.0
+
+# 数据处理
+numpy>=1.24.0
+pandas>=2.0.0
+
+# 配置和验证
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# 异步
+aiohttp>=3.9.0
+
+# 终端显示
+rich>=13.0.0
+
+# WebSocket
+websockets>=12.0
+
+# 可选：Telegram 通知
+# python-telegram-bot>=20.0
