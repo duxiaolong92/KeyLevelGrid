@@ -49,17 +49,33 @@ class NotificationManager:
     
     统一管理各类交易通知的格式和发送
     所有金额使用 USDT 计价
+    
+    支持两种模式:
+    1. 传入 bot 实例 (需要 bot.start() 后才能发送)
+    2. 传入 bot_token 和 chat_id (直接通过 HTTP API 发送，推荐)
     """
     
-    def __init__(self, bot, config: Optional[NotifyConfig] = None):
+    def __init__(
+        self, 
+        bot=None, 
+        config: Optional[NotifyConfig] = None,
+        bot_token: str = "",
+        chat_id: str = "",
+    ):
         """
         Args:
-            bot: KeyLevelTelegramBot 实例
+            bot: KeyLevelTelegramBot 实例 (可选)
             config: 通知配置
+            bot_token: Telegram Bot Token (直接发送模式)
+            chat_id: Telegram Chat ID (直接发送模式)
         """
         self.bot = bot
         self.config = config or NotifyConfig()
         self.logger = get_logger(__name__)
+        
+        # 直接发送模式的配置
+        self._bot_token = bot_token or (bot.config.bot_token if bot and hasattr(bot, 'config') else "")
+        self._chat_id = chat_id or (bot.config.chat_id if bot and hasattr(bot, 'config') else "")
         
         # 统计
         self._stats = {
@@ -77,6 +93,47 @@ class NotificationManager:
         
         # 风险预警状态
         self._risk_warning_sent = False
+    
+    async def _send_message(self, text: str) -> bool:
+        """
+        发送消息 (优先使用 HTTP API 直接发送)
+        
+        Returns:
+            bool: 是否发送成功
+        """
+        # 优先使用直接 HTTP API 发送
+        if self._bot_token and self._chat_id:
+            try:
+                import aiohttp
+                url = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
+                payload = {
+                    "chat_id": self._chat_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                }
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload, timeout=10) as resp:
+                        result = await resp.json()
+                        if result.get("ok"):
+                            return True
+                        else:
+                            self.logger.error(f"Telegram API 错误: {result}")
+                            return False
+            except Exception as e:
+                self.logger.error(f"发送 Telegram 消息失败: {e}")
+                return False
+        
+        # 回退到 Bot 实例发送
+        if self.bot and hasattr(self.bot, 'app') and self.bot.app:
+            try:
+                await self._send_message(text)
+                return True
+            except Exception as e:
+                self.logger.error(f"通过 Bot 发送消息失败: {e}")
+                return False
+        
+        self.logger.warning("无法发送 Telegram 消息: 未配置 token/chat_id 且 Bot 未启动")
+        return False
     
     def _can_notify(self, notify_type: str) -> bool:
         """检查是否可以发送通知（防刷屏）"""
@@ -180,7 +237,7 @@ class NotificationManager:
         
         text += f"\n⚙️ 网格配置: {num_grids}档 | 最大仓位 {max_position:,.0f} USDT"
         
-        await self.bot.send_message(text.strip())
+        await self._send_message(text.strip())
     
     async def notify_shutdown(
         self,
@@ -212,7 +269,7 @@ class NotificationManager:
             pnl_sign = "+" if total_pnl >= 0 else ""
             text += f"\n💰 本次运行盈亏: {pnl_emoji} {pnl_sign}{total_pnl:,.2f} USDT"
         
-        await self.bot.send_message(text.strip())
+        await self._send_message(text.strip())
     
     async def notify_order_filled(
         self,
@@ -305,7 +362,7 @@ class NotificationManager:
         elif position_after:
             text += "\n💼 持仓已清空"
         
-        await self.bot.send_message(text.strip())
+        await self._send_message(text.strip())
     
     async def notify_orders_placed(
         self,
@@ -367,7 +424,7 @@ class NotificationManager:
             self._stats["grid_rebuilds"] += 1
             text += f"\n⚠️ 网格重建次数: {self._stats['grid_rebuilds']}"
         
-        await self.bot.send_message(text.strip())
+        await self._send_message(text.strip())
     
     async def notify_grid_rebuild(
         self,
@@ -410,7 +467,7 @@ class NotificationManager:
 📋 新网格: {len(buy_orders)}档买单, 共 {total_buy:,.0f} USDT
 """
         
-        await self.bot.send_message(text.strip())
+        await self._send_message(text.strip())
     
     async def notify_error(
         self,
@@ -447,7 +504,7 @@ class NotificationManager:
         
         text += f"\n📊 累计错误: {self._stats['errors']} 次"
         
-        await self.bot.send_message(text.strip())
+        await self._send_message(text.strip())
     
     async def notify_risk_warning(
         self,
@@ -498,7 +555,7 @@ class NotificationManager:
 """
         
         self._risk_warning_sent = True
-        await self.bot.send_message(text.strip())
+        await self._send_message(text.strip())
     
     def reset_risk_warning(self) -> None:
         """重置风险预警状态（价格远离止损线时调用）"""
@@ -559,7 +616,7 @@ class NotificationManager:
 └ 网格档位: {filled_grids}/{total_grids} 已成交
 """
         
-        await self.bot.send_message(text.strip())
+        await self._send_message(text.strip())
         
         # 重置每日统计
         self._reset_daily_stats()
@@ -610,7 +667,7 @@ class NotificationManager:
 └ 运行时长: {uptime_hours:.1f} 小时
 """
         
-        await self.bot.send_message(text.strip())
+        await self._send_message(text.strip())
     
     def get_stats(self) -> dict:
         """获取通知统计"""

@@ -247,7 +247,12 @@ class KeyLevelGridStrategy:
             
             # 创建 Bot 和通知管理器
             bot = KeyLevelTelegramBot(tg_config, strategy=self)
-            self._notifier = NotificationManager(bot, notify_config)
+            self._notifier = NotificationManager(
+                bot=bot, 
+                config=notify_config,
+                bot_token=config.tg_bot_token,
+                chat_id=config.tg_chat_id,
+            )
             
             self.logger.info("📱 Telegram 通知已启用")
         except ImportError as e:

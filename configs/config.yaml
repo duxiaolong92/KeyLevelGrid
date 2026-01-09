@@ -129,7 +129,7 @@ api:
 # ============================================
 telegram:
   # 基础配置（从环境变量读取）
-  enabled: false              # 是否启用 Telegram 通知
+  enabled: true              # 是否启用 Telegram 通知
   bot_token_env: "TG_BOT_TOKEN"
   chat_id_env: "TG_CHAT_ID"
   
