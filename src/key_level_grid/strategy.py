@@ -603,6 +603,114 @@ class KeyLevelGridStrategy:
         await self._submit_grid_orders(new_grid, rebuild_mode=True)
         self._last_rebuild_at = time.time()
     
+    async def force_rebuild_grid(self) -> bool:
+        """
+        强制重建网格（由 Telegram 命令触发）
+        
+        不检查阈值和冷却时间，立即执行重建
+        
+        Returns:
+            bool: 是否成功
+        """
+        import time
+        
+        if self.config.dry_run or not self._executor:
+            self.logger.warning("Dry Run 模式或无执行器，无法强制重建")
+            return False
+        
+        if not self._current_state:
+            self.logger.warning("无当前状态数据，无法强制重建")
+            return False
+        
+        current_price = float(self._current_state.close or 0)
+        if current_price <= 0:
+            self.logger.warning("当前价格无效，无法强制重建")
+            return False
+        
+        self.logger.info(f"🔄 强制重建网格: current_price={current_price:.2f}")
+        
+        gate_symbol = self._convert_to_gate_symbol(self.config.symbol)
+        
+        try:
+            # 1) 撤掉该 symbol 下所有挂单
+            if hasattr(self._executor, "cancel_all_plan_orders"):
+                await self._executor.cancel_all_plan_orders(gate_symbol)
+            if hasattr(self._executor, "cancel_all_orders"):
+                await self._executor.cancel_all_orders(gate_symbol)
+            
+            # 2) 同步挂单缓存
+            await self._update_gate_orders()
+            
+            # 3) 获取最新K线
+            klines = self.kline_feed.get_cached_klines(
+                self.config.kline_config.primary_timeframe
+            )
+            if len(klines) < 50:
+                self.logger.warning("K线数据不足，无法重建")
+                return False
+            
+            # 4) 重新计算支撑/阻力位
+            from key_level_grid.models import Timeframe
+            klines_1d = None
+            if Timeframe.D1 in self.config.kline_config.auxiliary_timeframes:
+                klines_1d = self.kline_feed.get_cached_klines(Timeframe.D1)
+            
+            resistance_calc = self.position_manager.resistance_calc
+            resistances = resistance_calc.calculate_resistance_levels(
+                current_price, klines, "long", klines_1d=klines_1d
+            )
+            supports = resistance_calc.calculate_support_levels(
+                current_price, klines, klines_1d=klines_1d
+            )
+            
+            if not supports:
+                self.logger.warning("未找到有效支撑位，放弃重建")
+                return False
+            
+            # 5) 保存旧锚点用于通知
+            old_anchor = 0
+            if self.position_manager.state:
+                old_anchor = getattr(self.position_manager.state, "anchor_price", 0) or 0
+            
+            # 6) 重建网格
+            new_grid = self.position_manager.create_grid(
+                current_price=current_price,
+                support_levels=supports,
+                resistance_levels=resistances,
+            )
+            if not new_grid:
+                self.logger.warning("网格重建失败")
+                return False
+            
+            # 更新锚点
+            new_grid.anchor_price = current_price
+            new_grid.anchor_ts = int(time.time())
+            self.position_manager._save_state()
+            
+            # 重建后允许重新提交 TP
+            self._tp_orders_submitted = False
+            
+            # 7) 提交买单
+            await self._submit_grid_orders(new_grid, rebuild_mode=True)
+            self._last_rebuild_at = time.time()
+            
+            # 8) 发送通知
+            await self._notify_grid_rebuild(
+                reason="手动触发",
+                old_anchor=old_anchor,
+                new_anchor=current_price,
+                new_orders=[{"side": "buy", "price": o.price, "amount": o.amount_usdt} 
+                           for o in new_grid.buy_orders if not o.is_filled],
+            )
+            
+            self.logger.info(f"✅ 网格强制重建完成: 新锚点={current_price:.2f}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"强制重建网格失败: {e}", exc_info=True)
+            await self._notify_error("RebuildError", str(e), "强制重建网格")
+            return False
+    
     async def _update_account_balance(self) -> None:
         """从交易所更新账户余额"""
         import time

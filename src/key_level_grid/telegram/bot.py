@@ -14,11 +14,13 @@ if TYPE_CHECKING:
     from key_level_grid.strategy import KeyLevelGridStrategy
 
 try:
-    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
     from telegram.ext import (
         Application,
         CommandHandler as TGCommandHandler,
         CallbackQueryHandler,
+        MessageHandler,
+        filters,
         ContextTypes,
     )
     TELEGRAM_AVAILABLE = True
@@ -27,6 +29,8 @@ except ImportError:
     Update = None
     InlineKeyboardButton = None
     InlineKeyboardMarkup = None
+    ReplyKeyboardMarkup = None
+    KeyboardButton = None
 
 
 @dataclass
@@ -92,13 +96,21 @@ class KeyLevelTelegramBot:
         self.app.add_handler(TGCommandHandler("help", self._cmd_help))
         self.app.add_handler(TGCommandHandler("status", self._cmd_status))
         self.app.add_handler(TGCommandHandler("position", self._cmd_position))
+        self.app.add_handler(TGCommandHandler("orders", self._cmd_orders))
         self.app.add_handler(TGCommandHandler("indicators", self._cmd_indicators))
         self.app.add_handler(TGCommandHandler("levels", self._cmd_levels))
+        self.app.add_handler(TGCommandHandler("rebuild", self._cmd_rebuild))
         self.app.add_handler(TGCommandHandler("stop", self._cmd_stop))
         self.app.add_handler(TGCommandHandler("closeall", self._cmd_close_all))
         
         # 注册回调处理器 (按钮点击)
         self.app.add_handler(CallbackQueryHandler(self._handle_callback))
+        
+        # 注册消息处理器 (菜单按钮)
+        self.app.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            self._handle_menu_button
+        ))
         
         # 启动 Bot
         await self.app.initialize()
@@ -106,6 +118,15 @@ class KeyLevelTelegramBot:
         await self.app.updater.start_polling()
         
         self.logger.info("Telegram Bot 已启动")
+    
+    def _get_main_menu(self) -> ReplyKeyboardMarkup:
+        """获取主菜单键盘"""
+        keyboard = [
+            [KeyboardButton("📊 当前持仓"), KeyboardButton("📋 当前挂单")],
+            [KeyboardButton("🔄 更新网格"), KeyboardButton("📍 关键价位")],
+            [KeyboardButton("📈 市场指标"), KeyboardButton("❓ 帮助")],
+        ]
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
     async def stop(self) -> None:
         """停止 Bot"""
@@ -265,6 +286,37 @@ class KeyLevelTelegramBot:
                 signal_data = self._pending_confirmations[signal_id]["signal_data"]
                 detail_text = self._format_signal_detail(signal_data)
                 await query.message.reply_text(detail_text, parse_mode="HTML")
+        
+        elif data == "rebuild_confirm":
+            await query.edit_message_text("🔄 正在更新网格...")
+            if self.strategy:
+                try:
+                    result = await self.strategy.force_rebuild_grid()
+                    if result:
+                        await query.message.reply_text(
+                            "✅ <b>网格更新成功</b>\n\n"
+                            f"已根据最新支撑/阻力位重新挂单",
+                            parse_mode="HTML"
+                        )
+                    else:
+                        await query.message.reply_text("⚠️ 网格更新失败，请查看日志")
+                except Exception as e:
+                    await query.message.reply_text(f"❌ 更新失败: {e}")
+        
+        elif data == "rebuild_cancel":
+            await query.edit_message_text("❌ 已取消更新网格")
+        
+        elif data == "closeall_confirm":
+            await query.edit_message_text("🔄 正在平仓...")
+            if self.strategy:
+                try:
+                    # TODO: 实现平仓逻辑
+                    await query.message.reply_text("⚠️ 平仓功能尚未实现")
+                except Exception as e:
+                    await query.message.reply_text(f"❌ 平仓失败: {e}")
+        
+        elif data == "closeall_cancel":
+            await query.edit_message_text("❌ 已取消平仓")
     
     def _format_signal_detail(self, signal_data: dict) -> str:
         """格式化信号详情"""
@@ -291,14 +343,18 @@ class KeyLevelTelegramBot:
 
 关键位网格交易策略机器人
 
-<b>可用命令:</b>
-/status - 查看策略状态
-/position - 查看当前持仓
-/indicators - 查看市场指标
-/levels - 查看关键价位
-/help - 帮助信息
+请使用下方菜单操作，或输入命令：
+/position - 当前持仓
+/orders - 当前挂单
+/rebuild - 更新网格
+/levels - 关键价位
+/help - 更多帮助
 """
-        await update.message.reply_text(text, parse_mode="HTML")
+        await update.message.reply_text(
+            text, 
+            parse_mode="HTML",
+            reply_markup=self._get_main_menu()
+        )
     
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理 /help 命令"""
@@ -516,4 +572,103 @@ class KeyLevelTelegramBot:
         """设置回调函数"""
         self._on_confirm = on_confirm
         self._on_reject = on_reject
+    
+    async def _handle_menu_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """处理菜单按钮点击"""
+        text = update.message.text
+        
+        if text == "📊 当前持仓":
+            await self._cmd_position(update, context)
+        elif text == "📋 当前挂单":
+            await self._cmd_orders(update, context)
+        elif text == "🔄 更新网格":
+            await self._cmd_rebuild(update, context)
+        elif text == "📍 关键价位":
+            await self._cmd_levels(update, context)
+        elif text == "📈 市场指标":
+            await self._cmd_indicators(update, context)
+        elif text == "❓ 帮助":
+            await self._cmd_help(update, context)
+        # 其他消息忽略
+    
+    async def _cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """处理 /orders 命令 - 查看当前挂单"""
+        if not self.strategy:
+            await update.message.reply_text("❌ 策略未连接")
+            return
+        
+        data = self.strategy.get_display_data()
+        pending_orders = data.get("pending_orders", [])
+        
+        if not pending_orders:
+            await update.message.reply_text("📭 当前无挂单")
+            return
+        
+        # 获取当前价格
+        price_obj = data.get("price", {})
+        current_price = price_obj.get("current", 0) if isinstance(price_obj, dict) else 0
+        
+        # 分类买单和卖单
+        buy_orders = [o for o in pending_orders if o.get("side") == "buy"]
+        sell_orders = [o for o in pending_orders if o.get("side") == "sell"]
+        
+        text = f"📋 <b>当前挂单</b>\n\n当前价格: ${current_price:,.2f}\n"
+        
+        if buy_orders:
+            total_buy = sum(o.get("amount", 0) for o in buy_orders)
+            text += f"\n🟢 <b>买单</b> ({len(buy_orders)}个, 共 {total_buy:,.0f} USDT)\n"
+            buy_orders_sorted = sorted(buy_orders, key=lambda x: -x.get("price", 0))
+            for i, order in enumerate(buy_orders_sorted[:8], 1):
+                price = order.get("price", 0)
+                amount = order.get("amount", 0)
+                pct = (price - current_price) / current_price * 100 if current_price > 0 else 0
+                text += f"├ ${price:,.2f} | {amount:,.0f}U | {pct:+.1f}%\n"
+            if len(buy_orders) > 8:
+                text += f"└ ... 还有 {len(buy_orders) - 8} 个\n"
+        
+        if sell_orders:
+            total_sell = sum(o.get("amount", 0) for o in sell_orders)
+            text += f"\n🔴 <b>卖单</b> ({len(sell_orders)}个, 共 {total_sell:,.0f} USDT)\n"
+            sell_orders_sorted = sorted(sell_orders, key=lambda x: x.get("price", 0))
+            for i, order in enumerate(sell_orders_sorted[:8], 1):
+                price = order.get("price", 0)
+                amount = order.get("amount", 0)
+                pct = (price - current_price) / current_price * 100 if current_price > 0 else 0
+                text += f"├ ${price:,.2f} | {amount:,.0f}U | {pct:+.1f}%\n"
+            if len(sell_orders) > 8:
+                text += f"└ ... 还有 {len(sell_orders) - 8} 个\n"
+        
+        await update.message.reply_text(text, parse_mode="HTML")
+    
+    async def _cmd_rebuild(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """处理 /rebuild 命令 - 强制更新网格"""
+        # 权限检查
+        user_id = update.effective_user.id
+        if self.config.admin_user_ids and user_id not in self.config.admin_user_ids:
+            await update.message.reply_text("❌ 权限不足")
+            return
+        
+        if not self.strategy:
+            await update.message.reply_text("❌ 策略未连接")
+            return
+        
+        # 确认对话框
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ 确认更新", callback_data="rebuild_confirm"),
+                InlineKeyboardButton("❌ 取消", callback_data="rebuild_cancel"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(
+            "🔄 <b>确认更新网格?</b>\n\n"
+            "此操作将:\n"
+            "1. 撤销所有现有挂单\n"
+            "2. 重新计算支撑/阻力位\n"
+            "3. 根据新价位重新挂单\n\n"
+            "⚠️ 已成交的仓位不会受影响",
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
 
