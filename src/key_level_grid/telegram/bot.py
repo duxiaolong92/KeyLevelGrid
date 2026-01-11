@@ -306,6 +306,8 @@ class KeyLevelTelegramBot:
         query = update.callback_query
         await query.answer()
         
+        self.logger.info(f"收到回调: {query.data}")
+        
         data = query.data
         
         if data.startswith("confirm_"):
@@ -667,20 +669,27 @@ class KeyLevelTelegramBot:
         text = update.message.text
         self.logger.info(f"收到菜单按钮: {text}")
         
-        if text == "📊 当前持仓":
-            await self._cmd_position(update, context)
-        elif text == "📋 当前挂单":
-            await self._cmd_orders(update, context)
-        elif text == "🔄 更新网格":
-            await self._cmd_rebuild(update, context)
-        elif text == "📍 关键价位":
-            await self._cmd_levels(update, context)
-        elif text == "📈 市场指标":
-            await self._cmd_indicators(update, context)
-        elif text == "❓ 帮助":
-            await self._cmd_help(update, context)
-        else:
-            self.logger.debug(f"忽略未知消息: {text}")
+        try:
+            if text == "📊 当前持仓":
+                await self._cmd_position(update, context)
+            elif text == "📋 当前挂单":
+                await self._cmd_orders(update, context)
+            elif text == "🔄 更新网格":
+                await self._cmd_rebuild(update, context)
+            elif text == "📍 关键价位":
+                await self._cmd_levels(update, context)
+            elif text == "📈 市场指标":
+                await self._cmd_indicators(update, context)
+            elif text == "❓ 帮助":
+                await self._cmd_help(update, context)
+            else:
+                self.logger.debug(f"忽略未知消息: {text}")
+        except Exception as e:
+            self.logger.error(f"处理菜单按钮异常: {e}", exc_info=True)
+            try:
+                await update.message.reply_text(f"❌ 操作失败: {e}")
+            except Exception:
+                pass
     
     async def _cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理 /orders 命令 - 查看当前挂单"""
