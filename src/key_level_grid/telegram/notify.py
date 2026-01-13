@@ -145,6 +145,39 @@ class NotificationManager:
         self._last_notify_time[notify_type] = now
         return True
     
+    def _format_source(self, source: str) -> str:
+        """格式化来源（支持复合来源如 swing_5+volume_node）"""
+        if not source:
+            return ""
+        
+        source_map = {
+            "volume_node": "VOL",
+            "round_number": "PSY",
+        }
+        
+        parts = source.split("+")
+        abbrs = []
+        for p in parts:
+            p = p.strip()
+            if p.startswith("swing_"):
+                abbrs.append(f"SW{p.replace('swing_', '')}")
+            elif p.startswith("fib_"):
+                abbrs.append(f"FIB{p.replace('fib_', '')}")
+            elif p in source_map:
+                abbrs.append(source_map[p])
+            else:
+                abbrs.append(p[:3].upper())
+        return "+".join(abbrs)
+    
+    def _format_timeframe(self, tf: str) -> str:
+        """格式化周期"""
+        tf_map = {
+            "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+            "1h": "1H", "4h": "4H", "1d": "1D", "1w": "1W",
+            "multi": "MTF",
+        }
+        return tf_map.get(tf, tf.upper() if tf else "")
+    
     async def notify_startup(
         self,
         symbol: str,
@@ -204,7 +237,9 @@ class NotificationManager:
                 r_price = r.get("price", 0)
                 strength = r.get("strength", 0)
                 pct = ((r_price - current_price) / current_price * 100) if current_price > 0 else 0
-                text += f"├ R{i}: ${r_price:,.2f} (+{pct:.1f}%) 强度:{strength:.0f}\n"
+                source = self._format_source(r.get("source", ""))
+                tf = self._format_timeframe(r.get("timeframe", ""))
+                text += f"├ R{i}: ${r_price:,.2f} (+{pct:.1f}%) [{source}] {tf} 💪{strength:.0f}\n"
         
         # 关键价位 - 支撑位（按价格降序）
         if support_levels:
@@ -214,7 +249,9 @@ class NotificationManager:
                 s_price = s.get("price", 0)
                 strength = s.get("strength", 0)
                 pct = ((current_price - s_price) / current_price * 100) if current_price > 0 else 0
-                text += f"├ S{i}: ${s_price:,.2f} (-{pct:.1f}%) 强度:{strength:.0f}\n"
+                source = self._format_source(s.get("source", ""))
+                tf = self._format_timeframe(s.get("timeframe", ""))
+                text += f"├ S{i}: ${s_price:,.2f} (-{pct:.1f}%) [{source}] {tf} 💪{strength:.0f}\n"
         
         # 挂单信息
         buy_orders = [o for o in pending_orders if o.get("side") == "buy"]

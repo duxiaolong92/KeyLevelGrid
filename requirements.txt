@@ -12,7 +12,7 @@ pandas>=2.0.0
 pyyaml>=6.0
 python-dotenv>=1.0.0
 
-# 异步
+# 异步 HTTP（Binance + Polygon API）
 aiohttp>=3.9.0
 
 # 终端显示

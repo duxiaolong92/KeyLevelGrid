@@ -14,24 +14,38 @@ _LOG_FILE_PATH: Optional[str] = None
 _LOG_FILE_HANDLER: Optional[logging.FileHandler] = None
 
 
-def setup_file_logging(log_dir: str = "logs", log_file: str = "key_level_grid.log") -> str:
+def setup_file_logging(
+    log_dir: str = "logs",
+    log_file: str = "key_level_grid.log",
+    log_path: Optional[str] = None,
+    env_key: str = "LOG_FILE_PATH",
+) -> str:
     """
     设置日志文件输出
     
     Args:
         log_dir: 日志目录
         log_file: 日志文件名
+        log_path: 完整路径优先级最高（可覆盖 log_dir/log_file）
+        env_key: 允许通过环境变量覆盖日志路径（默认 LOG_FILE_PATH）
     
     Returns:
         日志文件完整路径
     """
     global _LOG_FILE_PATH, _LOG_FILE_HANDLER
     
-    # 创建日志目录
-    log_path = Path(log_dir)
-    log_path.mkdir(parents=True, exist_ok=True)
-    
-    _LOG_FILE_PATH = str(log_path / log_file)
+    # 优先级: 显式参数 log_path > 环境变量 > log_dir/log_file
+    env_path = os.getenv(env_key, "").strip()
+    if log_path:
+        _LOG_FILE_PATH = log_path
+    elif env_path:
+        _LOG_FILE_PATH = env_path
+    else:
+        if not log_file:
+            log_file = "key_level_grid.log"
+        path_obj = Path(log_dir)
+        path_obj.mkdir(parents=True, exist_ok=True)
+        _LOG_FILE_PATH = str(path_obj / log_file)
     
     # 创建文件处理器
     _LOG_FILE_HANDLER = logging.FileHandler(_LOG_FILE_PATH, encoding='utf-8')

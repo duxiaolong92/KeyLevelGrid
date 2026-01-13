@@ -1,0 +1,50 @@
+# Key Level Grid systemd 服务配置
+# 
+# 安装步骤:
+# 1. 复制到 systemd 目录:
+#    sudo cp /opt/key-level-grid/deploy/klg.service /etc/systemd/system/
+#
+# 2. 重新加载 systemd:
+#    sudo systemctl daemon-reload
+#
+# 3. 设置开机自启:
+#    sudo systemctl enable klg
+#
+# 4. 启动服务:
+#    sudo systemctl start klg
+#
+# 常用命令:
+#    sudo systemctl status klg     # 查看状态
+#    sudo systemctl restart klg    # 重启
+#    sudo journalctl -u klg -f     # 查看实时日志
+
+[Unit]
+Description=Key Level Grid Trading Strategy
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/key-level-grid
+Environment=PATH=/opt/key-level-grid/venv/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/opt/key-level-grid/.env
+
+# 启动命令
+ExecStart=/opt/key-level-grid/venv/bin/python scripts/run.py --config configs/config.yaml
+
+# 重启策略
+Restart=always
+RestartSec=10
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=klg
+
+# 资源限制
+MemoryMax=1G
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

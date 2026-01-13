@@ -1299,7 +1299,26 @@ class GateExecutor(ExchangeExecutor):
                     lambda: self._exchange.fetch_balance()
                 )
                 
-                if asset in balance_data:
+                # 优先从 info 获取 equity（总权益，含未实现盈亏）
+                info = balance_data.get('info', {})
+                if isinstance(info, list) and len(info) > 0:
+                    info = info[0]
+                elif not isinstance(info, dict):
+                    info = {}
+                
+                # Gate.io 合约账户: equity = 总权益(含未实现盈亏), available = 可用
+                equity = float(info.get('equity', 0) or 0)
+                available = float(info.get('available', 0) or 0)
+                
+                if equity > 0:
+                    # 使用 equity 作为总余额（包含未实现盈亏）
+                    return {
+                        'total': equity,
+                        'free': available,
+                        'used': equity - available
+                    }
+                elif asset in balance_data:
+                    # 回退到 CCXT 标准字段
                     asset_balance = balance_data[asset]
                     return {
                         'total': float(asset_balance.get('total', 0) or 0),

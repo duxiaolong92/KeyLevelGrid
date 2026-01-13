@@ -39,6 +39,7 @@ class GridConfig:
     rebuild_enabled: bool = True      # 是否启用自动重建
     rebuild_threshold_pct: float = 0.02  # 价格偏离阈值 2%
     rebuild_cooldown_sec: int = 900   # 重建冷却时间 15分钟
+    rebuild_cooldown_on_fill_sec: int = 600  # 因成交触发重建的冷却时间（秒）
 
 
 @dataclass
@@ -220,7 +221,8 @@ class GridPositionManager:
         stop_loss_config: Optional[StopLossConfig] = None,
         take_profit_config: Optional[TakeProfitConfig] = None,
         resistance_config: Optional[ResistanceConfig] = None,
-        symbol: str = ""
+        symbol: str = "",
+        exchange: str = "",
     ):
         self.grid_config = grid_config or GridConfig()
         self.position_config = position_config or PositionConfig()
@@ -228,6 +230,7 @@ class GridPositionManager:
         self.take_profit_config = take_profit_config or TakeProfitConfig()
         self.resistance_config = resistance_config or ResistanceConfig()
         self.symbol = symbol
+        self.exchange = exchange
         self.logger = get_logger(__name__)
         
         # 当前网格状态
@@ -239,6 +242,8 @@ class GridPositionManager:
         # 持久化
         base_dir = Path(__file__).resolve().parents[3]  # 项目根目录
         self.state_dir = base_dir / "state" / "key_level_grid"
+        if self.exchange:
+            self.state_dir = self.state_dir / self.exchange.lower()
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.state_dir / f"{self.symbol.lower()}_state.json"
     
@@ -292,38 +297,52 @@ class GridPositionManager:
         grid_floor = lower_price * (1 - self.grid_config.floor_buffer)
         
         # ============================================
-        # BTC 等量分配
+        # 每格名义金额（等额或按强度加权）
         # ============================================
         num_grids = len(strong_supports)
         max_position_usdt = self.position_config.max_position_usdt
-        
-        # 计算总 BTC 和每档 BTC
-        total_btc = max_position_usdt / current_price
-        per_grid_btc = total_btc / num_grids
-        
-        self.logger.info(
-            f"📊 网格 BTC 等量分配: 总仓位={max_position_usdt:.0f}U, "
-            f"当前价={current_price:.2f}, 总BTC={total_btc:.6f}, "
-            f"网格数={num_grids}, 每档BTC={per_grid_btc:.6f}"
-        )
-        
-        # 生成买入挂单 (每档 BTC 数量相同)
-        buy_orders = []
-        for i, s in enumerate(strong_supports):
-            amount_usdt = per_grid_btc * s.price  # 计算 USDT 金额 (用于显示)
-            buy_orders.append(
-                GridOrder(
-                    grid_id=i + 1,
-                    price=s.price,
-                    amount_usdt=amount_usdt,
-                    amount_btc=per_grid_btc,
-                    strength=s.strength,
-                    source=getattr(s, 'source', 'unknown'),
+
+        if self.position_config.allocation_mode == "weighted":
+            total_strength = sum(max(s.strength, 0) for s in strong_supports)
+            buy_orders = []
+            for i, s in enumerate(strong_supports):
+                if total_strength > 0:
+                    amount_usdt = max_position_usdt * (s.strength / total_strength)
+                else:
+                    amount_usdt = max_position_usdt / num_grids
+                amount_btc = amount_usdt / s.price
+                buy_orders.append(
+                    GridOrder(
+                        grid_id=i + 1,
+                        price=s.price,
+                        amount_usdt=amount_usdt,
+                        amount_btc=amount_btc,
+                        strength=s.strength,
+                        source=getattr(s, 'source', 'unknown'),
+                    )
                 )
-            )
-            self.logger.debug(
-                f"  网格#{i+1}: {per_grid_btc:.6f} BTC @ {s.price:.2f} = {amount_usdt:.0f}U"
-        )
+                self.logger.debug(
+                    f"  网格#{i+1}: {amount_btc:.6f} BTC @ {s.price:.2f} = {amount_usdt:.0f}U (权重)"
+                )
+        else:
+            per_grid_usdt = max_position_usdt / num_grids
+            buy_orders = []
+            for i, s in enumerate(strong_supports):
+                amount_usdt = per_grid_usdt
+                amount_btc = amount_usdt / s.price
+                buy_orders.append(
+                    GridOrder(
+                        grid_id=i + 1,
+                        price=s.price,
+                        amount_usdt=amount_usdt,
+                        amount_btc=amount_btc,
+                        strength=s.strength,
+                        source=getattr(s, 'source', 'unknown'),
+                    )
+                )
+                self.logger.debug(
+                    f"  网格#{i+1}: {amount_btc:.6f} BTC @ {s.price:.2f} = {amount_usdt:.0f}U"
+                )
         
         # 生成卖出挂单 (止盈) - BTC 数量在实际提交时根据持仓计算
         sell_orders = []
@@ -433,18 +452,6 @@ class GridPositionManager:
             per_tp = new_position / len(self.state.sell_orders)
             for sell_order in self.state.sell_orders:
                 sell_order.amount_usdt = per_tp
-        
-        # 对未成交买单重新等额分配剩余额度，保持一致性
-        max_position = self.position_config.max_position_usdt
-        remaining_cap = max_position - new_position
-        unfilled_buys = [o for o in self.state.buy_orders if not o.is_filled]
-        if remaining_cap > 0 and unfilled_buys:
-            per_buy = remaining_cap / len(unfilled_buys)
-            for buy_order in unfilled_buys:
-                buy_order.amount_usdt = per_buy
-        elif remaining_cap <= 0:
-            for buy_order in unfilled_buys:
-                buy_order.amount_usdt = 0
         
         self.logger.info(
             f"网格买入: #{order.grid_id} @ {fill_price:.2f}, "

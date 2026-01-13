@@ -124,7 +124,7 @@ key-level-grid/
 
 ### 2. 网格下单
 
-- 在强支撑位（评分 ≥ 80）布置买单
+- 在强支撑位（评分 ≥ 60，可配置）布置买单
 - 每个网格分配等量 BTC
 - 最大仓位 = 总资金 × 杠杆 × 使用率
 
@@ -218,4 +218,96 @@ telegram:
 | `/setname` | 修改 Bot 名称 |
 | `/setdescription` | 设置 Bot 描述 |
 | `/deletebot` | 删除 Bot |
+
+## 多实例运行（多交易所/多币种）
+
+> 适合同时跑多个网格实例（例如 BTC / SOL / ETH），每实例 = 1 交易所 + 1 交易对 + 1 进程 + 1 独立 Bot。
+
+### 1. 为每个交易对准备独立配置
+- 复制一份配置，按需修改 `trading.symbol`、杠杆、网格等参数，例如：
+  - `configs/gate_btc.yaml`
+  - `configs/gate_sol.yaml`
+  - `configs/gate_eth.yaml`
+- 每个实例使用独立的 Telegram Bot（在 `.env` 配置不同的 `TG_BOT_TOKEN_xxx`、`TG_CHAT_ID_xxx`，并在对应 yaml 中引用）。
+
+### 2. 配置实例清单 `configs/instances.yaml`
+```yaml
+launcher:
+  mode: "multi_process"
+  log_dir: "logs/instances"
+
+instances:
+  - name: "gate_btc"
+    config_path: "configs/gate_btc.yaml"
+  - name: "gate_sol"
+    config_path: "configs/gate_sol.yaml"
+  - name: "gate_eth"
+    config_path: "configs/gate_eth.yaml"
+```
+
+### 3. 启动多实例
+```bash
+PYTHONPATH=src python scripts/run_instances.py --config configs/instances.yaml
+```
+
+### 4. 日志与状态隔离
+- 日志：每实例写入 `logs/instances/{name}.log`
+- 状态：`state/key_level_grid/{exchange}/{symbol}_state.json`（按交易所+交易对隔离，避免覆盖）
+
+### 5. 注意事项
+- 同一交易所账号需确保当前服务器 IP 已加入 API 白名单，否则会出现 403 FORBIDDEN。
+- 机器带宽/CPU 需能承载多路 WebSocket/K线与下单请求。
+- 如果需单实例运行，仍可用原命令：`python scripts/run.py --config configs/config.yaml`
+
+## 关键价位计算工具（CLI + Telegram）
+
+支持计算任意加密货币或美股的支撑/阻力位。
+
+### 1. CLI 命令行工具
+
+```bash
+# 美股 TSLA，4h + 1d 多周期融合
+python scripts/calc_levels.py TSLA 4h 1d
+
+# 币圈 BTC
+python scripts/calc_levels.py BTCUSDT 4h 1d
+
+# 美股 AAPL，仅显示 5 个价位
+python scripts/calc_levels.py AAPL 1d --count 5
+
+# JSON 格式输出
+python scripts/calc_levels.py NVDA 4h --output json
+```
+
+**参数说明**：
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `symbol` | 标的代码 | 必填 |
+| `timeframes` | K线周期（可多个） | 必填 |
+| `--min-strength` | 最低强度阈值 | 60 |
+| `--count` | 返回数量 | 10 |
+| `--output` | 输出格式 (table/json) | table |
+
+### 2. Telegram 查询
+
+在 Bot 中发送命令：
+
+```
+/levels TSLA 4h 1d    # 查询美股 TSLA
+/levels BTCUSDT 4h    # 查询币圈 BTC
+/levels               # 无参数 = 当前策略标的
+```
+
+### 3. 美股数据源配置（Polygon）
+
+美股数据使用 [Polygon.io](https://polygon.io/) API，需要配置 API Key：
+
+1. 注册 Polygon.io 账号（免费套餐支持延迟数据）
+2. 在 `.env` 文件中添加：
+
+```bash
+POLYGON_API_KEY=your_polygon_api_key
+```
+
+**注意**：免费套餐有请求频率限制（5次/分钟），付费套餐可获取实时数据。
 

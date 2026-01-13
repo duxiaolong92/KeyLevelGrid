@@ -116,7 +116,7 @@ strategy.py (核心逻辑)
 - 不支持多实例共享状态
 - 需要定期保存（已实现）
 
-**状态文件路径**: `state/key_level_grid/{symbol}_state.json`
+**状态文件路径**: `state/key_level_grid/{exchange}/{symbol}_state.json`
 
 ---
 

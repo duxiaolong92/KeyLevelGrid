@@ -5,6 +5,7 @@ Telegram Bot 核心模块
 """
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
@@ -82,6 +83,9 @@ class KeyLevelTelegramBot:
         # 回调处理器
         self._on_confirm: Optional[Callable] = None
         self._on_reject: Optional[Callable] = None
+
+        # 最近一次收到指令的时间戳（用于卡死检测）
+        self._last_update_ts: float = time.time()
     
     def set_strategy(self, strategy: "KeyLevelGridStrategy") -> None:
         """设置策略引用"""
@@ -133,6 +137,7 @@ class KeyLevelTelegramBot:
         # 验证 polling 状态
         if self.app.updater.running:
             self.logger.info(f"✅ Telegram Bot polling 已启动，chat_id={self.config.chat_id}")
+            self._last_update_ts = time.time()
         else:
             self.logger.error("❌ Telegram Bot polling 启动失败")
     
@@ -150,7 +155,7 @@ class KeyLevelTelegramBot:
         keyboard = [
             [KeyboardButton("📊 当前持仓"), KeyboardButton("📋 当前挂单")],
             [KeyboardButton("🔄 更新网格"), KeyboardButton("📍 关键价位")],
-            [KeyboardButton("📈 市场指标"), KeyboardButton("❓ 帮助")],
+            [KeyboardButton("🔍 查询价位")],  # 查询任意标的的支撑/阻力位
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -168,6 +173,10 @@ class KeyLevelTelegramBot:
         if not self.app or not self.app.updater:
             return False
         return self.app.updater.running
+
+    def get_last_update_ts(self) -> float:
+        """获取最近一次收到用户指令的时间戳"""
+        return self._last_update_ts
     
     async def restart(self) -> None:
         """重启 Bot"""
@@ -180,6 +189,10 @@ class KeyLevelTelegramBot:
         await asyncio.sleep(2)
         await self.start()
         self.logger.info("Telegram Bot 已重启")
+
+    def _mark_alive(self) -> None:
+        """更新最近活动时间戳"""
+        self._last_update_ts = time.time()
     
     async def send_message(self, text: str, parse_mode: str = "HTML") -> None:
         """发送消息"""
@@ -307,6 +320,7 @@ class KeyLevelTelegramBot:
         await query.answer()
         
         self.logger.info(f"收到回调: {query.data}")
+        self._mark_alive()
         
         data = query.data
         
@@ -520,6 +534,23 @@ class KeyLevelTelegramBot:
         
         grid_floor = position.get("grid_floor", 0)
         
+        # 计算止损相关数据
+        sl_id = getattr(self.strategy, "_stop_loss_order_id", None) if self.strategy else None
+        
+        # 止损触发时的价值和预计亏损
+        if grid_floor > 0 and qty > 0 and entry_price > 0:
+            sl_value = grid_floor * qty  # 止损触发时的平仓价值
+            sl_loss = (entry_price - grid_floor) * qty  # 预计亏损（做多）
+            stop_loss_line = f"触发价=${grid_floor:,.2f}, 价值: {sl_value:,.0f} USDT, 预计亏损: {sl_loss:,.0f} USDT"
+        elif grid_floor > 0:
+            stop_loss_line = f"触发价=${grid_floor:,.2f}"
+        else:
+            stop_loss_line = "未设置"
+        
+        # 如果止损单未提交，添加提示
+        if not sl_id and grid_floor > 0:
+            stop_loss_line += " (待提交)"
+        
         text = f"""
 💼 <b>当前持仓</b>
 
@@ -529,7 +560,8 @@ class KeyLevelTelegramBot:
 ├ 均价: ${entry_price:,.2f}
 ├ 当前价: ${current_price:,.2f}
 ├ 未实现盈亏: {pnl_emoji} {pnl:+,.2f} USDT ({pnl_pct:+.2%})
-└ 网格底线: ${grid_floor:,.2f}
+├ 网格底线: ${grid_floor:,.2f}
+└ 止损单: {stop_loss_line}
 """
         await update.message.reply_text(text, parse_mode="HTML")
     
@@ -580,9 +612,28 @@ class KeyLevelTelegramBot:
         await update.message.reply_text(text, parse_mode="HTML")
     
     async def _cmd_levels(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """处理 /levels 命令 - 显示关键价位"""
+        """
+        处理 /levels 命令 - 显示关键价位
+        
+        支持两种用法:
+        1. /levels         - 显示当前策略标的的关键价位
+        2. /levels TSLA 4h 1d  - 查询任意标的的关键价位
+        """
+        args = context.args if context.args else []
+        
+        # 如果有参数，查询任意标的
+        if args:
+            await self._query_external_levels(update, args)
+            return
+        
+        # 无参数，显示当前策略标的
         if not self.strategy:
-            await update.message.reply_text("❌ 策略未连接")
+            await update.message.reply_text(
+                "❌ 策略未连接\n\n"
+                "💡 你可以查询任意标的:\n"
+                "/levels TSLA 4h 1d\n"
+                "/levels BTCUSDT 4h 1d"
+            )
             return
         
         data = self.strategy.get_display_data()
@@ -590,26 +641,275 @@ class KeyLevelTelegramBot:
         resistance = data.get("resistance_levels", [])
         support = data.get("support_levels", [])
         
-        # 阻力位按价格降序排列（高价在前）
-        resistance = sorted(resistance, key=lambda x: -x.get("price", 0))[:5]
-        # 支撑位按价格降序排列（高价在前）
-        support = sorted(support, key=lambda x: -x.get("price", 0))[:5]
-        
-        text = f"📍 <b>关键价位</b>\n\n当前价: ${price:,.2f}\n\n"
-        
-        text += "<b>阻力位:</b>\n"
-        for i, r in enumerate(resistance):
-            r_price = r.get("price", 0)
-            pct = ((r_price - price) / price * 100) if price > 0 else 0
-            text += f"├ R{i+1}: ${r_price:,.2f} (+{pct:.1f}%)\n"
-        
-        text += "\n<b>支撑位:</b>\n"
-        for i, s in enumerate(support):
-            s_price = s.get("price", 0)
-            pct = ((price - s_price) / price * 100) if price > 0 else 0
-            text += f"├ S{i+1}: ${s_price:,.2f} (-{pct:.1f}%)\n"
+        text = self._format_levels_text(
+            symbol="当前标的",
+            timeframes=[],
+            price=price,
+            resistance=resistance,
+            support=support,
+        )
         
         await update.message.reply_text(text, parse_mode="HTML")
+    
+    async def _query_external_levels(self, update: Update, args: list) -> None:
+        """
+        查询任意标的的关键价位
+        
+        Args:
+            args: [symbol, timeframe1, timeframe2, ...]
+        """
+        import time
+        
+        if len(args) < 2:
+            await update.message.reply_text(
+                "❌ 参数不足\n\n"
+                "用法: /levels <标的> <周期1> [周期2] ...\n"
+                "示例:\n"
+                "  /levels TSLA 4h 1d\n"
+                "  /levels BTCUSDT 4h\n"
+                "  /levels AAPL 1d"
+            )
+            return
+        
+        symbol = args[0].upper()
+        timeframes = [tf.lower() for tf in args[1:]]
+        
+        # 限流检查（每用户每分钟 5 次）
+        user_id = update.effective_user.id
+        cache_key = f"levels_query_{user_id}"
+        now = time.time()
+        
+        if not hasattr(self, "_query_rate_limit"):
+            self._query_rate_limit = {}
+        
+        user_queries = self._query_rate_limit.get(cache_key, [])
+        # 清理 1 分钟前的记录
+        user_queries = [t for t in user_queries if now - t < 60]
+        
+        if len(user_queries) >= 5:
+            await update.message.reply_text("⚠️ 查询太频繁，请稍后再试（每分钟限 5 次）")
+            return
+        
+        user_queries.append(now)
+        self._query_rate_limit[cache_key] = user_queries
+        
+        # 发送处理中消息
+        processing_msg = await update.message.reply_text(
+            f"⏳ 正在计算 {symbol} 关键价位..."
+        )
+        
+        try:
+            # 调用计算逻辑
+            result = await self._calculate_external_levels(symbol, timeframes)
+            
+            if result.get("error"):
+                await processing_msg.edit_text(f"❌ {result['error']}")
+                return
+            
+            # 格式化输出
+            text = self._format_levels_text(
+                symbol=symbol,
+                timeframes=timeframes,
+                price=result["current_price"],
+                resistance=result["resistance"],
+                support=result["support"],
+            )
+            
+            # 如果使用了较低的阈值，添加提示
+            min_strength_used = result.get("min_strength_used", 60)
+            if min_strength_used < 60:
+                text += f"\n\n<i>⚠️ 该标的波动较小，使用了较低阈值 (≥{min_strength_used})</i>"
+            
+            await processing_msg.edit_text(text, parse_mode="HTML")
+            
+        except Exception as e:
+            self.logger.error(f"查询 {symbol} 关键价位失败: {e}", exc_info=True)
+            await processing_msg.edit_text(f"❌ 查询失败: {str(e)[:100]}")
+    
+    async def _calculate_external_levels(self, symbol: str, timeframes: list) -> dict:
+        """
+        计算任意标的的关键价位
+        
+        自动检测数据源（币圈/美股）
+        """
+        from key_level_grid.models import Timeframe
+        from key_level_grid.resistance import ResistanceCalculator, ResistanceConfig
+        
+        # 检测数据源
+        crypto_suffixes = ["USDT", "USD", "BTC", "ETH", "BUSD", "USDC"]
+        is_crypto = any(symbol.endswith(suffix) for suffix in crypto_suffixes)
+        
+        try:
+            if is_crypto:
+                # 币圈：使用 Binance
+                klines_dict = await self._fetch_binance_klines_for_query(symbol, timeframes)
+            else:
+                # 美股：使用 Polygon
+                klines_dict = await self._fetch_polygon_klines_for_query(symbol, timeframes)
+            
+            if not klines_dict or not klines_dict.get(timeframes[0]):
+                return {"error": f"未获取到 {symbol} 的 K 线数据"}
+            
+            primary_klines = klines_dict[timeframes[0]]
+            current_price = primary_klines[-1].close
+            
+            # 计算价位（使用新的多周期接口，支持 1~3 个周期）
+            config = ResistanceConfig()
+            calculator = ResistanceCalculator(config)
+            
+            resistances = calculator.calculate_resistance_levels(
+                current_price=current_price,
+                klines=primary_klines,
+                direction="long",
+                klines_by_timeframe=klines_dict,  # 新的多周期参数
+            )
+            
+            supports = calculator.calculate_support_levels(
+                current_price=current_price,
+                klines=primary_klines,
+                klines_by_timeframe=klines_dict,  # 新的多周期参数
+            )
+            
+            # 格式化结果（自动降级阈值）
+            # 先尝试 min_strength=60，如果结果太少则降低到 40，再降低到 30
+            for min_strength in [60, 40, 30]:
+                resistance_list = [
+                    {
+                        "price": r.price,
+                        "strength": r.strength,
+                        "type": r.level_type.value if hasattr(r.level_type, 'value') else str(r.level_type),
+                    }
+                    for r in resistances if r.strength >= min_strength
+                ][:10]
+                
+                support_list = [
+                    {
+                        "price": s.price,
+                        "strength": s.strength,
+                        "type": s.level_type.value if hasattr(s.level_type, 'value') else str(s.level_type),
+                    }
+                    for s in supports if s.strength >= min_strength
+                ][:10]
+                
+                # 如果有足够的结果，使用当前阈值
+                if len(resistance_list) >= 3 or len(support_list) >= 3:
+                    break
+            
+            return {
+                "current_price": current_price,
+                "resistance": resistance_list,
+                "support": support_list,
+                "min_strength_used": min_strength,  # 返回实际使用的阈值
+            }
+            
+        except Exception as e:
+            self.logger.error(f"计算 {symbol} 价位失败: {e}", exc_info=True)
+            return {"error": str(e)}
+    
+    async def _fetch_binance_klines_for_query(self, symbol: str, timeframes: list) -> dict:
+        """获取 Binance K 线用于查询"""
+        from key_level_grid.kline_feed import BinanceKlineFeed
+        from key_level_grid.models import KlineFeedConfig, Timeframe
+        
+        primary_tf = Timeframe.from_string(timeframes[0])
+        aux_tfs = [Timeframe.from_string(tf) for tf in timeframes[1:]] if len(timeframes) > 1 else []
+        
+        config = KlineFeedConfig(
+            symbol=symbol,
+            primary_timeframe=primary_tf,
+            auxiliary_timeframes=aux_tfs,
+            history_bars=500,
+        )
+        
+        feed = BinanceKlineFeed(config)
+        await feed.start()
+        
+        result = {}
+        try:
+            klines = await feed.get_latest_klines(primary_tf)
+            result[timeframes[0]] = klines
+            
+            for tf_str in timeframes[1:]:
+                tf = Timeframe.from_string(tf_str)
+                klines = feed.get_cached_klines(tf)
+                result[tf_str] = klines
+        finally:
+            await feed.stop()
+        
+        return result
+    
+    async def _fetch_polygon_klines_for_query(self, symbol: str, timeframes: list) -> dict:
+        """获取 Polygon K 线用于查询"""
+        from key_level_grid.polygon_kline_feed import PolygonKlineFeed
+        from key_level_grid.models import Timeframe
+        
+        feed = PolygonKlineFeed(symbol)
+        await feed.start()
+        
+        result = {}
+        try:
+            for tf_str in timeframes:
+                tf = Timeframe.from_string(tf_str)
+                klines = await feed.get_klines(tf, 500)
+                result[tf_str] = klines
+        finally:
+            await feed.stop()
+        
+        return result
+    
+    def _format_levels_text(
+        self,
+        symbol: str,
+        timeframes: list,
+        price: float,
+        resistance: list,
+        support: list,
+    ) -> str:
+        """格式化关键价位文本"""
+        # 类型简写映射
+        type_map = {
+            "swing_high": "SW", "swing_low": "SW",
+            "fib_retracement": "FIB", "fib_extension": "FIB",
+            "psychological": "PSY", "volume_node": "VOL",
+            "resistance": "R", "support": "S",
+        }
+        
+        def get_type_abbr(level_type: str) -> str:
+            return type_map.get(level_type, level_type[:3].upper() if level_type else "?")
+        
+        # 阻力位按价格降序排列
+        resistance = sorted(resistance, key=lambda x: -x.get("price", 0))[:10]
+        # 支撑位按价格降序排列
+        support = sorted(support, key=lambda x: -x.get("price", 0))[:10]
+        
+        tf_str = f"（{' + '.join(timeframes)}）" if timeframes else ""
+        text = f"📍 <b>{symbol} 关键价位</b>{tf_str}\n\n当前价: ${price:,.2f}\n\n"
+        
+        text += "<b>阻力位:</b>\n"
+        if resistance:
+            for i, r in enumerate(resistance):
+                r_price = r.get("price", 0)
+                strength = r.get("strength", 0)
+                level_type = get_type_abbr(r.get("type", ""))
+                pct = ((r_price - price) / price * 100) if price > 0 else 0
+                text += f"├ R{i+1}: ${r_price:,.2f} (+{pct:.1f}%) [{level_type}] 💪{strength:.0f}\n"
+        else:
+            text += "├ 无阻力位数据\n"
+        
+        text += "\n<b>支撑位:</b>\n"
+        if support:
+            for i, s in enumerate(support):
+                s_price = s.get("price", 0)
+                strength = s.get("strength", 0)
+                level_type = get_type_abbr(s.get("type", ""))
+                pct = ((price - s_price) / price * 100) if price > 0 else 0
+                text += f"├ S{i+1}: ${s_price:,.2f} (-{pct:.1f}%) [{level_type}] 💪{strength:.0f}\n"
+        else:
+            text += "├ 无支撑位数据\n"
+        
+        text += "\n<i>类型: SW=摆动点 FIB=斐波那契 PSY=心理关口 VOL=成交密集区</i>"
+        
+        return text
     
     async def _cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理 /stop 命令"""
@@ -667,9 +967,27 @@ class KeyLevelTelegramBot:
     async def _handle_menu_button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理菜单按钮点击"""
         text = update.message.text
+        user_id = update.effective_user.id
         self.logger.info(f"收到菜单按钮: {text}")
+        self._mark_alive()
+        
+        # 初始化用户状态存储
+        if not hasattr(self, "_user_states"):
+            self._user_states = {}
+        
+        # 菜单按钮列表（点击这些按钮时清除等待状态）
+        menu_buttons = [
+            "📊 当前持仓", "📋 当前挂单", "🔄 更新网格", 
+            "📍 关键价位", "🔍 查询价位", "📈 市场指标", "❓ 帮助"
+        ]
         
         try:
+            # 如果点击了菜单按钮，清除等待状态
+            if text in menu_buttons:
+                if user_id in self._user_states:
+                    del self._user_states[user_id]
+            
+            # 处理菜单按钮
             if text == "📊 当前持仓":
                 await self._cmd_position(update, context)
             elif text == "📋 当前挂单":
@@ -678,18 +996,91 @@ class KeyLevelTelegramBot:
                 await self._cmd_rebuild(update, context)
             elif text == "📍 关键价位":
                 await self._cmd_levels(update, context)
+            elif text == "🔍 查询价位":
+                await self._prompt_levels_query(update, context)
             elif text == "📈 市场指标":
                 await self._cmd_indicators(update, context)
             elif text == "❓ 帮助":
                 await self._cmd_help(update, context)
             else:
-                self.logger.debug(f"忽略未知消息: {text}")
+                # 非菜单按钮消息，检查是否在等待输入
+                if user_id in self._user_states and self._user_states[user_id].get("waiting_for") == "levels_query":
+                    await self._handle_levels_query_input(update, context, text)
+                else:
+                    self.logger.debug(f"忽略未知消息: {text}")
         except Exception as e:
             self.logger.error(f"处理菜单按钮异常: {e}", exc_info=True)
             try:
                 await update.message.reply_text(f"❌ 操作失败: {e}")
             except Exception:
                 pass
+    
+    async def _prompt_levels_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """提示用户输入标的和周期"""
+        user_id = update.effective_user.id
+        
+        # 初始化用户状态存储
+        if not hasattr(self, "_user_states"):
+            self._user_states = {}
+        
+        # 设置等待状态
+        self._user_states[user_id] = {
+            "waiting_for": "levels_query",
+            "timestamp": __import__("time").time(),
+        }
+        
+        text = """
+🔍 <b>查询任意标的的支撑/阻力位</b>
+
+请输入 <b>标的代码</b> 和 <b>周期</b>：
+
+<b>格式:</b> <code>标的 周期1 [周期2] [周期3]</code>
+
+<b>示例:</b>
+• <code>TSLA 4h 1d</code> - 美股特斯拉
+• <code>AAPL 1d</code> - 美股苹果
+• <code>BTCUSDT 4h 1d</code> - 币圈比特币
+• <code>ETHUSDT 15m 4h 1d</code> - 币圈以太坊
+
+<b>支持周期:</b> 15m, 1h, 4h, 1d, 1w
+
+<i>输入 "取消" 返回菜单</i>
+"""
+        await update.message.reply_text(text, parse_mode="HTML")
+    
+    async def _handle_levels_query_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        """处理用户输入的标的和周期"""
+        user_id = update.effective_user.id
+        
+        # 清除等待状态
+        if hasattr(self, "_user_states") and user_id in self._user_states:
+            del self._user_states[user_id]
+        
+        # 检查是否取消
+        if text.lower() in ["取消", "cancel", "q", "quit"]:
+            await update.message.reply_text(
+                "✅ 已取消查询",
+                reply_markup=self._get_main_menu()
+            )
+            return
+        
+        # 解析输入（支持空格或逗号分隔）
+        # 先将逗号替换为空格，再分割
+        normalized = text.replace(",", " ").replace("，", " ")  # 支持中英文逗号
+        parts = [p.strip() for p in normalized.split() if p.strip()]
+        
+        if len(parts) < 2:
+            await update.message.reply_text(
+                "❌ 格式错误，请输入：<code>标的 周期</code>\n"
+                "例如：<code>TSLA 4h 1d</code> 或 <code>BTCUSDT 5m, 15m</code>",
+                parse_mode="HTML",
+                reply_markup=self._get_main_menu()
+            )
+            return
+        
+        # 调用现有的查询逻辑
+        args = parts  # [symbol, tf1, tf2, ...]
+        await self._query_external_levels(update, args)
     
     async def _cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理 /orders 命令 - 查看当前挂单"""
@@ -713,7 +1104,21 @@ class KeyLevelTelegramBot:
         sell_orders = [o for o in pending_orders if o.get("side") == "sell"]
         
         text = f"📋 <b>当前挂单</b>\n\n当前价格: ${current_price:,.2f}\n"
-        
+
+        # 卖单在上，按价格降序
+        if sell_orders:
+            total_sell = sum(o.get("amount", 0) for o in sell_orders)
+            text += f"\n🔴 <b>卖单</b> ({len(sell_orders)}个, 共 {total_sell:,.0f} USDT)\n"
+            sell_orders_sorted = sorted(sell_orders, key=lambda x: -x.get("price", 0))
+            for i, order in enumerate(sell_orders_sorted[:8], 1):
+                price = order.get("price", 0)
+                amount = order.get("amount", 0)
+                pct = (price - current_price) / current_price * 100 if current_price > 0 else 0
+                text += f"├ ${price:,.2f} | {amount:,.0f}U | {pct:+.1f}%\n"
+            if len(sell_orders) > 8:
+                text += f"└ ... 还有 {len(sell_orders) - 8} 个\n"
+
+        # 买单在下，按价格降序
         if buy_orders:
             total_buy = sum(o.get("amount", 0) for o in buy_orders)
             text += f"\n🟢 <b>买单</b> ({len(buy_orders)}个, 共 {total_buy:,.0f} USDT)\n"
@@ -725,18 +1130,6 @@ class KeyLevelTelegramBot:
                 text += f"├ ${price:,.2f} | {amount:,.0f}U | {pct:+.1f}%\n"
             if len(buy_orders) > 8:
                 text += f"└ ... 还有 {len(buy_orders) - 8} 个\n"
-        
-        if sell_orders:
-            total_sell = sum(o.get("amount", 0) for o in sell_orders)
-            text += f"\n🔴 <b>卖单</b> ({len(sell_orders)}个, 共 {total_sell:,.0f} USDT)\n"
-            sell_orders_sorted = sorted(sell_orders, key=lambda x: x.get("price", 0))
-            for i, order in enumerate(sell_orders_sorted[:8], 1):
-                price = order.get("price", 0)
-                amount = order.get("amount", 0)
-                pct = (price - current_price) / current_price * 100 if current_price > 0 else 0
-                text += f"├ ${price:,.2f} | {amount:,.0f}U | {pct:+.1f}%\n"
-            if len(sell_orders) > 8:
-                text += f"└ ... 还有 {len(sell_orders) - 8} 个\n"
         
         await update.message.reply_text(text, parse_mode="HTML")
     

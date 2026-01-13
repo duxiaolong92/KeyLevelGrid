@@ -1,0 +1,11 @@
+# 多实例启动器配置示例
+launcher:
+  mode: "multi_process"        # 固定：每实例一个进程
+  log_dir: "logs/instances"    # 每实例日志目录
+
+instances:
+  - name: "gate_btc"
+    config_path: "configs/config.yaml"   # 这里可替换为你的 BTC 配置
+
+  # - name: "okx_eth"
+  #   config_path: "configs/okx_eth.yaml"

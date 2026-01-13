@@ -17,8 +17,9 @@ trading:
   margin_mode: "cross"        # 保证金模式: cross (全仓) | isolated (逐仓)
   leverage: 10                 # 杠杆倍数 (建议 3-5x，与 position.max_leverage 保持一致)
   timeframe: "4h"             # 主交易周期
-  aux_timeframes:             # 辅助周期 (多周期融合)
+  aux_timeframes:             # 辅助周期 (多周期融合，最多 2 个，总共支持 1~3 个周期)
     - "1d"
+    - "1w"                  # 示例: ["1d"] 或 ["4h", "1d"] 或 ["1h"]
 
 # K线数据源配置
 kline_feed:
@@ -33,28 +34,29 @@ kline_feed:
 # ============================================
 grid:
   # 网格区间
-  range_mode: "auto"          # auto: 基于 S/R 自动计算 | manual: 手动设置
-  manual_upper: 95000        # manual 模式: 上边界
-  manual_lower: 87000         # manual 模式: 下边界
+  range_mode: "manual"          # auto: 基于 S/R 自动计算 | manual: 手动设置
+  manual_upper: 98000        # manual 模式: 上边界
+  manual_lower: 80000         # manual 模式: 下边界
   
   # 网格数量
   count_mode: "by_levels"     # by_levels: 按有效支撑位数量 | fixed: 固定数量
-  fixed_count: 10              # fixed 模式: 网格数量
-  max_grids: 20               # 最大网格数量
+  # fixed_count: 10              # fixed 模式: 网格数量
+  # max_grids: 20               # 最大网格数量
   
   # 网格底线 (止损线)
   floor_buffer: 0.005         # 最低支撑下方 0.5%
   
   # 网格重建 (价格大幅偏离锚点时自动重建)
   rebuild_enabled: true       # 是否启用自动重建
-  rebuild_threshold_pct: 0.02 # 价格偏离阈值 2%
+  rebuild_threshold_pct: 1 # 价格偏离阈值 2%
   rebuild_cooldown_sec: 900   # 重建冷却时间 15分钟 (900秒)
+  rebuild_cooldown_on_fill_sec: 900 #成交驱动重建冷却
 
 # ============================================
 # 仓位配置
 # ============================================
 position:
-  total_capital: 5000         # 账户总金额 (USDT)
+  total_capital: 800         # 账户总金额 (USDT)
   max_leverage: 10            # 最大杠杆 (需与 trading.leverage 保持一致)
   max_capital_usage: 0.8      # 使用 80% 资金，留 20% 缓冲
   
@@ -68,14 +70,14 @@ position:
 stop_loss:
   mode: "total"               # total: 统一止损 (不对单个网格止损)
   trigger: "grid_floor"       # grid_floor: 跌破网格底线触发 | fixed_pct: 固定比例
-  fixed_pct: 0.10             # fixed_pct 模式: 10% 止损
+  # fixed_pct: 0.10             # fixed_pct 模式: 10% 止损
 
 # ============================================
 # 止盈配置 (按阻力位)
 # ============================================
 take_profit:
   mode: "by_resistance"       # by_resistance: 按阻力位止盈 | fixed_pct: 固定比例
-  fixed_pct: 0.05             # fixed_pct 模式: 5% 止盈
+  # fixed_pct: 0.05             # fixed_pct 模式: 5% 止盈
   # by_resistance 模式: 每个阻力位止盈 = 总持仓 / 有效阻力位数量
 
 # ============================================
@@ -83,7 +85,7 @@ take_profit:
 # ============================================
 resistance:
   # 强度阈值 (核心参数)
-  min_strength: 80            # 只使用 >= 80 分的支撑/阻力位
+  min_strength: 60            # 只使用 >= 80 分的支撑/阻力位
   
   # 摆动高低点 (三尺度)
   swing_lookbacks:

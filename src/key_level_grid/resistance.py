@@ -58,6 +58,7 @@ class ResistanceConfig:
     # 多周期融合
     multi_timeframe: bool = True
     mtf_boost: float = 0.30            # 多周期叠加强度提升 30%
+    auxiliary_boost: float = 1.2       # 辅助周期（非主周期）强度加成
     
     # 过滤
     min_distance_pct: float = 0.005    # 最小距离 0.5%
@@ -107,101 +108,170 @@ class ResistanceCalculator:
         direction: str = "long",
         klines_1d: Optional[List[Kline]] = None,
         stop_loss: Optional[float] = None,
-        primary_timeframe: str = "4h"
+        primary_timeframe: str = "4h",
+        *,
+        klines_by_timeframe: Optional[Dict[str, List[Kline]]] = None,
     ) -> List[PriceLevel]:
         """
         计算阻力位 (多周期融合版)
         
+        支持两种调用方式：
+        1. 旧接口（向后兼容）：klines + klines_1d + primary_timeframe
+        2. 新接口（推荐）：klines_by_timeframe={"4h": [...], "1d": [...]}
+        
         Args:
             current_price: 当前价格
-            klines: 主周期 K线列表
+            klines: 主周期 K线列表（旧接口）
             direction: 交易方向 "long" | "short"
-            klines_1d: 辅助周期 K线列表 (可选，用于多周期融合)
+            klines_1d: 辅助周期 K线列表（旧接口，已废弃）
             stop_loss: 止损价 (可选，用于过滤低盈亏比)
-            primary_timeframe: 主周期名称 (如 "15m", "1h", "4h")
+            primary_timeframe: 主周期名称（旧接口）
+            klines_by_timeframe: 多周期 K线字典（新接口，推荐）
+                格式: {"4h": [...], "1d": [...]} 或 {"15m": [...], "4h": [...], "1d": [...]}
+                第一个为主周期，后续为辅助周期（最多支持 3 个周期）
             
         Returns:
             按综合得分排序的阻力位列表
         """
-        all_levels: List[PriceLevel] = []
+        # 统一转换为多周期字典格式
+        if klines_by_timeframe:
+            tf_dict = klines_by_timeframe
+        else:
+            # 向后兼容：从旧参数构建字典
+            tf_dict = {primary_timeframe: klines}
+            if klines_1d:
+                tf_dict["1d"] = klines_1d
         
-        # === 主周期阻力位 ===
-        levels_primary = self._calculate_single_timeframe(
-            klines, current_price, direction, primary_timeframe
+        return self._calculate_levels_multi_tf(
+            current_price=current_price,
+            klines_by_timeframe=tf_dict,
+            direction=direction,
+            stop_loss=stop_loss,
+            level_type="resistance",
         )
-        all_levels.extend(levels_primary)
-        
-        # === 1D 周期阻力位 ===
-        if self.config.multi_timeframe and klines_1d:
-            levels_1d = self._calculate_single_timeframe(
-                klines_1d, current_price, direction, "1d"
-            )
-            # 日线级别强度基础提升 20%
-            for level in levels_1d:
-                level.strength = min(100, level.strength * 1.2)
-            all_levels.extend(levels_1d)
-        
-        # === 多周期融合 ===
-        if self.config.multi_timeframe and klines_1d:
-            all_levels = self._fuse_multi_timeframe(all_levels)
-        
-        # === 合并相近价位 ===
-        merged = self._merge_levels(all_levels)
-        
-        # === 过滤 ===
-        filtered = self._filter_levels(merged, current_price, direction, stop_loss)
-        
-        # === 排序: 综合强度和距离 ===
-        return self._sort_levels(filtered, current_price, direction)
     
     def calculate_support_levels(
         self,
         current_price: float,
         klines: List[Kline],
         klines_1d: Optional[List[Kline]] = None,
-        primary_timeframe: str = "4h"
+        primary_timeframe: str = "4h",
+        *,
+        klines_by_timeframe: Optional[Dict[str, List[Kline]]] = None,
     ) -> List[PriceLevel]:
         """
         计算支撑位 (做多止损参考)
         
-        不再依赖 EMA 通道，仅使用技术位
+        支持两种调用方式：
+        1. 旧接口（向后兼容）：klines + klines_1d + primary_timeframe
+        2. 新接口（推荐）：klines_by_timeframe={"4h": [...], "1d": [...]}
         
         Args:
             current_price: 当前价格
-            klines: 主周期 K线列表
-            klines_1d: 辅助周期 K线列表
-            primary_timeframe: 主周期名称 (如 "15m", "1h", "4h")
+            klines: 主周期 K线列表（旧接口）
+            klines_1d: 辅助周期 K线列表（旧接口，已废弃）
+            primary_timeframe: 主周期名称（旧接口）
+            klines_by_timeframe: 多周期 K线字典（新接口，推荐）
             
         Returns:
             按价格排序的支撑位列表 (从高到低)
         """
+        # 统一转换为多周期字典格式
+        if klines_by_timeframe:
+            tf_dict = klines_by_timeframe
+        else:
+            # 向后兼容：从旧参数构建字典
+            tf_dict = {primary_timeframe: klines}
+            if klines_1d:
+                tf_dict["1d"] = klines_1d
+        
+        return self._calculate_levels_multi_tf(
+            current_price=current_price,
+            klines_by_timeframe=tf_dict,
+            direction="short",  # 支撑位在价格下方
+            stop_loss=None,
+            level_type="support",
+        )
+    
+    def _calculate_levels_multi_tf(
+        self,
+        current_price: float,
+        klines_by_timeframe: Dict[str, List[Kline]],
+        direction: str,
+        stop_loss: Optional[float],
+        level_type: str,  # "resistance" or "support"
+    ) -> List[PriceLevel]:
+        """
+        多周期融合计算价位（内部核心方法）
+        
+        Args:
+            current_price: 当前价格
+            klines_by_timeframe: 多周期 K线字典，如 {"4h": [...], "1d": [...]}
+            direction: "long" 找阻力位，"short" 找支撑位
+            stop_loss: 止损价（可选）
+            level_type: "resistance" 或 "support"
+            
+        Returns:
+            排序后的价位列表
+        """
+        if not klines_by_timeframe:
+            return []
+        
+        # 获取周期列表（限制最多 3 个）
+        timeframes = list(klines_by_timeframe.keys())[:3]
+        if not timeframes:
+            return []
+        
+        primary_tf = timeframes[0]
+        auxiliary_tfs = timeframes[1:]
+        
         all_levels: List[PriceLevel] = []
         
-        # === 主周期支撑位 ===
-        levels_primary = self._calculate_single_timeframe(
-            klines, current_price, "short", primary_timeframe  # short 方向找下方支撑
-        )
-        all_levels.extend([l for l in levels_primary if l.price < current_price])
-        
-        # === 1D 周期支撑位 ===
-        if self.config.multi_timeframe and klines_1d:
-            levels_1d = self._calculate_single_timeframe(
-                klines_1d, current_price, "short", "1d"
+        # === 主周期价位 ===
+        primary_klines = klines_by_timeframe.get(primary_tf, [])
+        if primary_klines:
+            levels_primary = self._calculate_single_timeframe(
+                primary_klines, current_price, direction, primary_tf
             )
-            for level in levels_1d:
-                level.strength = min(100, level.strength * 1.2)
-            all_levels.extend([l for l in levels_1d if l.price < current_price])
+            if level_type == "support":
+                levels_primary = [l for l in levels_primary if l.price < current_price]
+            all_levels.extend(levels_primary)
+        
+        # === 辅助周期价位（强度加成） ===
+        if self.config.multi_timeframe:
+            for aux_tf in auxiliary_tfs:
+                aux_klines = klines_by_timeframe.get(aux_tf, [])
+                if not aux_klines:
+                    continue
+                
+                levels_aux = self._calculate_single_timeframe(
+                    aux_klines, current_price, direction, aux_tf
+                )
+                
+                # 辅助周期强度加成（默认 1.2）
+                for level in levels_aux:
+                    level.strength = min(100, level.strength * self.config.auxiliary_boost)
+                
+                if level_type == "support":
+                    levels_aux = [l for l in levels_aux if l.price < current_price]
+                
+                all_levels.extend(levels_aux)
         
         # === 多周期融合 ===
-        if self.config.multi_timeframe and klines_1d:
+        if self.config.multi_timeframe and len(timeframes) > 1:
             all_levels = self._fuse_multi_timeframe(all_levels)
         
-        # 合并并排序 (从高到低)
+        # === 合并相近价位 ===
         merged = self._merge_levels(all_levels)
-        merged = [l for l in merged if l.price < current_price]
-        merged.sort(key=lambda x: -x.price)
         
-        return merged
+        if level_type == "support":
+            merged = [l for l in merged if l.price < current_price]
+        
+        # === 过滤 ===
+        filtered = self._filter_levels(merged, current_price, direction, stop_loss)
+        
+        # === 排序: 综合强度和距离 ===
+        return self._sort_levels(filtered, current_price, direction)
     
     # ==================== 单周期计算 ====================
     

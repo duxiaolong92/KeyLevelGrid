@@ -360,7 +360,7 @@ def create_display(strategy: KeyLevelGridStrategy) -> Layout:
     return layout
 
 
-async def run_strategy(config_path: str):
+async def run_strategy(config_path: str, force_rebuild: bool = False):
     """运行策略"""
     load_dotenv()
     
@@ -392,6 +392,18 @@ async def run_strategy(config_path: str):
     
     # 等待初始数据
     await asyncio.sleep(3)
+
+    # 可选：启动后立即强制重建一次网格
+    if force_rebuild:
+        console.print("[yellow]⏳ 强制重建网格中...[/yellow]")
+        try:
+            ok = await strategy.force_rebuild_grid()
+            if ok:
+                console.print("[green]✅ 已强制重建网格[/green]")
+            else:
+                console.print("[red]⚠️ 强制重建网格失败（可能是数据不足或 DryRun）[/red]")
+        except Exception as e:
+            console.print(f"[red]❌ 强制重建网格异常: {e}[/red]")
     
     # 实时显示
     try:
@@ -409,16 +421,26 @@ async def run_strategy(config_path: str):
 def main():
     # 初始化日志文件
     from key_level_grid.utils.logger import setup_file_logging
-    log_file = setup_file_logging()
-    console.print(f"[dim]📝 日志文件: {log_file}[/dim]")
-    
     parser = argparse.ArgumentParser(description="Key Level Grid Strategy Runner")
     parser.add_argument(
         "--config", "-c",
         default="configs/config.yaml",
         help="配置文件路径"
     )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="日志文件路径（可选，未提供则使用默认 logs/key_level_grid.log 或环境变量 LOG_FILE_PATH）"
+    )
+    parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="启动后立即强制重建当前网格"
+    )
     args = parser.parse_args()
+
+    log_file = setup_file_logging(log_file=args.log_file)
+    console.print(f"[dim]📝 日志文件: {log_file}[/dim]")
     
     # 检查配置文件
     config_path = Path(args.config)
@@ -430,7 +452,7 @@ def main():
             console.print(f"[red]❌ 配置文件不存在: {args.config}[/red]")
             sys.exit(1)
     
-    asyncio.run(run_strategy(str(config_path)))
+    asyncio.run(run_strategy(str(config_path), force_rebuild=args.force_rebuild))
 
 
 if __name__ == "__main__":

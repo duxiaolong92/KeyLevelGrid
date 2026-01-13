@@ -24,7 +24,7 @@ from key_level_grid.indicator import IndicatorConfig, KeyLevelGridIndicator
 from key_level_grid.kline_feed import BinanceKlineFeed
 from key_level_grid.models import Kline, KlineFeedConfig, Timeframe, KeyLevelGridState
 from key_level_grid.mtf_manager import MultiTimeframeManager
-from key_level_grid.position import PositionConfig, KeyLevelPositionManager
+from key_level_grid.position import PositionConfig, KeyLevelPositionManager, ResistanceConfig
 from key_level_grid.signal import SignalConfig, SignalType, KeyLevelSignal, KeyLevelSignalGenerator
 
 
@@ -50,6 +50,7 @@ class KeyLevelGridConfig:
     breakout_config: BreakoutFilterConfig = None
     position_config: PositionConfig = None
     grid_config: "GridConfig" = None  # V2.3: 网格配置
+    resistance_config: ResistanceConfig = None  # 支撑/阻力配置
     
     # 运行模式
     dry_run: bool = True                  # 模拟交易
@@ -76,6 +77,8 @@ class KeyLevelGridConfig:
             self.breakout_config = BreakoutFilterConfig()
         if self.position_config is None:
             self.position_config = PositionConfig()
+        if self.resistance_config is None:
+            self.resistance_config = ResistanceConfig()
 
 
 class KeyLevelGridStrategy:
@@ -122,8 +125,9 @@ class KeyLevelGridStrategy:
             position_config=config.position_config,
             stop_loss_config=StopLossConfig(),
             take_profit_config=TakeProfitConfig(),
-            resistance_config=ResistanceConfig(min_strength=80),
-            symbol=config.symbol
+            resistance_config=config.resistance_config if config.resistance_config else ResistanceConfig(),
+            symbol=config.symbol,
+            exchange=config.exchange,
         )
         
         # 初始化交易所执行器 (Gate)
@@ -144,12 +148,16 @@ class KeyLevelGridStrategy:
         self._gate_position: Dict[str, Any] = {}  # 当前持仓
         self._position_updated_at: float = 0
         self._last_position_usdt: float = 0  # 上次持仓价值（用于检测变化）
+        self._last_position_contracts: Optional[int] = None  # 上次持仓张数（None 表示未初始化）
         self._tp_orders_submitted: bool = False  # 止盈单是否已提交
+        self._need_rebuild_after_fill: bool = False  # 持仓变化后标记重建
         
         # 止损单状态
         self._stop_loss_order_id: Optional[str] = None  # 当前止损单 ID
         self._stop_loss_contracts: float = 0  # 止损单覆盖的张数
         self._sl_order_updated_at: float = 0  # 止损单更新时间
+        self._sl_synced_from_exchange: bool = False  # 是否已从交易所同步止损单
+        self._sl_last_entry_price: float = 0  # 止损前的入场价（用于计算亏损）
         
         # Gate 成交记录缓存
         self._gate_trades: List[Dict] = []
@@ -162,6 +170,7 @@ class KeyLevelGridStrategy:
         self._pending_signal: Optional[KeyLevelSignal] = None
         self._restored_state = False
         self._grid_created = False  # 网格是否已创建
+        self._last_rebuild_at = 0.0
         
         # 回调
         self._on_signal_callback = None
@@ -300,6 +309,13 @@ class KeyLevelGridStrategy:
         signal_config = SignalConfig(
             min_score=resistance_raw.get('min_strength', 80),  # 使用支撑位强度阈值
         )
+        # 支撑/阻力配置
+        resistance_config = ResistanceConfig(
+            min_strength=resistance_raw.get('min_strength', 80),
+            swing_lookbacks=resistance_raw.get('swing_lookbacks', [5, 13, 34]),
+            fib_ratios=resistance_raw.get('fib_ratios', [0.382, 0.5, 0.618, 1.0, 1.618]),
+            merge_tolerance=resistance_raw.get('merge_tolerance', 0.005),
+        )
         
         # V2.3: 仓位配置 (网格模式)
         pos_raw = raw_config.get('position', {})
@@ -343,6 +359,7 @@ class KeyLevelGridStrategy:
             rebuild_enabled=grid_raw.get('rebuild_enabled', True),
             rebuild_threshold_pct=grid_raw.get('rebuild_threshold_pct', 0.02),
             rebuild_cooldown_sec=grid_raw.get('rebuild_cooldown_sec', 900),
+            rebuild_cooldown_on_fill_sec=grid_raw.get('rebuild_cooldown_on_fill_sec', 600),
         )
         logging.info(f"[Config] 网格配置: rebuild_enabled={grid_config.rebuild_enabled}, "
                      f"rebuild_threshold={grid_config.rebuild_threshold_pct:.2%}, "
@@ -371,6 +388,7 @@ class KeyLevelGridStrategy:
             signal_config=signal_config,
             position_config=position_config,
             grid_config=grid_config,
+            resistance_config=resistance_config,
             dry_run=raw_config.get('dry_run', True),
             tg_enabled=tg_enabled,
             tg_bot_token=tg_bot_token,
@@ -447,6 +465,33 @@ class KeyLevelGridStrategy:
         # 发送停止通知
         await self._send_shutdown_notification(reason)
     
+    def _build_klines_by_timeframe(self, primary_klines: list = None) -> dict:
+        """
+        构建多周期 K 线字典（用于支撑/阻力位计算）
+        
+        Args:
+            primary_klines: 主周期 K 线（可选，如果不传则从缓存获取）
+            
+        Returns:
+            {"4h": [...], "1d": [...]} 格式的字典
+        """
+        kline_config = self.config.kline_config
+        primary_tf = kline_config.primary_timeframe
+        
+        # 主周期
+        if primary_klines is None:
+            primary_klines = self.kline_feed.get_cached_klines(primary_tf)
+        
+        klines_dict = {primary_tf.value: primary_klines}
+        
+        # 辅助周期（最多支持 2 个辅助周期，总共 3 个）
+        for aux_tf in kline_config.auxiliary_timeframes[:2]:
+            aux_klines = self.kline_feed.get_cached_klines(aux_tf)
+            if aux_klines:
+                klines_dict[aux_tf.value] = aux_klines
+        
+        return klines_dict
+    
     async def _update_cycle(self) -> None:
         """更新周期"""
         # 获取最新K线
@@ -489,6 +534,11 @@ class KeyLevelGridStrategy:
                         await self._submit_grid_orders(self.position_manager.state)
             self._restored_state = True
         
+        # T004: 启动时同步交易所现有止损单（仅一次）
+        if not self._sl_synced_from_exchange and self._executor:
+            await self._sync_stop_loss_from_exchange()
+            self._sl_synced_from_exchange = True
+        
         # 更新实时K线
         await self.kline_feed.update_latest(
             self.config.kline_config.primary_timeframe
@@ -516,7 +566,7 @@ class KeyLevelGridStrategy:
         if not self._grid_created and self._current_state:
             await self._create_initial_grid(klines)
 
-        # 价格偏离触发：自动重建网格（方案A：重建模式跳过均价保护）
+        # 价格偏离 / 成交触发：自动重建网格
         if self._grid_created and self._current_state and self.position_manager.state:
             await self._maybe_rebuild_grid(klines)
         
@@ -525,6 +575,9 @@ class KeyLevelGridStrategy:
         
         # 检测持仓变化，更新止损单
         await self._check_and_update_stop_loss_order()
+        
+        # T005: 检测止损单是否被触发
+        await self._check_stop_loss_triggered()
         
         # 更新仓位 (如果有)
         if self.position_manager.state:
@@ -577,19 +630,28 @@ class KeyLevelGridStrategy:
         
         threshold = grid_cfg.rebuild_threshold_pct
         cooldown_sec = grid_cfg.rebuild_cooldown_sec
+        fill_cooldown = grid_cfg.rebuild_cooldown_on_fill_sec
         
         move_pct = abs(current_price - anchor_price) / anchor_price
         last_rebuild_at = getattr(self, "_last_rebuild_at", 0.0) or 0.0
-        if last_rebuild_at and (time.time() - last_rebuild_at) < cooldown_sec:
-            return
+        now_ts = time.time()
 
-        if move_pct < threshold:
-            return
-
-        self.logger.warning(
-            f"🔄 触发网格重建: current={current_price:.2f}, anchor={anchor_price:.2f}, "
-            f"move={move_pct:.2%} > {threshold:.2%}"
-        )
+        # 成交驱动的重建：优先于偏离逻辑，带独立冷却
+        if getattr(self, "_need_rebuild_after_fill", False):
+            if last_rebuild_at and (now_ts - last_rebuild_at) < fill_cooldown:
+                # 冷却中，保留标记等待下次
+                return
+            self.logger.warning("🔄 因持仓变动触发重建（成交驱动）")
+        else:
+            # 偏离驱动
+            if last_rebuild_at and (now_ts - last_rebuild_at) < cooldown_sec:
+                return
+            if move_pct < threshold:
+                return
+            self.logger.warning(
+                f"🔄 触发网格重建: current={current_price:.2f}, anchor={anchor_price:.2f}, "
+                f"move={move_pct:.2%} > {threshold:.2%}"
+            )
 
         gate_symbol = self._convert_to_gate_symbol(self.config.symbol)
 
@@ -605,19 +667,15 @@ class KeyLevelGridStrategy:
         # 2) 同步一次挂单缓存
         await self._update_gate_orders()
 
-        # 3) 重新计算支撑/阻力位
-        from key_level_grid.models import Timeframe
-        klines_1d = None
-        if Timeframe.D1 in self.config.kline_config.auxiliary_timeframes:
-            klines_1d = self.kline_feed.get_cached_klines(Timeframe.D1)
-
+        # 3) 重新计算支撑/阻力位（使用多周期融合）
+        klines_dict = self._build_klines_by_timeframe(klines)
         resistance_calc = self.position_manager.resistance_calc
-        primary_tf = self.config.kline_config.primary_timeframe.value
+        
         resistances = resistance_calc.calculate_resistance_levels(
-            current_price, klines, "long", klines_1d=klines_1d, primary_timeframe=primary_tf
+            current_price, klines, "long", klines_by_timeframe=klines_dict
         )
         supports = resistance_calc.calculate_support_levels(
-            current_price, klines, klines_1d=klines_1d, primary_timeframe=primary_tf
+            current_price, klines, klines_by_timeframe=klines_dict
         )
 
         if not supports:
@@ -647,6 +705,7 @@ class KeyLevelGridStrategy:
         # 5) 提交买单：重建模式跳过均价保护（方案A）
         await self._submit_grid_orders(new_grid, rebuild_mode=True)
         self._last_rebuild_at = time.time()
+        self._need_rebuild_after_fill = False
     
     async def force_rebuild_grid(self) -> bool:
         """
@@ -694,19 +753,15 @@ class KeyLevelGridStrategy:
                 self.logger.warning("K线数据不足，无法重建")
                 return False
             
-            # 4) 重新计算支撑/阻力位
-            from key_level_grid.models import Timeframe
-            klines_1d = None
-            if Timeframe.D1 in self.config.kline_config.auxiliary_timeframes:
-                klines_1d = self.kline_feed.get_cached_klines(Timeframe.D1)
-            
+            # 4) 重新计算支撑/阻力位（使用多周期融合）
+            klines_dict = self._build_klines_by_timeframe(klines)
             resistance_calc = self.position_manager.resistance_calc
-            primary_tf = self.config.kline_config.primary_timeframe.value
+            
             resistances = resistance_calc.calculate_resistance_levels(
-                current_price, klines, "long", klines_1d=klines_1d, primary_timeframe=primary_tf
+                current_price, klines, "long", klines_by_timeframe=klines_dict
             )
             supports = resistance_calc.calculate_support_levels(
-                current_price, klines, klines_1d=klines_1d, primary_timeframe=primary_tf
+                current_price, klines, klines_by_timeframe=klines_dict
             )
             
             if not supports:
@@ -741,6 +796,7 @@ class KeyLevelGridStrategy:
             # 7) 提交买单
             await self._submit_grid_orders(new_grid, rebuild_mode=True)
             self._last_rebuild_at = time.time()
+            self._need_rebuild_after_fill = False
             
             # 8) 发送通知
             await self._notify_grid_rebuild(
@@ -917,6 +973,10 @@ class KeyLevelGridStrategy:
                             f"📊 Gate 持仓同步: {real_btc:.6f} BTC ({raw_contracts:.0f}张) @ {entry_price:.2f}, "
                             f"价值={self._gate_position['notional']:.2f} USDT, contractSize={contract_size}"
                         )
+                        # 首次同步时对齐基准，避免虚假成交通知
+                        if getattr(self, "_last_position_contracts", None) is None:
+                            self._last_position_contracts = int(raw_contracts)
+                            self._last_position_usdt = float(self._gate_position["notional"])
                         break
             
             if not self._gate_position:
@@ -1000,24 +1060,34 @@ class KeyLevelGridStrategy:
         last_contracts = getattr(self, "_last_position_contracts", 0)
         
         # 检测持仓增加（买单成交）
+        if last_contracts is None:
+            # 首次初始化基准，不发送通知
+            self._last_position_contracts = current_contracts
+            self._last_position_usdt = current_position_usdt
+            return
+
         if current_contracts > last_contracts:
             added_contracts = current_contracts - last_contracts
             self.logger.info(
                 f"🎯 持仓增加: +{added_contracts}张, "
                 f"当前持仓: {current_contracts}张 (≈{current_position_usdt:.0f} USDT)"
             )
+            # 标记需要重建（成交驱动）
+            self._need_rebuild_after_fill = True
             
-            # 发送买入成交通知
+            # 发送买入成交通知（使用真实 contract_size）
             fill_price = float(self._gate_position.get("entry_price", 0) or 0)
-            contract_size = 0.001  # BTC 合约面值
+            contract_size = float(self._gate_position.get("contract_size", getattr(self, "_contract_size", 0.0001)) or 0.0001)
             fill_amount = added_contracts * contract_size * fill_price  # USDT
-            await self._notify_order_filled(
-                side="buy",
-                fill_price=fill_price,
-                fill_amount=fill_amount,
-                grid_index=0,
-                realized_pnl=0,
-            )
+            # 避免 contract_size 异常导致巨额金额
+            if fill_amount > 0:
+                await self._notify_order_filled(
+                    side="buy",
+                    fill_price=fill_price,
+                    fill_amount=fill_amount,
+                    grid_index=0,
+                    realized_pnl=0,
+                )
             
             # 重新提交止盈单（会自动计算正确的数量）
             await self._submit_take_profit_orders(current_position_usdt)
@@ -1029,21 +1099,24 @@ class KeyLevelGridStrategy:
                 f"✅ 持仓减少: -{reduced_contracts}张 (止盈成交), "
                 f"当前持仓: {current_contracts}张 (≈{current_position_usdt:.0f} USDT)"
             )
+            # 标记需要重建（成交驱动）
+            self._need_rebuild_after_fill = True
             
-            # 发送卖出成交通知
+            # 发送卖出成交通知（使用真实 contract_size）
             fill_price = float(self._gate_position.get("mark_price", 0) or 0)
-            contract_size = 0.001  # BTC 合约面值
+            contract_size = float(self._gate_position.get("contract_size", getattr(self, "_contract_size", 0.0001)) or 0.0001)
             fill_amount = reduced_contracts * contract_size * fill_price  # USDT
             # 计算实现盈亏（简化估算）
             entry_price = float(self._gate_position.get("entry_price", 0) or 0)
             realized_pnl = (fill_price - entry_price) * reduced_contracts * contract_size if entry_price > 0 else 0
-            await self._notify_order_filled(
-                side="sell",
-                fill_price=fill_price,
-                fill_amount=fill_amount,
-                grid_index=0,
-                realized_pnl=realized_pnl,
-            )
+            if fill_amount > 0:
+                await self._notify_order_filled(
+                    side="sell",
+                    fill_price=fill_price,
+                    fill_amount=fill_amount,
+                    grid_index=0,
+                    realized_pnl=realized_pnl,
+                )
             
             # 如果全部平仓，重置状态
             if current_contracts == 0:
@@ -1188,6 +1261,8 @@ class KeyLevelGridStrategy:
                 self._stop_loss_order_id = str(order_id) if order_id else "pending"
                 self._stop_loss_contracts = contracts
                 self._sl_order_updated_at = time.time()
+                # T005: 保存入场价，用于止损触发时计算亏损
+                self._sl_last_entry_price = float(self._gate_position.get('entry_price', 0) or 0)
                 self.logger.info(f"✅ 止损单提交成功: ID={self._stop_loss_order_id}")
                 return True
             else:
@@ -1236,6 +1311,150 @@ class KeyLevelGridStrategy:
         self._stop_loss_contracts = 0
         
         return success
+    
+    async def _sync_stop_loss_from_exchange(self) -> None:
+        """
+        T004: 启动时从交易所同步现有止损单
+        
+        避免重启后重复提交止损单
+        """
+        if self.config.dry_run or not self._executor:
+            self.logger.debug("止损单同步: dry_run 或无执行器，跳过")
+            return
+        
+        try:
+            # 查询交易所现有的计划委托（止损单）
+            symbol = self._convert_to_gate_symbol(self.config.symbol)
+            plan_orders = await self._executor.get_plan_orders(symbol, status='open')
+            
+            if not plan_orders:
+                self.logger.info("📊 启动同步: 交易所无现有止损单")
+                return
+            
+            # 查找 reduce_only 的卖单（止损单特征）
+            for order in plan_orders:
+                # Gate plan order 结构: {id, contract, size, trigger, ...}
+                order_id = str(order.get('id', ''))
+                size = abs(int(order.get('size', 0)))  # 负数表示卖
+                is_sell = int(order.get('size', 0)) < 0
+                reduce_only = order.get('is_reduce_only', False) or order.get('reduce_only', False)
+                trigger_info = order.get('trigger', {})
+                trigger_price = float(trigger_info.get('price', 0) if isinstance(trigger_info, dict) else 0)
+                
+                # 止损单特征：卖出 + reduce_only
+                if is_sell and size > 0:
+                    self._stop_loss_order_id = order_id
+                    self._stop_loss_contracts = size
+                    self.logger.info(
+                        f"✅ 启动同步: 找到现有止损单 ID={order_id}, "
+                        f"数量={size}张, 触发价=${trigger_price:,.2f}"
+                    )
+                    return
+            
+            self.logger.info("📊 启动同步: 未找到符合条件的止损单")
+            
+        except Exception as e:
+            self.logger.error(f"❌ 同步止损单失败: {e}", exc_info=True)
+    
+    async def _check_stop_loss_triggered(self) -> None:
+        """
+        T005: 检测止损单是否被触发执行，并发送通知
+        
+        检测逻辑：
+        1. 之前有止损单 ID 且有止损张数
+        2. 现在持仓变为 0（或大幅减少）
+        3. 查询止损单状态，确认已执行
+        """
+        if self.config.dry_run or not self._executor:
+            return
+        
+        # 没有止损单，无需检测
+        if not self._stop_loss_order_id or self._stop_loss_contracts == 0:
+            return
+        
+        try:
+            # 查询止损单状态
+            symbol = self._convert_to_gate_symbol(self.config.symbol)
+            plan_orders = await self._executor.get_plan_orders(symbol, status='finished')
+            
+            # 查找我们的止损单是否已执行
+            for order in plan_orders:
+                order_id = str(order.get('id', ''))
+                if order_id == self._stop_loss_order_id:
+                    # 止损单已执行
+                    status = order.get('status', '')
+                    finish_as = order.get('finish_as', '')
+                    
+                    if finish_as == 'succeeded' or status == 'finished':
+                        # 计算亏损
+                        trigger_info = order.get('trigger', {})
+                        trigger_price = float(trigger_info.get('price', 0) if isinstance(trigger_info, dict) else 0)
+                        contracts = abs(int(order.get('size', 0)))
+                        contract_size = float(self._gate_position.get('contract_size', 0.0001) or 0.0001)
+                        
+                        # 使用之前保存的入场价计算亏损
+                        entry_price = self._sl_last_entry_price or float(self._gate_position.get('entry_price', 0) or 0)
+                        
+                        if entry_price > 0 and trigger_price > 0:
+                            # 做多止损：亏损 = (入场价 - 触发价) * 数量
+                            loss_usdt = (entry_price - trigger_price) * contracts * contract_size
+                            loss_pct = (trigger_price - entry_price) / entry_price * 100
+                            
+                            await self._notify_stop_loss_triggered(
+                                trigger_price=trigger_price,
+                                contracts=contracts,
+                                loss_usdt=abs(loss_usdt),
+                                loss_pct=abs(loss_pct),
+                                entry_price=entry_price,
+                            )
+                        
+                        # 清空本地止损单状态
+                        self._stop_loss_order_id = None
+                        self._stop_loss_contracts = 0
+                        self._sl_last_entry_price = 0
+                        return
+                        
+        except Exception as e:
+            self.logger.error(f"❌ 检测止损触发失败: {e}", exc_info=True)
+    
+    async def _notify_stop_loss_triggered(
+        self,
+        trigger_price: float,
+        contracts: int,
+        loss_usdt: float,
+        loss_pct: float,
+        entry_price: float,
+    ) -> None:
+        """
+        T005: 发送止损触发通知
+        """
+        self.logger.warning(
+            f"🛑 止损触发: {contracts}张 @ ${trigger_price:,.2f}, "
+            f"亏损 ${loss_usdt:,.2f} ({loss_pct:.2f}%)"
+        )
+        
+        if not self._notifier:
+            return
+        
+        try:
+            contract_size = float(self._gate_position.get('contract_size', 0.0001) or 0.0001)
+            position_btc = contracts * contract_size
+            position_usdt = position_btc * trigger_price
+            
+            text = f"""🛑 <b>止损触发</b>
+
+├ 触发价: ${trigger_price:,.2f}
+├ 入场均价: ${entry_price:,.2f}
+├ 平仓数量: {contracts}张 (≈{position_btc:.6f} BTC)
+├ 平仓价值: ${position_usdt:,.2f}
+└ <b>亏损: ${loss_usdt:,.2f} ({loss_pct:.2f}%)</b>
+
+⚠️ 止损单已执行，持仓已清空"""
+            
+            await self._notifier.send_message(text)
+            
+        except Exception as e:
+            self.logger.error(f"发送止损通知失败: {e}")
     
     async def _submit_take_profit_orders(self, position_usdt: float) -> None:
         """
@@ -1467,21 +1686,15 @@ class KeyLevelGridStrategy:
         
         current_price = self._current_state.close
         
-        # 获取 1D K线用于多周期融合
-        from key_level_grid.models import Timeframe
-        klines_1d = None
-        if Timeframe.D1 in self.config.kline_config.auxiliary_timeframes:
-            klines_1d = self.kline_feed.get_cached_klines(Timeframe.D1)
-        
-        # 计算支撑位和阻力位
+        # 计算支撑位和阻力位（使用多周期融合）
+        klines_dict = self._build_klines_by_timeframe(klines)
         resistance_calc = self.position_manager.resistance_calc
-        primary_tf = self.config.kline_config.primary_timeframe.value
         
         resistances = resistance_calc.calculate_resistance_levels(
-            current_price, klines, "long", klines_1d=klines_1d, primary_timeframe=primary_tf
+            current_price, klines, "long", klines_by_timeframe=klines_dict
         )
         supports = resistance_calc.calculate_support_levels(
-            current_price, klines, klines_1d=klines_1d, primary_timeframe=primary_tf
+            current_price, klines, klines_by_timeframe=klines_dict
         )
         
         if not supports:
@@ -1587,87 +1800,44 @@ class KeyLevelGridStrategy:
         if current_price <= 0:
             current_price = grid_state.buy_orders[0].price
         
-        # 总是基于当前的 max_position_usdt 计算（确保与账户余额同步）
-        max_position_usdt = self.position_manager.position_config.max_position_usdt
-        total_contracts = int(max_position_usdt / (current_price * contract_size)) if contract_size > 0 else 0
-        contracts_per_grid = max(1, int(total_contracts / num_grids)) if total_contracts > 0 else 1
-        
-        # 检查是否与保存的配置一致，如有变化则更新
-        saved_contracts = grid_state.per_grid_contracts
-        if saved_contracts > 0 and saved_contracts != contracts_per_grid:
-            self.logger.warning(
-                f"⚠️ 网格配置变化: 保存={saved_contracts}张 → 当前={contracts_per_grid}张 "
-                f"(max_pos={max_position_usdt:.0f}U), 使用新配置"
-            )
-        
-        # 更新并保存
-        grid_state.per_grid_contracts = contracts_per_grid
+        # 记录合同规模用于后续转换
         grid_state.contract_size = contract_size
         grid_state.num_grids = num_grids
         self.position_manager._save_state()
         
-        self.logger.info(
-            f"📊 网格配置: max_position={max_position_usdt:.0f}U, "
-            f"总张数≈{total_contracts}, 每档={contracts_per_grid}张"
-        )
-        
-        per_grid_btc = contracts_per_grid * contract_size
-        
         # ============================================
         # 4. 三层过滤：计算已成交网格数 + 均价保护
-        # ============================================
         position_contracts = int(float(self._gate_position.get("raw_contracts", 0) or 0))
         avg_entry_price = float(self._gate_position.get("entry_price", 0) or 0)
-        
-        # 规则 A：计算已成交网格数
-        filled_grids = 0
-        if position_contracts > 0 and contracts_per_grid > 0:
-            filled_grids = math.ceil(position_contracts / contracts_per_grid)
-        
-        # 规则 C：均价保护阈值（网格重建模式跳过）
         price_threshold = avg_entry_price * 0.995 if (avg_entry_price > 0 and not rebuild_mode) else 0
-        
+
+        # 5. 买单排序（按价格从高到低）
+        leverage = self.config.leverage or 20
+        sorted_orders = sorted(grid_state.buy_orders, key=lambda x: x.price, reverse=True)
+
+        # 粗略估计每格张数（用于日志）：取首档金额
+        ref_contracts_per_grid = 0
+        if sorted_orders:
+            ref_contracts_per_grid = int(sorted_orders[0].amount_usdt / (sorted_orders[0].price * contract_size)) or 1
+
+        filled_grids = 0
+        if position_contracts > 0 and ref_contracts_per_grid > 0:
+            filled_grids = math.ceil(position_contracts / ref_contracts_per_grid)
+
         self.logger.info(
-            f"📊 过滤参数: 持仓={position_contracts}张, 已成交网格={filled_grids}, "
+            f"📊 过滤参数: 持仓={position_contracts}张, 已成交网格≈{filled_grids}, "
             f"均价={avg_entry_price:.2f}, 均价保护阈值={price_threshold:.2f}"
         )
-        
-        # ============================================
-        # 5. 买单排序（按价格从高到低）
-        # ============================================
-        sorted_orders = sorted(grid_state.buy_orders, key=lambda x: x.price, reverse=True)
-        
-        # ============================================
-        # 5.5 余额检查：如果余额不足以支撑一格，跳过所有买单
-        # ============================================
-        # 计算单格所需保证金（考虑杠杆）
-        leverage = self.config.leverage or 20
-        single_grid_usdt = contracts_per_grid * contract_size * current_price
-        single_grid_margin = single_grid_usdt / leverage
-        
-        if available_balance < single_grid_margin:
-            self.logger.warning(
-                f"⚠️ 余额不足，跳过所有买单: 可用={available_balance:.2f}U, "
-                f"单格需={single_grid_margin:.2f}U (杠杆{leverage}x)"
-            )
-            # 不返回，继续执行止盈单逻辑（如果有持仓）
-            return
-        
-        # ============================================
-        # 6. 提交买单（双重过滤：均价保护 + Gate 去重）
-        # ============================================
-        # 注意：移除了"规则 A（跳过前 N 个）"，因为它与"规则 C（均价保护）"重复
-        # 均价保护更精确：只跳过 price >= avg_entry * 0.995 的买单
-        
+
         submitted_count = 0
         skipped_exists = 0
         skipped_threshold = 0
         failed_count = 0
-        
+
         for idx, order in enumerate(sorted_orders):
             if order.is_filled:
                 continue
-            
+
             # 规则 B：跳过 Gate 上已有的挂单（价格容差 0.1%）
             already_exists = any(
                 abs(order.price - gate_price) / order.price < 0.001
@@ -1677,55 +1847,62 @@ class KeyLevelGridStrategy:
                 skipped_exists += 1
                 self.logger.debug(f"⏭️ 跳过 Gate 已有挂单: @ {order.price:.2f}")
                 continue
-            
+
             # 规则 C：跳过 price >= avg_entry * 0.995（均价保护）
-            # 方案A：网格重建时 rebuild_mode=True，会把 price_threshold 置 0，从而不触发该过滤
             if price_threshold > 0 and order.price >= price_threshold:
                 skipped_threshold += 1
                 self.logger.debug(f"⏭️ 跳过均价保护: @ {order.price:.2f} >= {price_threshold:.2f}")
                 continue
-            
-            # 通过所有过滤，提交订单
+
+            # 计算张数与保证金
+            qty = max(1, int(order.amount_usdt / (order.price * contract_size)))
+            required_margin = order.amount_usdt / leverage
+
+            if available_balance < required_margin:
+                self.logger.warning(
+                    f"⚠️ 余额不足，跳过买单: 价格={order.price:.2f}, 金额={order.amount_usdt:.2f}U, "
+                    f"需保证金≈{required_margin:.2f}U, 可用={available_balance:.2f}U"
+                )
+                continue
+
+            # 提交订单
             try:
-                target_value_usd = float(contracts_per_grid * contract_size * order.price)
-                
                 gate_order = Order.create(
                     symbol=gate_symbol,
                     side=OrderSide.BUY,
                     order_type=OrderType.LIMIT,
                     price=order.price,
-                    quantity=0,
+                    quantity=qty,
                     pricing_mode="usdt",
-                    target_value_usd=target_value_usd,
+                    target_value_usd=order.amount_usdt,
                 )
                 gate_order.metadata['order_mode'] = 'limit'
                 gate_order.metadata['grid_id'] = order.grid_id
                 gate_order.metadata['source'] = order.source
-                gate_order.metadata['target_contracts'] = contracts_per_grid
+                gate_order.metadata['target_contracts'] = qty
                 gate_order.metadata['contract_size'] = contract_size
-                
+
                 success = await self._executor.submit_order(gate_order)
-                
+
                 if success:
                     submitted_count += 1
+                    available_balance -= required_margin
                     self.logger.info(
-                        f"✅ 网格买单 #{order.grid_id}: "
-                        f"{contracts_per_grid}张 @ {order.price:.2f} (≈{target_value_usd:.0f}U)"
+                        f"✅ 网格买单 #{order.grid_id}: {qty}张 @ {order.price:.2f} (≈{order.amount_usdt:.0f}U)"
                     )
                 else:
                     failed_count += 1
                     self.logger.error(
                         f"❌ 网格买单 #{order.grid_id} 失败: {gate_order.reject_reason}"
                     )
-                    # 如果是余额不足，停止继续提交
                     if "余额" in str(gate_order.reject_reason) or "insufficient" in str(gate_order.reject_reason).lower():
                         self.logger.warning("⚠️ 余额不足，停止提交剩余买单")
                         break
-                    
+
             except Exception as e:
                 failed_count += 1
                 self.logger.error(f"❌ 提交网格买单 #{order.grid_id} 异常: {e}")
-        
+
         self.logger.info(
             f"📊 网格挂单完成: 新提交={submitted_count}, "
             f"跳过(已挂单)={skipped_exists}, 跳过(均价保护)={skipped_threshold}, "
@@ -1987,23 +2164,18 @@ class KeyLevelGridStrategy:
             klines = self.kline_feed.get_cached_klines(
                 self.config.kline_config.primary_timeframe
             )
-            # 获取 1D K线用于多周期融合
-            klines_1d = None
-            from key_level_grid.models import Timeframe
-            if Timeframe.D1 in self.config.kline_config.auxiliary_timeframes:
-                klines_1d = self.kline_feed.get_cached_klines(Timeframe.D1)
             
             if len(klines) >= 50:
+                # 构建多周期 K 线字典
+                klines_dict = self._build_klines_by_timeframe(klines)
                 resistance_calc = self.position_manager.resistance_calc
-                primary_tf = self.config.kline_config.primary_timeframe.value
                 
                 # 阻力位始终是当前价格上方，支撑位始终是当前价格下方
-                # 不管趋势方向如何
                 resistances = resistance_calc.calculate_resistance_levels(
-                    state.close, klines, "long", klines_1d=klines_1d, primary_timeframe=primary_tf
+                    state.close, klines, "long", klines_by_timeframe=klines_dict
                 )
                 supports = resistance_calc.calculate_support_levels(
-                    state.close, klines, klines_1d=klines_1d, primary_timeframe=primary_tf
+                    state.close, klines, klines_by_timeframe=klines_dict
                 )
                 
                 data["resistance_levels"] = [
@@ -2583,10 +2755,19 @@ class KeyLevelGridStrategy:
             return
         
         try:
+            # 1) 运行状态检查
             if not self._tg_bot.is_running():
                 self.logger.warning("⚠️ Telegram Bot 已断开，正在重连...")
                 await self._tg_bot.restart()
                 self.logger.info("✅ Telegram Bot 重连成功")
+                return
+
+            # 2) 活跃度检查：超过 10 分钟没有收到指令则尝试重启
+            last_ts = self._tg_bot.get_last_update_ts()
+            if last_ts and (time.time() - last_ts) > 600:
+                self.logger.warning("⚠️ Telegram Bot 超过 10 分钟无指令，尝试重启以防卡死")
+                await self._tg_bot.restart()
+                self.logger.info("✅ Telegram Bot 重启完成")
         except Exception as e:
             self.logger.error(f"Telegram Bot 重连失败: {e}")
     

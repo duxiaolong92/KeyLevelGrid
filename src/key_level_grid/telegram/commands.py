@@ -126,6 +126,39 @@ class CommandHandler:
 └ 量比: {volume_ratio:.2f if volume_ratio else 'N/A'}x
 """
     
+    def _format_source(self, source: str) -> str:
+        """格式化来源（支持复合来源如 swing_5+volume_node）"""
+        if not source:
+            return ""
+        
+        source_map = {
+            "volume_node": "VOL",
+            "round_number": "PSY",
+        }
+        
+        parts = source.split("+")
+        abbrs = []
+        for p in parts:
+            p = p.strip()
+            if p.startswith("swing_"):
+                abbrs.append(f"SW{p.replace('swing_', '')}")
+            elif p.startswith("fib_"):
+                abbrs.append(f"FIB{p.replace('fib_', '')}")
+            elif p in source_map:
+                abbrs.append(source_map[p])
+            else:
+                abbrs.append(p[:3].upper())
+        return "+".join(abbrs)
+    
+    def _format_timeframe(self, tf: str) -> str:
+        """格式化周期"""
+        tf_map = {
+            "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+            "1h": "1H", "4h": "4H", "1d": "1D", "1w": "1W",
+            "multi": "MTF",
+        }
+        return tf_map.get(tf, tf.upper() if tf else "")
+    
     def handle_levels(self) -> str:
         """处理 /levels 命令 - 显示关键价位"""
         if not self.strategy:
@@ -140,13 +173,21 @@ class CommandHandler:
         
         text += "<b>阻力位:</b>\n"
         for i, r in enumerate(resistance):
-            pct = ((r.get("price", 0) - price) / price * 100) if price > 0 else 0
-            text += f"├ R{i+1}: {r.get('price', 0):.4f} (+{pct:.1f}%)\n"
+            r_price = r.get("price", 0)
+            pct = ((r_price - price) / price * 100) if price > 0 else 0
+            source = self._format_source(r.get("source", ""))
+            tf = self._format_timeframe(r.get("timeframe", ""))
+            strength = r.get("strength", 0)
+            text += f"├ R{i+1}: {r_price:.4f} (+{pct:.1f}%) [{source}] {tf} 💪{strength:.0f}\n"
         
         text += "\n<b>支撑位:</b>\n"
         for i, s in enumerate(support):
-            pct = ((price - s.get("price", 0)) / price * 100) if price > 0 else 0
-            text += f"├ S{i+1}: {s.get('price', 0):.4f} (-{pct:.1f}%)\n"
+            s_price = s.get("price", 0)
+            pct = ((price - s_price) / price * 100) if price > 0 else 0
+            source = self._format_source(s.get("source", ""))
+            tf = self._format_timeframe(s.get("timeframe", ""))
+            strength = s.get("strength", 0)
+            text += f"├ S{i+1}: {s_price:.4f} (-{pct:.1f}%) [{source}] {tf} 💪{strength:.0f}\n"
         
         return text
     
