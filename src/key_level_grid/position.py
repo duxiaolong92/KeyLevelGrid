@@ -84,6 +84,8 @@ class ResistanceConfig:
     swing_lookbacks: List[int] = field(default_factory=lambda: [5, 13, 34])
     fib_ratios: List[float] = field(default_factory=lambda: [0.382, 0.5, 0.618, 1.0, 1.618])
     merge_tolerance: float = 0.005
+    min_distance_pct: float = 0.005   # 最小距离 0.5% (过滤太近的价位)
+    max_distance_pct: float = 0.30    # 最大距离 30% (过滤太远的价位)
 
 
 # ============================================
@@ -798,9 +800,17 @@ class GridPositionManager:
     @property
     def resistance_calc(self):
         """兼容: 返回阻力计算器"""
-        from key_level_grid.resistance import ResistanceCalculator
+        from key_level_grid.resistance import ResistanceCalculator, ResistanceConfig as CalcResistanceConfig
         if not hasattr(self, '_resistance_calc'):
-            self._resistance_calc = ResistanceCalculator()
+            # 将位置管理器的 resistance_config 转换为计算器的配置
+            calc_config = CalcResistanceConfig(
+                swing_lookbacks=self.resistance_config.swing_lookbacks,
+                fib_ratios=self.resistance_config.fib_ratios,
+                merge_tolerance=self.resistance_config.merge_tolerance,
+                min_distance_pct=self.resistance_config.min_distance_pct,
+                max_distance_pct=self.resistance_config.max_distance_pct,
+            )
+            self._resistance_calc = ResistanceCalculator(calc_config)
         return self._resistance_calc
     
     def update_position(self, current_price: float, market_state=None) -> dict:

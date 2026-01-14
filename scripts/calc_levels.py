@@ -19,6 +19,8 @@ import os
 import sys
 from typing import List, Optional
 
+import yaml
+
 # 添加项目路径
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -37,28 +39,28 @@ def detect_source(symbol: str) -> str:
     自动检测数据源类型
     
     规则:
-    - 包含 USDT/USD/BTC/ETH 后缀 → 币圈 (binance)
+    - 包含 USDT/USD/BTC/ETH 后缀 → 币圈 (gate)
     - 纯字母 1~5 位 → 美股 (polygon)
     """
     symbol_upper = symbol.upper()
     
-    # 币圈标识
+    # 币圈标识 → 使用 Gate 期货
     crypto_suffixes = ["USDT", "USD", "BTC", "ETH", "BUSD", "USDC"]
     for suffix in crypto_suffixes:
         if symbol_upper.endswith(suffix):
-            return "binance"
+            return "gate"
     
     # 纯字母且长度 1-5 → 美股
     if symbol_upper.isalpha() and 1 <= len(symbol_upper) <= 5:
         return "polygon"
     
-    # 默认尝试币圈
-    return "binance"
+    # 默认尝试币圈 (Gate)
+    return "gate"
 
 
-async def fetch_binance_klines(symbol: str, timeframes: List[str], limit: int = 500) -> dict:
-    """获取币安 K 线数据"""
-    from key_level_grid.kline_feed import BinanceKlineFeed
+async def fetch_gate_klines(symbol: str, timeframes: List[str], limit: int = 500) -> dict:
+    """获取 Gate.io 期货 K 线数据"""
+    from key_level_grid.gate_kline_feed import GateKlineFeed
     from key_level_grid.models import KlineFeedConfig
     
     # 转换周期
@@ -72,7 +74,7 @@ async def fetch_binance_klines(symbol: str, timeframes: List[str], limit: int = 
         history_bars=limit,
     )
     
-    feed = BinanceKlineFeed(config)
+    feed = GateKlineFeed(config)
     await feed.start()
     
     result = {}
@@ -111,6 +113,19 @@ async def fetch_polygon_klines(symbol: str, timeframes: List[str], limit: int = 
     return result
 
 
+def load_resistance_config_from_yaml() -> dict:
+    """从配置文件加载阻力位相关配置"""
+    config_path = os.path.join(os.path.dirname(__file__), "..", "configs", "config.yaml")
+    
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_config = yaml.safe_load(f)
+        return raw_config.get("resistance", {})
+    except Exception as e:
+        logger.warning(f"无法加载配置文件: {e}，使用默认值")
+        return {}
+
+
 def calculate_levels(
     klines_dict: dict,
     current_price: float,
@@ -129,7 +144,16 @@ def calculate_levels(
     Returns:
         {"resistance": [...], "support": [...], "current_price": ...}
     """
-    config = ResistanceConfig()
+    # 从配置文件加载参数
+    resistance_raw = load_resistance_config_from_yaml()
+    
+    config = ResistanceConfig(
+        swing_lookbacks=resistance_raw.get('swing_lookbacks', [5, 13, 34]),
+        fib_ratios=resistance_raw.get('fib_ratios', [0.382, 0.5, 0.618, 1.0, 1.618]),
+        merge_tolerance=resistance_raw.get('merge_tolerance', 0.005),
+        min_distance_pct=resistance_raw.get('min_distance_pct', 0.005),
+        max_distance_pct=resistance_raw.get('max_distance_pct', 0.30),
+    )
     calculator = ResistanceCalculator(config)
     
     # 获取周期列表（限制最多 3 个）
@@ -310,9 +334,9 @@ async def main():
     )
     parser.add_argument(
         "--source",
-        choices=["binance", "polygon", "auto"],
+        choices=["gate", "polygon", "auto"],
         default="auto",
-        help="数据源（默认 auto 自动检测）"
+        help="数据源（默认 auto 自动检测，币圈用 Gate 期货，美股用 Polygon）"
     )
     
     args = parser.parse_args()
@@ -330,8 +354,8 @@ async def main():
     
     try:
         # 获取 K 线数据
-        if source == "binance":
-            klines_dict = await fetch_binance_klines(symbol, timeframes)
+        if source == "gate":
+            klines_dict = await fetch_gate_klines(symbol, timeframes)
         else:
             klines_dict = await fetch_polygon_klines(symbol, timeframes)
         

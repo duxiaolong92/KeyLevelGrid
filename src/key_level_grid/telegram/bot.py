@@ -487,6 +487,9 @@ class KeyLevelTelegramBot:
             trend = "弱趋势"
             trend_emoji = "📊"
         
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
         text = f"""
 📊 <b>策略状态</b>
 
@@ -495,6 +498,8 @@ class KeyLevelTelegramBot:
 ├ 当前价格: {price:.4f if price else 'N/A'}
 ├ 趋势强度: {trend_emoji} ADX={adx:.1f if adx else 'N/A'} ({trend})
 └ RSI: {rsi:.1f if rsi else 'N/A'}
+
+🕐 {timestamp}
 """
         await update.message.reply_text(text, parse_mode="HTML")
     
@@ -532,24 +537,37 @@ class KeyLevelTelegramBot:
         else:
             pnl_pct = 0
         
+        # 网格底线：优先从配置读取 manual_lower，回退到持久化状态
         grid_floor = position.get("grid_floor", 0)
+        config_lower = 0
+        if self.strategy:
+            grid_config = getattr(self.strategy.position_manager, 'grid_config', None)
+            if grid_config and grid_config.range_mode == "manual" and grid_config.manual_lower > 0:
+                config_lower = grid_config.manual_lower
+        display_floor = config_lower if config_lower > 0 else grid_floor
         
         # 计算止损相关数据
         sl_id = getattr(self.strategy, "_stop_loss_order_id", None) if self.strategy else None
+        # 优先使用实际止损触发价，回退到 grid_floor
+        sl_trigger_price = getattr(self.strategy, "_stop_loss_trigger_price", 0) if self.strategy else 0
+        sl_price = sl_trigger_price if sl_trigger_price > 0 else grid_floor
         
         # 止损触发时的价值和预计亏损
-        if grid_floor > 0 and qty > 0 and entry_price > 0:
-            sl_value = grid_floor * qty  # 止损触发时的平仓价值
-            sl_loss = (entry_price - grid_floor) * qty  # 预计亏损（做多）
-            stop_loss_line = f"触发价=${grid_floor:,.2f}, 价值: {sl_value:,.0f} USDT, 预计亏损: {sl_loss:,.0f} USDT"
-        elif grid_floor > 0:
-            stop_loss_line = f"触发价=${grid_floor:,.2f}"
+        if sl_price > 0 and qty > 0 and entry_price > 0:
+            sl_value = sl_price * qty  # 止损触发时的平仓价值
+            sl_loss = (entry_price - sl_price) * qty  # 预计亏损（做多）
+            stop_loss_line = f"触发价=${sl_price:,.2f}, 价值: {sl_value:,.0f} USDT, 预计亏损: {sl_loss:,.0f} USDT"
+        elif sl_price > 0:
+            stop_loss_line = f"触发价=${sl_price:,.2f}"
         else:
             stop_loss_line = "未设置"
         
         # 如果止损单未提交，添加提示
-        if not sl_id and grid_floor > 0:
+        if not sl_id and display_floor > 0:
             stop_loss_line += " (待提交)"
+        
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         text = f"""
 💼 <b>当前持仓</b>
@@ -560,8 +578,10 @@ class KeyLevelTelegramBot:
 ├ 均价: ${entry_price:,.2f}
 ├ 当前价: ${current_price:,.2f}
 ├ 未实现盈亏: {pnl_emoji} {pnl:+,.2f} USDT ({pnl_pct:+.2%})
-├ 网格底线: ${grid_floor:,.2f}
+├ 网格底线: ${display_floor:,.2f}
 └ 止损单: {stop_loss_line}
+
+🕐 {timestamp}
 """
         await update.message.reply_text(text, parse_mode="HTML")
     
@@ -599,6 +619,9 @@ class KeyLevelTelegramBot:
         elif rsi and rsi < 30:
             rsi_status = "超卖"
         
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
         text = f"""
 📈 <b>市场指标</b>
 
@@ -608,6 +631,8 @@ class KeyLevelTelegramBot:
 ├ ADX: {adx:.1f if adx else 'N/A'} ({trend})
 ├ ATR: {atr:.4f if atr else 'N/A'}
 └ 量比: {volume_ratio:.2f if volume_ratio else 'N/A'}x
+
+🕐 {timestamp}
 """
         await update.message.reply_text(text, parse_mode="HTML")
     
@@ -726,6 +751,32 @@ class KeyLevelTelegramBot:
             self.logger.error(f"查询 {symbol} 关键价位失败: {e}", exc_info=True)
             await processing_msg.edit_text(f"❌ 查询失败: {str(e)[:100]}")
     
+    def _load_resistance_config(self):
+        """从配置文件加载阻力位配置"""
+        import os
+        import yaml
+        from key_level_grid.resistance import ResistanceConfig
+        
+        config_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "..", "configs", "config.yaml"
+        )
+        
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                raw_config = yaml.safe_load(f)
+            resistance_raw = raw_config.get("resistance", {})
+            
+            return ResistanceConfig(
+                swing_lookbacks=resistance_raw.get('swing_lookbacks', [5, 13, 34]),
+                fib_ratios=resistance_raw.get('fib_ratios', [0.382, 0.5, 0.618, 1.0, 1.618]),
+                merge_tolerance=resistance_raw.get('merge_tolerance', 0.005),
+                min_distance_pct=resistance_raw.get('min_distance_pct', 0.005),
+                max_distance_pct=resistance_raw.get('max_distance_pct', 0.30),
+            )
+        except Exception as e:
+            self.logger.warning(f"加载配置文件失败: {e}，使用默认值")
+            return ResistanceConfig()
+
     async def _calculate_external_levels(self, symbol: str, timeframes: list) -> dict:
         """
         计算任意标的的关键价位
@@ -741,8 +792,8 @@ class KeyLevelTelegramBot:
         
         try:
             if is_crypto:
-                # 币圈：使用 Binance
-                klines_dict = await self._fetch_binance_klines_for_query(symbol, timeframes)
+                # 币圈：使用 Gate 期货
+                klines_dict = await self._fetch_gate_klines_for_query(symbol, timeframes)
             else:
                 # 美股：使用 Polygon
                 klines_dict = await self._fetch_polygon_klines_for_query(symbol, timeframes)
@@ -753,9 +804,14 @@ class KeyLevelTelegramBot:
             primary_klines = klines_dict[timeframes[0]]
             current_price = primary_klines[-1].close
             
-            # 计算价位（使用新的多周期接口，支持 1~3 个周期）
-            config = ResistanceConfig()
-            calculator = ResistanceCalculator(config)
+            # 计算价位：优先使用策略配置，否则从配置文件加载
+            if self.strategy and hasattr(self.strategy, 'position_manager'):
+                # 使用策略的 resistance_calc（已包含配置）
+                calculator = self.strategy.position_manager.resistance_calc
+            else:
+                # 从配置文件加载参数
+                config = self._load_resistance_config()
+                calculator = ResistanceCalculator(config)
             
             resistances = calculator.calculate_resistance_levels(
                 current_price=current_price,
@@ -806,9 +862,9 @@ class KeyLevelTelegramBot:
             self.logger.error(f"计算 {symbol} 价位失败: {e}", exc_info=True)
             return {"error": str(e)}
     
-    async def _fetch_binance_klines_for_query(self, symbol: str, timeframes: list) -> dict:
-        """获取 Binance K 线用于查询"""
-        from key_level_grid.kline_feed import BinanceKlineFeed
+    async def _fetch_gate_klines_for_query(self, symbol: str, timeframes: list) -> dict:
+        """获取 Gate.io 期货 K 线用于查询"""
+        from key_level_grid.gate_kline_feed import GateKlineFeed
         from key_level_grid.models import KlineFeedConfig, Timeframe
         
         primary_tf = Timeframe.from_string(timeframes[0])
@@ -821,7 +877,7 @@ class KeyLevelTelegramBot:
             history_bars=500,
         )
         
-        feed = BinanceKlineFeed(config)
+        feed = GateKlineFeed(config)
         await feed.start()
         
         result = {}
@@ -907,7 +963,10 @@ class KeyLevelTelegramBot:
         else:
             text += "├ 无支撑位数据\n"
         
-        text += "\n<i>类型: SW=摆动点 FIB=斐波那契 PSY=心理关口 VOL=成交密集区</i>"
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        text += f"\n<i>类型: SW=摆动点 FIB=斐波那契 PSY=心理关口 VOL=成交密集区</i>\n\n🕐 {timestamp}"
         
         return text
     
@@ -1105,31 +1164,33 @@ class KeyLevelTelegramBot:
         
         text = f"📋 <b>当前挂单</b>\n\n当前价格: ${current_price:,.2f}\n"
 
-        # 卖单在上，按价格降序
+        # 卖单在上，按价格降序（显示全部）
         if sell_orders:
             total_sell = sum(o.get("amount", 0) for o in sell_orders)
             text += f"\n🔴 <b>卖单</b> ({len(sell_orders)}个, 共 {total_sell:,.0f} USDT)\n"
             sell_orders_sorted = sorted(sell_orders, key=lambda x: -x.get("price", 0))
-            for i, order in enumerate(sell_orders_sorted[:8], 1):
+            for i, order in enumerate(sell_orders_sorted, 1):
                 price = order.get("price", 0)
                 amount = order.get("amount", 0)
                 pct = (price - current_price) / current_price * 100 if current_price > 0 else 0
-                text += f"├ ${price:,.2f} | {amount:,.0f}U | {pct:+.1f}%\n"
-            if len(sell_orders) > 8:
-                text += f"└ ... 还有 {len(sell_orders) - 8} 个\n"
+                prefix = "└" if i == len(sell_orders_sorted) else "├"
+                text += f"{prefix} ${price:,.2f} | {amount:,.0f}U | {pct:+.1f}%\n"
 
-        # 买单在下，按价格降序
+        # 买单在下，按价格降序（显示全部）
         if buy_orders:
             total_buy = sum(o.get("amount", 0) for o in buy_orders)
             text += f"\n🟢 <b>买单</b> ({len(buy_orders)}个, 共 {total_buy:,.0f} USDT)\n"
             buy_orders_sorted = sorted(buy_orders, key=lambda x: -x.get("price", 0))
-            for i, order in enumerate(buy_orders_sorted[:8], 1):
+            for i, order in enumerate(buy_orders_sorted, 1):
                 price = order.get("price", 0)
                 amount = order.get("amount", 0)
                 pct = (price - current_price) / current_price * 100 if current_price > 0 else 0
-                text += f"├ ${price:,.2f} | {amount:,.0f}U | {pct:+.1f}%\n"
-            if len(buy_orders) > 8:
-                text += f"└ ... 还有 {len(buy_orders) - 8} 个\n"
+                prefix = "└" if i == len(buy_orders_sorted) else "├"
+                text += f"{prefix} ${price:,.2f} | {amount:,.0f}U | {pct:+.1f}%\n"
+        
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        text += f"\n🕐 {timestamp}"
         
         await update.message.reply_text(text, parse_mode="HTML")
     

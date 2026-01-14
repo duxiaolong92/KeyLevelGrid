@@ -21,7 +21,7 @@ from key_level_grid.breakout_filter import (
 )
 from key_level_grid.filter import FilterConfig, SignalFilterChain
 from key_level_grid.indicator import IndicatorConfig, KeyLevelGridIndicator
-from key_level_grid.kline_feed import BinanceKlineFeed
+from key_level_grid.gate_kline_feed import GateKlineFeed
 from key_level_grid.models import Kline, KlineFeedConfig, Timeframe, KeyLevelGridState
 from key_level_grid.mtf_manager import MultiTimeframeManager
 from key_level_grid.position import PositionConfig, KeyLevelPositionManager, ResistanceConfig
@@ -99,7 +99,7 @@ class KeyLevelGridStrategy:
         self.logger = get_logger(__name__)
         
         # 初始化子模块
-        self.kline_feed = BinanceKlineFeed(config.kline_config)
+        self.kline_feed = GateKlineFeed(config.kline_config)
         self.indicator = KeyLevelGridIndicator(
             config.indicator_config, 
             symbol=config.symbol
@@ -151,10 +151,12 @@ class KeyLevelGridStrategy:
         self._last_position_contracts: Optional[int] = None  # 上次持仓张数（None 表示未初始化）
         self._tp_orders_submitted: bool = False  # 止盈单是否已提交
         self._need_rebuild_after_fill: bool = False  # 持仓变化后标记重建
+        self._last_fill_at: float = 0  # 上次成交时间（用于成交后延迟重建）
         
         # 止损单状态
         self._stop_loss_order_id: Optional[str] = None  # 当前止损单 ID
         self._stop_loss_contracts: float = 0  # 止损单覆盖的张数
+        self._stop_loss_trigger_price: float = 0  # 止损单实际触发价（从交易所同步）
         self._sl_order_updated_at: float = 0  # 止损单更新时间
         self._sl_synced_from_exchange: bool = False  # 是否已从交易所同步止损单
         self._sl_last_entry_price: float = 0  # 止损前的入场价（用于计算亏损）
@@ -315,6 +317,8 @@ class KeyLevelGridStrategy:
             swing_lookbacks=resistance_raw.get('swing_lookbacks', [5, 13, 34]),
             fib_ratios=resistance_raw.get('fib_ratios', [0.382, 0.5, 0.618, 1.0, 1.618]),
             merge_tolerance=resistance_raw.get('merge_tolerance', 0.005),
+            min_distance_pct=resistance_raw.get('min_distance_pct', 0.005),
+            max_distance_pct=resistance_raw.get('max_distance_pct', 0.30),
         )
         
         # V2.3: 仓位配置 (网格模式)
@@ -636,10 +640,13 @@ class KeyLevelGridStrategy:
         last_rebuild_at = getattr(self, "_last_rebuild_at", 0.0) or 0.0
         now_ts = time.time()
 
-        # 成交驱动的重建：优先于偏离逻辑，带独立冷却
+        # 成交驱动的重建：成交后等待 fill_cooldown 再重建
         if getattr(self, "_need_rebuild_after_fill", False):
-            if last_rebuild_at and (now_ts - last_rebuild_at) < fill_cooldown:
-                # 冷却中，保留标记等待下次
+            last_fill_at = getattr(self, "_last_fill_at", 0.0) or 0.0
+            if last_fill_at and (now_ts - last_fill_at) < fill_cooldown:
+                # 距离成交时间不足，继续等待
+                remaining = int(fill_cooldown - (now_ts - last_fill_at))
+                self.logger.debug(f"⏳ 成交后等待重建: 剩余 {remaining} 秒")
                 return
             self.logger.warning("🔄 因持仓变动触发重建（成交驱动）")
         else:
@@ -984,6 +991,9 @@ class KeyLevelGridStrategy:
             
             self._position_updated_at = time.time()
             
+            # ⭐ 持仓同步后立即检测成交（不等待 K 线收盘）
+            await self._check_and_submit_take_profit_orders()
+            
         except Exception as e:
             self.logger.error(f"同步 Gate 持仓失败: {e}")
     
@@ -1072,8 +1082,9 @@ class KeyLevelGridStrategy:
                 f"🎯 持仓增加: +{added_contracts}张, "
                 f"当前持仓: {current_contracts}张 (≈{current_position_usdt:.0f} USDT)"
             )
-            # 标记需要重建（成交驱动）
+            # 标记需要重建（成交驱动），记录成交时间
             self._need_rebuild_after_fill = True
+            self._last_fill_at = time.time()
             
             # 发送买入成交通知（使用真实 contract_size）
             fill_price = float(self._gate_position.get("entry_price", 0) or 0)
@@ -1099,8 +1110,9 @@ class KeyLevelGridStrategy:
                 f"✅ 持仓减少: -{reduced_contracts}张 (止盈成交), "
                 f"当前持仓: {current_contracts}张 (≈{current_position_usdt:.0f} USDT)"
             )
-            # 标记需要重建（成交驱动）
+            # 标记需要重建（成交驱动），记录成交时间
             self._need_rebuild_after_fill = True
+            self._last_fill_at = time.time()
             
             # 发送卖出成交通知（使用真实 contract_size）
             fill_price = float(self._gate_position.get("mark_price", 0) or 0)
@@ -1260,6 +1272,7 @@ class KeyLevelGridStrategy:
                 order_id = getattr(sl_order, 'exchange_order_id', None) or sl_order.metadata.get('order_id', '')
                 self._stop_loss_order_id = str(order_id) if order_id else "pending"
                 self._stop_loss_contracts = contracts
+                self._stop_loss_trigger_price = trigger_price  # 保存实际触发价
                 self._sl_order_updated_at = time.time()
                 # T005: 保存入场价，用于止损触发时计算亏损
                 self._sl_last_entry_price = float(self._gate_position.get('entry_price', 0) or 0)
@@ -1345,6 +1358,7 @@ class KeyLevelGridStrategy:
                 if is_sell and size > 0:
                     self._stop_loss_order_id = order_id
                     self._stop_loss_contracts = size
+                    self._stop_loss_trigger_price = trigger_price  # 保存实际触发价
                     self.logger.info(
                         f"✅ 启动同步: 找到现有止损单 ID={order_id}, "
                         f"数量={size}张, 触发价=${trigger_price:,.2f}"

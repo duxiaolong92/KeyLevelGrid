@@ -13,6 +13,7 @@ from key_level_grid.models import (
 )
 from key_level_grid.indicator import KeyLevelGridIndicator, IndicatorConfig
 from key_level_grid.kline_feed import BinanceKlineFeed
+from key_level_grid.gate_kline_feed import GateKlineFeed
 from key_level_grid.mtf_manager import MultiTimeframeManager
 from key_level_grid.signal import (
     KeyLevelSignalGenerator,
@@ -45,6 +46,7 @@ __all__ = [
     "IndicatorConfig",
     # Data
     "BinanceKlineFeed",
+    "GateKlineFeed",
     "MultiTimeframeManager",
     # Signal
     "KeyLevelSignalGenerator",
