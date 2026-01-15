@@ -15,11 +15,12 @@ trading:
   exchange: "gate"            # 交易所 (Gate)
   market_type: "futures"      # 合约市场 (USDT 永续)
   margin_mode: "cross"        # 保证金模式: cross (全仓) | isolated (逐仓)
-  leverage: 10                 # 杠杆倍数 (建议 3-5x，与 position.max_leverage 保持一致)
+  leverage: 10                # 杠杆倍数 (建议 3-5x，与 position.max_leverage 保持一致)
   timeframe: "4h"             # 主交易周期
   aux_timeframes:             # 辅助周期 (多周期融合，最多 2 个，总共支持 1~3 个周期)
     - "1d"
-    - "1w"                  # 示例: ["1d"] 或 ["4h", "1d"] 或 ["1h"]
+    - "1w"                    # 示例: ["1d"] 或 ["4h", "1d"] 或 ["1h"]
+  default_contract_size: 0.0001  # 合约大小后备值（仅当 API 获取失败时使用，BTC=0.0001）
 
 # K线数据源配置
 kline_feed:
@@ -108,6 +109,11 @@ resistance:
   volume_profile_enabled: true
   volume_buckets: 50          # 价格分桶数
   volume_top_n: 5             # 取 Top N 成交量节点
+  volume_bucket_pct: 0.01     # 价格分桶百分比 1%
+  volume_top_pct: 0.20        # Top 20% 成交量区
+  
+  # 多周期融合
+  mtf_boost: 0.30             # 多周期叠加强度提升 30%
   
   # 融合配置
   merge_tolerance: 0.005      # 合并相近价位 0.5%

@@ -19,10 +19,9 @@
 ## 3. 功能需求（FR）
 ### FR-001 关键价位识别
 - **多周期 K 线融合**：支持 1~3 个周期灵活配置（禁止硬编码）。
-  - 配置项：`resistance.timeframes`（列表，如 `["4h", "1d"]` 或 `["15m", "4h", "1d"]`）
+  - 配置项：`trading.timeframe` + `trading.aux_timeframes`
   - 第一个为主周期，后续为辅助周期
-  - 辅助周期强度基础提升 20%（`auxiliary_boost: 1.2`）
-  - 多周期共振强度提升 30%（`mtf_boost: 0.30`）
+  - 多周期共振强度提升 `mtf_boost`（默认 0.30）
 - **价位来源**：摆动高低点（SW）、斐波那契（FIB）、心理关口（PSY）、成交量密集区（VOL）。
 - **强度评分**：阈值 `min_strength`（默认 60），相近价位按 `merge_tolerance`（默认 0.5%）合并。
 - **距离过滤**：`min_distance_pct`（0.5%）~ `max_distance_pct`（30%）。
@@ -38,14 +37,18 @@
 
 **配置示例**：
 ```yaml
+trading:
+  timeframe: "4h"
+  aux_timeframes: ["1d", "1w"]
+
 resistance:
-  timeframes: ["4h", "1d"]        # 支持 1~3 个周期
-  auxiliary_boost: 1.2            # 辅助周期强度加成
   mtf_boost: 0.30                 # 多周期共振加成
   min_strength: 60
   merge_tolerance: 0.005
   min_distance_pct: 0.005
   max_distance_pct: 0.30
+  volume_bucket_pct: 0.01
+  volume_top_pct: 0.20
 ```
 
 ### FR-002 网格构建
@@ -57,7 +60,7 @@ resistance:
 ### FR-003 止损订单（交易所计划委托）
 - 持仓存在即提交/更新止损计划单（reduce_only，IOC）。
 - 更新防抖：30s；取消与本地状态分离，避免重复提交。
-- 启动需同步交易所现有止损单（T004 未完）；触发后需通知亏损（T005 未完）。
+- 启动同步交易所现有止损单；触发后通知亏损（已完成）。
 
 ### FR-004 止盈订单
 - 按阻力位等份拆分覆盖持仓；持仓变化触发补挂。
@@ -68,7 +71,7 @@ resistance:
 
 ### FR-006 Telegram 菜单/指令
 - `/start` 菜单：当前持仓、当前挂单、关键价位、更新网格。
-- “更新网格”强制刷新 pending orders；按钮需长期可用，自检/重启机制（10 分钟无指令则重启）。
+- “更新网格”强制刷新 pending orders。
 - `/position` 展示止损计划单（ID、触发价、数量）。
 
 ### FR-007 状态持久化
@@ -152,9 +155,9 @@ python scripts/calc_levels.py ETHUSDT 1h 4h 1d    # 币圈 ETH，多周期
 ```
 
 **标的识别规则**：
-- 包含 `USDT`/`USD`/`BTC` → 币圈（使用 Binance 数据源）
+- 包含 `USDT`/`USD`/`BTC` → 币圈（使用 Gate 期货数据源）
 - 纯字母 2~5 位 → 美股（使用 Polygon 数据源）
-- 可通过 `--source binance|polygon` 强制指定
+- 可通过 `--source gate|polygon` 强制指定
 
 **技术要点**：
 - 复用现有 `resistance.py` 中的价位计算逻辑
@@ -182,25 +185,7 @@ python scripts/calc_levels.py ETHUSDT 1h 4h 1d    # 币圈 ETH，多周期
 4. 返回格式化结果（同 CLI 输出）
 
 **限制**：
-- 每用户每分钟最多 5 次查询（防滥用）
 - 单次查询超时 30 秒
-- 仅支持预定义的标的列表（可配置白名单）
-
-**配置示例**：
-```yaml
-telegram:
-  levels_query:
-    enabled: true
-    allowed_symbols:          # 白名单（空 = 允许所有）
-      - TSLA
-      - AAPL
-      - NVDA
-      - SPY
-      - BTCUSDT
-      - ETHUSDT
-    rate_limit_per_minute: 5
-    timeout_sec: 30
-```
 
 **技术要点**：
 - 扩展 `bot.py` 的 `/levels` 命令，支持参数解析
@@ -218,7 +203,7 @@ telegram:
 - 仓位：`total_capital=800`，`max_capital_usage=0.8`，`allocation_mode=equal|weighted`。
 - 止损：`mode=total`，`trigger=grid_floor` 或 `fixed_pct`。
 - 止盈：`mode=by_resistance` 或 `fixed_pct`。
-- 阻力/支撑：`min_strength=60`，`merge_tolerance=0.005`。
+- 阻力/支撑：`min_strength=60`，`merge_tolerance=0.005`，`min_distance_pct`/`max_distance_pct`，`volume_bucket_pct`/`volume_top_pct`，`mtf_boost`。
 - 日志：`logging.level/file/console`，可被 CLI 覆盖。
 
 ## 6. 非功能性需求
@@ -256,9 +241,10 @@ telegram:
 - 多实例全局风控未做。
 
 ## 10. 版本
-- 文档版本：v1.4  
-- 更新日期：2026-01-13  
+- 文档版本：v1.5  
+- 更新日期：2026-01-14  
 - 维护人：KeyLevelGrid 团队
 - 变更记录：
+  - v1.5：同步 Gate 数据源、Telegram 时间戳、距离过滤与配置项
   - v1.4：FR-001 增强多周期灵活配置，移除硬编码
   - v1.3：新增 FR-010/011/012 美股数据源和跨市场价位查询

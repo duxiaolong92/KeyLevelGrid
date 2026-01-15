@@ -127,6 +127,30 @@ contract_size = market_info.get('contractSize', 1.0)
 - 持仓数量计算: `size (币) = contracts (张) * contractSize`
 - 持仓价值计算: `value (USDT) = size (币) * price`
 
+#### 合约大小获取规范
+
+**严禁**硬编码 `contract_size`（如 `0.0001`）。必须通过交易所 API 动态获取。
+
+```python
+# 错误 ❌
+contract_size = 0.0001  # BTC 合约默认值
+
+# 正确 ✅
+market = self._executor._exchange.markets.get(gate_symbol, {})
+contract_size = market.get('contractSize', 1.0) or 1.0
+
+# 如果 API 获取失败，使用配置的后备值
+contract_size = self.config.default_contract_size
+```
+
+**配置后备值**（仅当 API 获取失败时使用）：
+
+```yaml
+# config.yaml
+trading:
+  default_contract_size: 0.0001  # BTC 合约后备值
+```
+
 ### 3.3. Gate.io 特殊规则 (Gate-Specifics)
 
 | 规则 | 说明 |

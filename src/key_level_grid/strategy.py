@@ -37,6 +37,7 @@ class KeyLevelGridConfig:
     market_type: str = "futures"  # futures / spot
     margin_mode: str = "cross"    # cross (全仓) / isolated (逐仓)
     leverage: int = 3             # 杠杆倍数
+    default_contract_size: float = 1.0  # 合约大小后备值（仅当 API 获取失败时使用）
     
     # API 配置 (环境变量名)
     api_key_env: str = ""
@@ -385,6 +386,7 @@ class KeyLevelGridStrategy:
             market_type=trading.get('market_type', 'futures'),
             margin_mode=trading.get('margin_mode', 'cross'),
             leverage=trading.get('leverage', 3),
+            default_contract_size=trading.get('default_contract_size', 1.0),
             api_key_env=api_config.get('key_env', ''),
             api_secret_env=api_config.get('secret_env', ''),
             kline_config=kline_config,
@@ -941,8 +943,9 @@ class KeyLevelGridStrategy:
                     contract_size = market.get('contractSize', 1.0) or 1.0
                     self._contract_size = contract_size
                 except Exception as e:
-                    contract_size = 0.0001  # BTC 合约默认值
-                    self.logger.warning(f"获取 contractSize 失败，使用默认值 {contract_size}: {e}")
+                    # 从配置获取默认值，禁止硬编码
+                    contract_size = getattr(self.config, 'default_contract_size', None) or 1.0
+                    self.logger.warning(f"获取 contractSize 失败，使用配置默认值 {contract_size}: {e}")
             
             # 找到当前标的的持仓
             self._gate_position = {}

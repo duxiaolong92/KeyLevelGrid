@@ -5,7 +5,7 @@
 | 组件 | 选型 | 版本 | 说明 |
 |------|------|------|------|
 | 语言 | Python | 3.12+ | 异步支持好 |
-| 数据源 | Binance WebSocket | - | K线数据稳定 |
+| 数据源 | Gate WebSocket | - | Gate 期货 K线 |
 | 执行交易 | Gate.io (ccxt) | 4.x | 支持计划委托 |
 | 通知 | python-telegram-bot | 20.x | Telegram Bot |
 | 配置 | YAML + .env | - | 敏感信息分离 |
@@ -23,7 +23,7 @@
 │                                                              │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
 │  │  Kline Feed  │───▶│  Resistance  │───▶│   Position   │  │
-│  │  (Binance)   │    │  Calculator  │    │   Manager    │  │
+│  │   (Gate)     │    │  Calculator  │    │   Manager    │  │
 │  └──────────────┘    └──────────────┘    └──────────────┘  │
 │         │                   │                   │           │
 │         ▼                   ▼                   ▼           │
@@ -42,7 +42,7 @@
 ## 模块依赖
 
 ```
-kline_feed.py (Binance WebSocket)
+kline_feed.py (Gate WebSocket)
       │
       ▼
 resistance.py (支撑/阻力计算)
@@ -59,22 +59,21 @@ strategy.py (核心逻辑)
 
 ## 架构决策记录 (ADR)
 
-### ADR-001: 数据源与执行分离
+### ADR-001: 数据源与执行统一为 Gate
 
 **状态**: 已采纳
 
-**背景**: 需要选择获取行情数据和执行交易的交易所。
+**背景**: 需要统一行情数据与执行交易的交易所，减少跨所价差偏移。
 
-**决策**: Binance 获取 K 线数据，Gate.io 执行交易。
+**决策**: Gate.io 获取 K 线数据，Gate.io 执行交易。
 
 **理由**:
-- Binance WebSocket 数据更稳定，延迟更低
+- 行情与执行一致，避免跨所价格差异导致的误判
 - Gate.io API 支持 Trigger Order（计划委托），功能更灵活
-- 分离后可独立替换任一组件
+- 统一数据源，降低运维复杂度
 
 **后果**:
-- 需要处理两个交易所的连接
-- 价格可能有微小差异（可接受）
+- 行情依赖 Gate 稳定性，需要提升重试与容错
 
 ---
 
@@ -144,17 +143,37 @@ strategy.py (核心逻辑)
 # configs/config.yaml
 trading:
   symbol: "BTCUSDT"
-  timeframe: "4h"           # 主周期
-  aux_timeframes: ["1d"]    # 辅助周期
+  exchange: "gate"
+  timeframe: "4h"
+  aux_timeframes: ["1d", "1w"]
   leverage: 10
+  default_contract_size: 0.0001
+
+kline_feed:
+  history_bars: 500
+  use_websocket: true
+  request_timeout_sec: 10.0
 
 grid:
-  max_grids: 8
-  grid_capital_pct: 0.1     # 每格资金比例
-  
+  range_mode: "manual"
+  manual_upper: 98000
+  manual_lower: 80000
+  rebuild_threshold_pct: 1
+  rebuild_cooldown_sec: 900
+
 position:
-  max_position_usd: 8000    # 最大持仓 USDT
+  total_capital: 800
   max_leverage: 10
+  max_capital_usage: 0.8
+
+resistance:
+  min_strength: 60
+  merge_tolerance: 0.005
+  min_distance_pct: 0.0001
+  max_distance_pct: 0.30
+  volume_bucket_pct: 0.01
+  volume_top_pct: 0.20
+  mtf_boost: 0.30
 
 telegram:
   enabled: true
