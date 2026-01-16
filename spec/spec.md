@@ -1,250 +1,144 @@
-# Key Level Grid - 单一规格文档（All-in-One）
+# Key Level Grid 需求规格说明书 (V3.0 - 终极整合版)
 
-整合原有 `strategy_spec.md`、`telegram_notification.md`、`features/F001~F003`、`plan.md`、`ADR005` 等需求到一份文档，便于统一查阅。
+## 1. 系统架构：双轨异步驱动机制
+
+系统基于 `asyncio.Lock` 维护核心状态 `GridMap`，通过两套并行逻辑确保响应速度与最终一致性。
+
+### 1.1 事件驱动轨道 (Event Track) - 微观反射
+
+- **触发源**：WebSocket 订单成交事件 (`FILLED`)。
+- **核心逻辑**：
+  - **买成交反射**：立即重算均价，按 `sell_quota_ratio` 在上方最近有效阻力位执行“增量补卖”。
+  - **卖成交反射**：释放对应支撑位的 `fill_counter` 配额，并清理该阻力位状态。
+- **特点**：低延迟、单点处理、不扫描全局。
+
+### 1.2 全局对账轨道 (Recon Track) - 宏观守卫
+
+- **执行周期**：`recon_interval_sec` (默认 60s)。
+- **核心逻辑**：
+  - **极性与空间对账**：根据现价划分水位角色，并校验买/卖缓冲区。
+  - **瀑布流重排**：基于“利润避让”原则，确保 70% 止盈单在满足利润的水位上物理对齐。
+  - **自愈机制**：修复漏单、多单、及因均价漂移导致的无效止盈单。
 
 ---
 
-## 1. 项目概述
-- 目标：基于支撑/阻力位的智能网格策略，适配永续合约（Gate 优先）。
-- 价值：价位识别 + 网格化下单 + 交易所级止损 + Telegram 可观测/可控 + 多实例扩展。
+## 2. 核心逻辑算法 (Algorithms)
 
-## 2. 用户故事（精简）
-- US-001 关键价位交易：支撑挂买、阻力挂卖，震荡盈利。
-- US-002 自动止损保护：持仓自动提交交易所止损，断网仍有效。
-- US-003 实时通知：Telegram 提示启动、成交、异常、订单更新。
-- US-004 远程控制：Telegram 查看持仓/挂单/关键价位，触发“更新网格”。
-- US-005 多实例：可并行跑多交易所/多币种，互不干扰。
-- US-006 跨市场价位分析：通过 CLI 或 Telegram 查询任意美股/加密货币的关键价位。🆕
+### 2.1 物理极性判定与空间守卫
 
-## 3. 功能需求（FR）
-### FR-001 关键价位识别
-- **多周期 K 线融合**：支持 1~3 个周期灵活配置（禁止硬编码）。
-  - 配置项：`trading.timeframe` + `trading.aux_timeframes`
-  - 第一个为主周期，后续为辅助周期
-  - 多周期共振强度提升 `mtf_boost`（默认 0.30）
-- **价位来源**：摆动高低点（SW）、斐波那契（FIB）、心理关口（PSY）、成交量密集区（VOL）。
-- **强度评分**：阈值 `min_strength`（默认 60），相近价位按 `merge_tolerance`（默认 0.5%）合并。
-- **距离过滤**：`min_distance_pct`（0.5%）~ `max_distance_pct`（30%）。
+水位角色随现价实时变化，但挂单受缓冲区保护：
 
-**多周期融合算法**：
-```
-1. 分别计算各周期价位（SW/VOL/FIB/PSY）
-2. 辅助周期强度 ×1.2
-3. ±0.5% 内相同价位视为"多周期共振"，强度 ×1.3
-4. 多来源叠加：每多一种来源，强度 +15%
-5. 合并 → 过滤 → 按综合分排序
-```
+- **支撑位 (Support)**：`Level_Price < Current_Price`。
+- **买单挂出条件**：角色为 Support，且 `Current_Price > Level_Price * (1 + buy_price_buffer_pct)`。
 
-**配置示例**：
-```yaml
-trading:
-  timeframe: "4h"
-  aux_timeframes: ["1d", "1w"]
+- **阻力位 (Resistance)**：`Level_Price > Current_Price`。
+- **卖单挂出条件**：角色为 Resistance，且
+  - 空间校验：`Current_Price < Level_Price * (1 - sell_price_buffer_pct)`，
+  - 利润校验：`Level_Price > Avg_Entry_Price * (1 + min_profit_pct)`。
 
-resistance:
-  mtf_boost: 0.30                 # 多周期共振加成
-  min_strength: 60
-  merge_tolerance: 0.005
-  min_distance_pct: 0.005
-  max_distance_pct: 0.30
-  volume_bucket_pct: 0.01
-  volume_top_pct: 0.20
-```
+### 2.2 水位配额计数器 (Quota Counter)
 
-### FR-002 网格构建
-- 区间：自动或手动（`manual_upper/lower`）。
-- 网格数：按有效支撑/阻力（`by_levels`）或固定数量。
-- 底线：最低支撑下方 `floor_buffer` 形成止损线。
-- 重建：价格偏离阈值（默认 2%）+ 冷却（默认 900s）；成交驱动重建有独立冷却 `rebuild_cooldown_on_fill_sec`。
+- **限额逻辑**：每个水位拥有 `fill_counter`。买单成交则 `fill_counter += 1`。
+- **回补逻辑**：当 `fill_counter >= max_fill_per_level`（默认 1）时，禁止在该水位补买单。
+- **释放逻辑**：仅当该水位产生的筹码在阻力位被卖出后，计数器重置为 `0`。
 
-### FR-003 止损订单（交易所计划委托）
-- 持仓存在即提交/更新止损计划单（reduce_only，IOC）。
-- 更新防抖：30s；取消与本地状态分离，避免重复提交。
-- 启动同步交易所现有止损单；触发后通知亏损（已完成）。
+### 2.3 利润避让瀑布流 (Profit-Guard Waterfall)
 
-### FR-004 止盈订单
-- 按阻力位等份拆分覆盖持仓；持仓变化触发补挂。
-- 使用 reduce_only；成交后可触发成交驱动重建。
+在分配 `Total_Sell_Qty` 时，执行以下流程：
 
-### FR-005 Telegram 通知
-- 启动/停止、错误、成交、网格重建、挂单汇总、风险预警、每日汇总；统一 USDT 计价，支持 dry_run。
+1. **利润过滤**：跳过所有 `Level_Price <= Avg_Entry_Price * (1 + min_profit_pct)` 的水位。
+2. **物理分配**：从最近的合格阻力位开始，按 `base_amount_per_grid` 阶梯填充。
+3. **增量改单**：若目标数量与实盘数量不符，执行“物理合并改单”（撤旧挂新或 Amend）。
 
-### FR-006 Telegram 菜单/指令
-- `/start` 菜单：当前持仓、当前挂单、关键价位、更新网格。
-- “更新网格”强制刷新 pending orders。
-- `/position` 展示止损计划单（ID、触发价、数量）。
+---
 
-### FR-007 状态持久化
-- JSON：`state/key_level_grid/{exchange}/{symbol}_state.json`。重启可恢复锚点、网格、持仓、订单状态。
+## 3. 详细动作分解 (Execution Details)
 
-### FR-008 多实例运行（F002）
-- 配置：`configs/instances.yaml` 列出实例 `name/exchange/symbol/config_path/log_path/env_prefix`。
-- 启动器：`scripts/run_instances.py` 为每实例创建子进程，日志隔离（`LOG_FILE_PATH` 环境变量）。
-- 状态按 `exchange` 隔离；未实现的交易所需显式报错。
+### 3.1 增量改单 (Incremental Adjustment)
 
-### FR-009 固定每格金额（F003，可按强度加权）
-- 每格金额 = `(total_capital * max_leverage * max_capital_usage) / 网格数`。
-- 分配模式：`equal` 或 `weighted`（按强度 Σstrength_i 比例）。
-- 挂单数量由金额/价格转合约张数；余额不足跳过该档，不再二次分配。
+- **定义**：当水位已存在活跃订单时，不创建新订单，而是修改原单。
+- **公式**：`delta_qty = target_qty - open_qty`。
+- **执行**：
+  - 若 `delta_qty > 0`：执行增量补单；
+  - 若 `delta_qty < 0`：执行减量改单（不支持 Amend 则撤旧挂新）。
 
-### FR-010 美股 K 线数据源（Polygon）🆕
-**背景**：扩展关键价位识别能力，支持美股市场分析。
+### 3.2 极性翻转处理 (Polarity Flip)
 
-**数据源**：
-- 使用 [Polygon.io](https://polygon.io/) API 获取美股 K 线数据
-- 支持的周期：`1m`, `5m`, `15m`, `1h`, `4h`, `1d`, `1w`
-- 需要 API Key（通过环境变量 `POLYGON_API_KEY` 配置）
+- **防冲突撤单**：当水位从 Support 变为 Resistance 时，Recon 必须先撤销所有买单。
+- **角色重置**：清理 `fill_counter` 状态（视策略可选），重新根据瀑布流算法评估是否挂卖单。
 
-**支持标的**：
-- 美股个股：AAPL, TSLA, NVDA, GOOGL, MSFT 等
-- 美股 ETF：SPY, QQQ, IWM 等
-- 后续可扩展：指数、期权（视 Polygon 套餐）
+---
 
-**技术要点**：
-- 新建 `polygon_kline_feed.py` 模块，复用 `KlineFeed` 接口
-- K 线数据结构与币圈保持一致（OHLCV + timestamp）
-- 美股交易时段外返回最近有效数据
+## 4. 状态机与冲突防御 (FR-STATE)
 
-**配置示例**：
-```yaml
-polygon:
-  api_key_env: "POLYGON_API_KEY"
-  rate_limit: 5  # 请求/秒（免费套餐限制）
-```
+| 状态 | 说明 | 轨道冲突规则 |
+| --- | --- | --- |
+| **IDLE** | 无任务 | 两轨均可发起 `PLACING` |
+| **PLACING** | API 调用中 | 互斥锁锁定。另一轨道必须跳过此水位 |
+| **ACTIVE** | 已挂单 | Event 等待成交；Recon 负责增量对齐或撤单 |
+| **FILLED** | 待处理 | Event 独占处理补单反射，完成后转 `IDLE` |
+| **CANCELING** | 撤单中 | 互斥锁锁定。禁止其他一切操作 |
 
-### FR-011 CLI 关键价位计算工具 🆕
-**背景**：提供独立的命令行工具，快速计算任意标的的支撑/阻力位，不依赖策略运行。
+---
 
-**命令格式**：
-```bash
-python scripts/calc_levels.py <symbol> <timeframes> [options]
+## 5. 风控与异常处理 (FR-RISK)
 
-# 示例
-python scripts/calc_levels.py TSLA 4h 1d          # 美股 TSLA，4h + 1d 融合
-python scripts/calc_levels.py BTCUSDT 4h 1d       # 币圈 BTC，4h + 1d 融合
-python scripts/calc_levels.py AAPL 1d             # 美股 AAPL，仅日线
-python scripts/calc_levels.py ETHUSDT 1h 4h 1d    # 币圈 ETH，多周期
-```
+1. **止损全覆盖**：Recon 每周期更新 `reduce_only` 止损单，数量覆盖 `Current_Holdings`。
+2. **API 容错**：若 Event 补单失败，不进行重试，标记水位为 `IDLE`，由 Recon 在下一分钟自动修复。
+3. **资金保护**：若 `Total_Sell_Qty` 计算结果异常，或所有阻力位均不满足利润避让，系统应停止挂出任何卖单。
 
-**参数说明**：
-| 参数 | 说明 | 示例 |
-|------|------|------|
-| `symbol` | 标的代码（自动识别币圈/美股） | `TSLA`, `BTCUSDT`, `AAPL` |
-| `timeframes` | 一个或多个周期（空格分隔） | `4h 1d`, `1h 4h 1d` |
-| `--min-strength` | 最低强度阈值（默认 60） | `--min-strength 70` |
-| `--count` | 返回数量（默认 10） | `--count 5` |
-| `--output` | 输出格式：`table`/`json` | `--output json` |
+---
 
-**输出示例**：
-```
-📍 TSLA 关键价位分析（4h + 1d）
+## 6. AI 开发指令 (Developer Directives)
 
-当前价: $248.50
+1. **原子化操作**：所有 API 写入（下单/撤单）必须封装在 Level-Level Lock 异步锁中。
+2. **幂等性设计**：Recon 每次同步前必须重新从交易所拉取 Open Orders 镜像，严禁依赖内存状态做减法。
+3. **数据口径**：内部逻辑使用“币数量”，物理执行前转换为“张数”。最小单位不足一格时向下合并。
+4. **持久化要求**：`fill_counter`、`Avg_Price` 必须实时落地 JSON，确保重启后“配额锁定”依然有效。
 
-阻力位 (10):
-├ R1:  $252.30 (+1.5%) [SW] 💪85
-├ R2:  $258.00 (+3.8%) [FIB] 💪78
-├ R3:  $265.00 (+6.6%) [PSY] 💪92
-...
+---
 
-支撑位 (10):
-├ S1:  $245.00 (-1.4%) [SW] 💪80
-├ S2:  $240.00 (-3.4%) [VOL] 💪75
-├ S3:  $235.00 (-5.4%) [FIB] 💪88
-...
-```
+## 7. 验收场景建议
 
-**标的识别规则**：
-- 包含 `USDT`/`USD`/`BTC` → 币圈（使用 Gate 期货数据源）
-- 纯字母 2~5 位 → 美股（使用 Polygon 数据源）
-- 可通过 `--source gate|polygon` 强制指定
+- **震荡市测试**：验证在买单成交且对应卖单未成交前，同一水位是否保持 `IDLE` 且不挂单。
+- **利润规避测试**：手动拉高 `min_profit_pct`，验证 Recon 是否自动撤销过于接近均价的低位卖单。
+- **暴力极性测试**：手动向交易所下入大额头寸，验证 Recon 是否在上方阻力位按瀑布流铺开卖单。
 
-**技术要点**：
-- 复用现有 `resistance.py` 中的价位计算逻辑
-- 新建 `scripts/calc_levels.py` 独立脚本
-- 支持多周期融合（与策略逻辑一致）
+---
 
-### FR-012 Telegram 关键价位查询扩展 🆕
-**背景**：在 Telegram Bot 中支持查询任意标的的关键价位，不限于当前策略运行的币种。
+# 补充需求：网格重置与冷启动对齐逻辑 (FR-RESET)
 
-**新增命令**：
-```
-/levels <symbol> [timeframes]
+## 1. 重置场景定义
 
-# 示例
-/levels TSLA 4h 1d       # 查询 TSLA 的关键价位
-/levels AAPL 1d          # 查询 AAPL 日线价位
-/levels ETHUSDT 4h       # 查询 ETH 4h 价位
-/levels                  # 无参数 = 当前策略标的（保持原有功能）
-```
+系统必须能够处理以下三种重置场景：
 
-**交互流程**：
-1. 用户发送 `/levels TSLA 4h 1d`
-2. Bot 回复 "⏳ 正在计算 TSLA 关键价位..."
-3. 后台拉取 Polygon K 线 → 计算支撑/阻力
-4. 返回格式化结果（同 CLI 输出）
+1. **冷启动恢复 (Cold Start)**：程序崩溃或手动重启。
+2. **清仓重置 (Zero-Position Reset)**：由于止损或手动清仓导致持仓归零。
+3. **手动强制重置 (Manual Override)**：用户通过 Telegram 指令强制清空计数器。
 
-**限制**：
-- 单次查询超时 30 秒
+## 2. 核心处理逻辑
 
-**技术要点**：
-- 扩展 `bot.py` 的 `/levels` 命令，支持参数解析
-- 异步调用 CLI 计算逻辑（避免阻塞 Bot）
-- 结果缓存 5 分钟（相同查询直接返回）
+### 2.1 冷启动：实盘反向推导 (Reverse Reconciliation)
 
-## 4. 架构与模块
-- 模块：`strategy`（主循环/重建）、`position`（网格生成）、`executor`（交易所适配，Gate）、`telegram.bot`、`state`、`utils`（logger/config）。
-- 数据流：价位 → 网格 → 挂单（买/卖/止损/止盈）→ 事件（成交/异常）→ 通知 & 状态。
-- 日志：默认 `logs/key_level_grid.log`，CLI 可 `--log-file`；多实例可独立路径。
+- **原则**：以交易所持仓为准，反向锁定水位。
+- **逻辑流程**：
+  1. 获取当前账户 `Total_Holdings`。
+  2. 计算需要锁定的配额总数：`Total_Holdings / base_amount_per_grid`（向下取整）。
+  3. 从当前价格向下支撑位按从远到近锁定 `fill_counter`，直到达到配额总数。
 
-## 5. 配置要点（映射 `configs/config.yaml`）
-- 交易：`exchange=gate`，`symbol=BTCUSDT`，`leverage` 与 `position.max_leverage` 对齐。
-- 网格：`range_mode`，`manual_upper/lower`，`rebuild_threshold_pct`，`rebuild_cooldown_sec`，`floor_buffer`，`rebuild_cooldown_on_fill_sec`。
-- 仓位：`total_capital=800`，`max_capital_usage=0.8`，`allocation_mode=equal|weighted`。
-- 止损：`mode=total`，`trigger=grid_floor` 或 `fixed_pct`。
-- 止盈：`mode=by_resistance` 或 `fixed_pct`。
-- 阻力/支撑：`min_strength=60`，`merge_tolerance=0.005`，`min_distance_pct`/`max_distance_pct`，`volume_bucket_pct`/`volume_top_pct`，`mtf_boost`。
-- 日志：`logging.level/file/console`，可被 CLI 覆盖。
+### 2.2 自动归零逻辑 (Auto-Clear)
 
-## 6. 非功能性需求
-- 安全：密钥用环境变量；reduce_only；支持 dry_run。
-- 可靠：交易所止损；异常捕获 + Telegram；Bot 自检重启。
-- 可维护：禁止硬编码（见 `DEV_GUIDE.md`）；配置优先；分层清晰。
-- 可观测：Rich 面板、日志文件、Telegram 通知。
+- **触发点**：Recon 周期发现 `Total_Holdings == 0`。
+- **动作**：清空所有水位 `fill_counter`。
 
-## 7. 接口与命令
-- 单实例：`python scripts/run.py [--force-rebuild] [--log-file PATH]`。
-- 多实例：`python scripts/run_instances.py --config configs/instances.yaml`。
-- 价位计算：`python scripts/calc_levels.py <symbol> <timeframes> [--min-strength N] [--count N]`。🆕
-- Telegram：菜单按钮 + `/position` `/orders` `/levels [symbol timeframes]` `/update_grid` 等。
+### 2.3 局部释放逻辑 (Incremental Reset)
 
-## 8. 验收要点（提炼）
-- 价位过滤遵守 `min_strength`，相近价位可合并。
-- 重建遵守偏移阈值与冷却；成交驱动重建有独立冷却。
-- 持仓存在则有交易所止损计划单；更新防抖；触发后需通知（待补）。
-- 止盈单覆盖持仓张数，reduce_only。
-- Telegram 菜单长期可用；10 分钟无指令自动重启 polling。
-- 多实例日志/state 隔离；未支持交易所需显式报错。
-- 固定每格金额；余额不足跳过该档，不再重分配。
+- **触发点**：Event 捕获到止盈单成交。
+- **动作**：按 `filled_qty / base_amount_per_grid` 释放配额。
+- **优先级**：优先释放价格最低的支撑位 `fill_counter`。
 
-## 9. 未完事项 / 风险
-- ~~T004 止损单状态同步（启动查询、避免重复、状态落地）~~  ✅ 已完成
-- ~~T005 止损触发通知（含亏损金额/百分比）~~ ✅ 已完成
-- T006 单元测试（止损提交/取消/状态持久化）。
-- ~~T007 美股数据源 Polygon 集成（FR-010）~~ ✅ 已完成
-- ~~T008 CLI 关键价位计算工具（FR-011）~~ ✅ 已完成
-- ~~T009 Telegram 跨标的价位查询（FR-012）~~ ✅ 已完成
-- ~~T010 多周期灵活配置（FR-001 增强）~~ ✅ 已完成
-  - 移除硬编码的 "1d" 辅助周期
-  - 支持 1~3 个周期灵活配置
-  - 新增 `klines_by_timeframe` 参数，保持向后兼容
-- 多实例全局风控未做。
+## 3. 状态一致性守卫 (Consistency Guard)
 
-## 10. 版本
-- 文档版本：v1.5  
-- 更新日期：2026-01-14  
-- 维护人：KeyLevelGrid 团队
-- 变更记录：
-  - v1.5：同步 Gate 数据源、Telegram 时间戳、距离过滤与配置项
-  - v1.4：FR-001 增强多周期灵活配置，移除硬编码
-  - v1.3：新增 FR-010/011/012 美股数据源和跨市场价位查询
+- `sum(fill_counter) * base_amount_per_grid` 必须与实盘持仓量一致。
+- 若差异超过 1 个网格单位，Recon 必须告警并触发反向推导。
+- 重置操作需持有全局 `GridLock`。

@@ -158,11 +158,17 @@ grid:
   range_mode: "manual"
   manual_upper: 98000
   manual_lower: 80000
-  rebuild_threshold_pct: 1
-  rebuild_cooldown_sec: 900
+  sell_quota_ratio: 0.7
+  min_profit_pct: 0.005
+  buy_price_buffer_pct: 0.002
+  sell_price_buffer_pct: 0.002
+  base_amount_per_grid: 1.0
+  base_position_locked: 0.0
+  recon_interval_sec: 30
+  order_action_timeout_sec: 10
 
 position:
-  total_capital: 800
+  # total_capital: 自动从交易所读取
   max_leverage: 10
   max_capital_usage: 0.8
 

@@ -151,7 +151,7 @@ class KeyLevelGridStrategy:
         self._last_position_usdt: float = 0  # 上次持仓价值（用于检测变化）
         self._last_position_contracts: Optional[int] = None  # 上次持仓张数（None 表示未初始化）
         self._tp_orders_submitted: bool = False  # 止盈单是否已提交
-        self._need_rebuild_after_fill: bool = False  # 持仓变化后标记重建
+        self._need_rebuild_after_fill: bool = False  # 兼容保留
         self._last_fill_at: float = 0  # 上次成交时间（用于成交后延迟重建）
         
         # 止损单状态
@@ -173,7 +173,11 @@ class KeyLevelGridStrategy:
         self._pending_signal: Optional[KeyLevelSignal] = None
         self._restored_state = False
         self._grid_created = False  # 网格是否已创建
-        self._last_rebuild_at = 0.0
+        self._last_rebuild_at = 0.0  # 兼容保留
+        self._recon_last_run_at: float = 0.0
+        self._grid_lock_until: float = 0.0
+        self._grid_lock = asyncio.Lock()
+        self._last_trade_ids: set = set()
         
         # 回调
         self._on_signal_callback = None
@@ -251,6 +255,7 @@ class KeyLevelGridStrategy:
                 order_placed=notify_raw.get('order_placed', False),
                 grid_rebuild=notify_raw.get('grid_rebuild', True),
                 orders_summary=notify_raw.get('orders_summary', True),
+                quota_event=notify_raw.get('quota_event', True),
                 risk_warning=notify_raw.get('risk_warning', True),
                 near_stop_loss_pct=notify_raw.get('near_stop_loss_pct', 0.02),
                 daily_summary=notify_raw.get('daily_summary', True),
@@ -283,6 +288,7 @@ class KeyLevelGridStrategy:
     @classmethod
     def from_yaml(cls, config_path: str) -> "KeyLevelGridStrategy":
         """从 YAML 文件加载配置 (V2.3 简化版)"""
+        logger = get_logger(__name__)
         with open(config_path, 'r', encoding='utf-8') as f:
             raw_config = yaml.safe_load(f)
         
@@ -321,6 +327,13 @@ class KeyLevelGridStrategy:
             min_distance_pct=resistance_raw.get('min_distance_pct', 0.005),
             max_distance_pct=resistance_raw.get('max_distance_pct', 0.30),
         )
+        logger.info(
+            "[Config] 支撑/阻力配置: min_strength=%s, min_distance_pct=%s, max_distance_pct=%s, merge_tolerance=%s",
+            resistance_config.min_strength,
+            resistance_config.min_distance_pct,
+            resistance_config.max_distance_pct,
+            resistance_config.merge_tolerance,
+        )
         
         # V2.3: 仓位配置 (网格模式)
         pos_raw = raw_config.get('position', {})
@@ -329,8 +342,7 @@ class KeyLevelGridStrategy:
         position_leverage = pos_raw.get('max_leverage', trading_leverage)
         # 如果 position.max_leverage 未设置或与 trading.leverage 不同，使用 trading.leverage
         if position_leverage != trading_leverage:
-            import logging
-            logging.warning(
+            logger.warning(
                 f"[Config] position.max_leverage({position_leverage}) 与 trading.leverage({trading_leverage}) 不一致，"
                 f"使用 trading.leverage={trading_leverage}"
             )
@@ -344,11 +356,11 @@ class KeyLevelGridStrategy:
         )
         
         # 打印配置验证
-        import logging
-        logging.info(f"[Config] 仓位配置: total_capital={position_config.total_capital}, "
-                     f"max_leverage={position_config.max_leverage}, "
-                     f"max_capital_usage={position_config.max_capital_usage}, "
-                     f"max_position_usdt={position_config.max_position_usdt}")
+        logger.info(
+            "[Config] 仓位配置: max_leverage=%sx, max_capital_usage=%s (total_capital 将在启动后从交易所读取)",
+            position_config.max_leverage,
+            position_config.max_capital_usage,
+        )
         
         # V2.3: 网格配置
         from key_level_grid.position import GridConfig
@@ -361,14 +373,23 @@ class KeyLevelGridStrategy:
             fixed_count=grid_raw.get('fixed_count', 5),
             max_grids=grid_raw.get('max_grids', 10),
             floor_buffer=grid_raw.get('floor_buffer', 0.005),
-            rebuild_enabled=grid_raw.get('rebuild_enabled', True),
-            rebuild_threshold_pct=grid_raw.get('rebuild_threshold_pct', 0.02),
-            rebuild_cooldown_sec=grid_raw.get('rebuild_cooldown_sec', 900),
-            rebuild_cooldown_on_fill_sec=grid_raw.get('rebuild_cooldown_on_fill_sec', 600),
+            sell_quota_ratio=grid_raw.get('sell_quota_ratio', 0.7),
+            min_profit_pct=grid_raw.get('min_profit_pct', 0.005),
+            buy_price_buffer_pct=grid_raw.get('buy_price_buffer_pct', 0.002),
+            sell_price_buffer_pct=grid_raw.get('sell_price_buffer_pct', 0.002),
+            base_amount_per_grid=grid_raw.get('base_amount_per_grid', 1.0),
+            base_position_locked=grid_raw.get('base_position_locked', 0.0),
+            max_fill_per_level=grid_raw.get('max_fill_per_level', 1),
+            recon_interval_sec=grid_raw.get('recon_interval_sec', 30),
+            order_action_timeout_sec=grid_raw.get('order_action_timeout_sec', 10),
+            restore_state_enabled=grid_raw.get('restore_state_enabled', True),
         )
-        logging.info(f"[Config] 网格配置: rebuild_enabled={grid_config.rebuild_enabled}, "
-                     f"rebuild_threshold={grid_config.rebuild_threshold_pct:.2%}, "
-                     f"cooldown={grid_config.rebuild_cooldown_sec}s")
+        
+        logger.info(
+            "[Config] 缓冲参数: buy_price_buffer_pct=%s, sell_price_buffer_pct=%s",
+            grid_config.buy_price_buffer_pct,
+            grid_config.sell_price_buffer_pct,
+        )
         
         # API 配置
         api_config = raw_config.get('api', {})
@@ -529,15 +550,15 @@ class KeyLevelGridStrategy:
         
         # 尝试恢复网格状态 (仅一次)
         if not self._restored_state:
-            current_price = klines[-1].close if klines else 0
-            if current_price > 0:
-                restored = self.position_manager.restore_state(current_price)
-                if restored:
-                    self.logger.info("已从持久化恢复网格状态")
-                    self._grid_created = True  # 恢复成功，标记网格已创建
-                    # 如果没有挂单（例如手动全撤），重新提交
-                    if not self.config.dry_run and self._executor and not self._gate_open_orders:
-                        await self._submit_grid_orders(self.position_manager.state)
+            if not self.position_manager.grid_config.restore_state_enabled:
+                self.logger.info("🧹 已禁用持久化恢复，跳过恢复网格状态")
+            else:
+                current_price = klines[-1].close if klines else 0
+                if current_price > 0:
+                    restored = self.position_manager.restore_state(current_price)
+                    if restored:
+                        self.logger.info("已从持久化恢复网格状态")
+                        self._grid_created = True  # 恢复成功，标记网格已创建
             self._restored_state = True
         
         # T004: 启动时同步交易所现有止损单（仅一次）
@@ -572,256 +593,216 @@ class KeyLevelGridStrategy:
         if not self._grid_created and self._current_state:
             await self._create_initial_grid(klines)
 
-        # 价格偏离 / 成交触发：自动重建网格
-        if self._grid_created and self._current_state and self.position_manager.state:
-            await self._maybe_rebuild_grid(klines)
+        # 价格偏离 / 成交触发：自动重建网格（已废弃，保留接口但不触发）
+        # if self._grid_created and self._current_state and self.position_manager.state:
+        #     await self._maybe_rebuild_grid(klines)
         
-        # 检测持仓变化，提交止盈挂单
-        await self._check_and_submit_take_profit_orders()
-        
-        # 检测持仓变化，更新止损单
+        # Recon 对账 + Event 增量更新
+        await self._run_recon_track()
+        await self._run_event_track()
+
+        # 检测持仓变化，更新止损单（保留全仓止损）
         await self._check_and_update_stop_loss_order()
-        
+
         # T005: 检测止损单是否被触发
         await self._check_stop_loss_triggered()
-        
-        # 更新仓位 (如果有)
-        if self.position_manager.state:
-            result = self.position_manager.update_position(
-                self._current_state.close,
-                self._current_state
-            )
-            
-            if result.get('status') == 'stop_loss_triggered':
-                await self._handle_stop_loss(result)
-            
-            for action in result.get('actions', []):
-                await self._handle_action(action)
 
     async def _maybe_rebuild_grid(self, klines: List[Kline]) -> None:
         """
-        当价格相对网格锚点偏离超过阈值时，自动重建网格。
-
-        - 触发条件：abs(current - anchor) / anchor > 2%
-        - 冷却：避免频繁重建（默认 15 分钟）
-        - 方案A：重建模式下提交买单时跳过“均价保护”过滤
+        旧版自动重建网格逻辑（Spec2.0 已废弃，保留但不使用）。
         """
-        import time
-        if self.config.dry_run or not self._executor:
-            return
-
-        state = self.position_manager.state
-        if not state:
-            return
-
-        current_price = float(self._current_state.close or 0)
-        if current_price <= 0:
-            return
-
-        # 初始化锚点（如果旧状态没有该字段）
-        if getattr(state, "anchor_price", 0.0) <= 0:
-            state.anchor_price = current_price
-            state.anchor_ts = int(time.time())
-            self.position_manager._save_state()
-            return
-
-        anchor_price = float(state.anchor_price or 0)
-        if anchor_price <= 0:
-            return
-
-        # 从配置读取重建参数
-        grid_cfg = self.position_manager.grid_config
-        if not grid_cfg.rebuild_enabled:
-            return  # 重建功能已禁用
-        
-        threshold = grid_cfg.rebuild_threshold_pct
-        cooldown_sec = grid_cfg.rebuild_cooldown_sec
-        fill_cooldown = grid_cfg.rebuild_cooldown_on_fill_sec
-        
-        move_pct = abs(current_price - anchor_price) / anchor_price
-        last_rebuild_at = getattr(self, "_last_rebuild_at", 0.0) or 0.0
-        now_ts = time.time()
-
-        # 成交驱动的重建：成交后等待 fill_cooldown 再重建
-        if getattr(self, "_need_rebuild_after_fill", False):
-            last_fill_at = getattr(self, "_last_fill_at", 0.0) or 0.0
-            if last_fill_at and (now_ts - last_fill_at) < fill_cooldown:
-                # 距离成交时间不足，继续等待
-                remaining = int(fill_cooldown - (now_ts - last_fill_at))
-                self.logger.debug(f"⏳ 成交后等待重建: 剩余 {remaining} 秒")
-                return
-            self.logger.warning("🔄 因持仓变动触发重建（成交驱动）")
-        else:
-            # 偏离驱动
-            if last_rebuild_at and (now_ts - last_rebuild_at) < cooldown_sec:
-                return
-            if move_pct < threshold:
-                return
-            self.logger.warning(
-                f"🔄 触发网格重建: current={current_price:.2f}, anchor={anchor_price:.2f}, "
-                f"move={move_pct:.2%} > {threshold:.2%}"
-            )
-
-        gate_symbol = self._convert_to_gate_symbol(self.config.symbol)
-
-        # 1) 先撤掉该 symbol 下所有挂单（包含普通单与计划委托）
-        try:
-            if hasattr(self._executor, "cancel_all_plan_orders"):
-                await self._executor.cancel_all_plan_orders(gate_symbol)
-            if hasattr(self._executor, "cancel_all_orders"):
-                await self._executor.cancel_all_orders(gate_symbol)
-        except Exception as e:
-            self.logger.error(f"网格重建撤单失败: {e}", exc_info=True)
-
-        # 2) 同步一次挂单缓存
-        await self._update_gate_orders()
-
-        # 3) 重新计算支撑/阻力位（使用多周期融合）
-        klines_dict = self._build_klines_by_timeframe(klines)
-        resistance_calc = self.position_manager.resistance_calc
-        
-        resistances = resistance_calc.calculate_resistance_levels(
-            current_price, klines, "long", klines_by_timeframe=klines_dict
-        )
-        supports = resistance_calc.calculate_support_levels(
-            current_price, klines, klines_by_timeframe=klines_dict
-        )
-
-        if not supports:
-            self.logger.warning("网格重建：未找到有效支撑位，放弃重建")
-            return
-
-        # 4) 重建网格（会写入新锚点并持久化）
-        new_grid = self.position_manager.create_grid(
-            current_price=current_price,
-            support_levels=supports,
-            resistance_levels=resistances,
-        )
-        if not new_grid:
-            self.logger.warning("网格重建失败，将在下次周期重试")
-            return
-
-        # 更新锚点（保险起见）
-        new_grid.anchor_price = current_price
-        new_grid.anchor_ts = int(time.time())
-        self.position_manager._save_state()
-
-        # 重建后允许重新提交 TP（但会被“已挂止盈覆盖”逻辑挡住重复）
-        self._tp_orders_submitted = False
-        self._stop_loss_order_id = None  # 重置止损单状态（已被全部撤销）
-        self._stop_loss_contracts = 0
-
-        # 5) 提交买单：重建模式跳过均价保护（方案A）
-        await self._submit_grid_orders(new_grid, rebuild_mode=True)
-        self._last_rebuild_at = time.time()
-        self._need_rebuild_after_fill = False
+        return
     
     async def force_rebuild_grid(self) -> bool:
         """
-        强制重建网格（由 Telegram 命令触发）
+        强制重置网格（TG 触发）。
         
-        不检查阈值和冷却时间，立即执行重建
-        
-        Returns:
-            bool: 是否成功
+        逻辑：
+        - 先同步持仓/挂单
+        - 撤销全部挂单
+        - 重新计算支撑/阻力位并重建网格状态
+        - 无持仓：按最新支撑位全量挂买单
+        - 有持仓：计算 N，从 N+1 支撑位开始挂买单；卖单按 Recon 规则分配
         """
         import time
-        
-        if self.config.dry_run or not self._executor:
-            self.logger.warning("Dry Run 模式或无执行器，无法强制重建")
+
+        if not self._executor:
+            self.logger.warning("无执行器，无法强制重置网格")
             return False
-        
+
+        # 补齐当前状态
         if not self._current_state:
-            self.logger.warning("无当前状态数据，无法强制重建")
-            return False
-        
+            klines = self.kline_feed.get_cached_klines(
+                self.config.kline_config.primary_timeframe
+            )
+            if len(klines) >= 50:
+                self._current_state = self.indicator.calculate(klines)
+            else:
+                self.logger.warning("无当前状态数据，无法强制重置")
+                return False
+
         current_price = float(self._current_state.close or 0)
         if current_price <= 0:
-            self.logger.warning("当前价格无效，无法强制重建")
+            self.logger.warning("当前价格无效，无法强制重置")
             return False
-        
-        self.logger.info(f"🔄 强制重建网格: current_price={current_price:.2f}")
-        
+
+        self.logger.info(f"🔄 强制重置网格: current_price={current_price:.2f}")
+
         gate_symbol = self._convert_to_gate_symbol(self.config.symbol)
-        
+
         try:
-            # 1) 撤掉该 symbol 下所有挂单
+            # 1) 同步账户/挂单/持仓
+            await self._update_account_balance()
+            await self._update_gate_orders()
+            await self._update_gate_position()
+            await self._update_gate_trades()
+
+            # 2) 撤掉该 symbol 下所有挂单
             if hasattr(self._executor, "cancel_all_plan_orders"):
                 await self._executor.cancel_all_plan_orders(gate_symbol)
             if hasattr(self._executor, "cancel_all_orders"):
                 await self._executor.cancel_all_orders(gate_symbol)
-            
-            # 2) 同步挂单缓存
-            await self._update_gate_orders()
-            
-            # 3) 获取最新K线
+
+            # 3) 重新计算支撑/阻力位（多周期融合）
             klines = self.kline_feed.get_cached_klines(
                 self.config.kline_config.primary_timeframe
             )
             if len(klines) < 50:
-                self.logger.warning("K线数据不足，无法重建")
+                self.logger.warning("K线数据不足，无法重置")
                 return False
-            
-            # 4) 重新计算支撑/阻力位（使用多周期融合）
+
             klines_dict = self._build_klines_by_timeframe(klines)
             resistance_calc = self.position_manager.resistance_calc
-            
+
             resistances = resistance_calc.calculate_resistance_levels(
                 current_price, klines, "long", klines_by_timeframe=klines_dict
             )
             supports = resistance_calc.calculate_support_levels(
                 current_price, klines, klines_by_timeframe=klines_dict
             )
-            
+
             if not supports:
-                self.logger.warning("未找到有效支撑位，放弃重建")
+                self.logger.warning("未找到有效支撑位，放弃重置")
                 return False
-            
-            # 5) 保存旧锚点用于通知
+
+            # 4) 保存旧锚点用于通知
             old_anchor = 0
             if self.position_manager.state:
                 old_anchor = getattr(self.position_manager.state, "anchor_price", 0) or 0
-            
-            # 6) 重建网格
+
+            # 5) 重建网格状态
             new_grid = self.position_manager.create_grid(
                 current_price=current_price,
                 support_levels=supports,
                 resistance_levels=resistances,
             )
             if not new_grid:
-                self.logger.warning("网格重建失败")
+                self.logger.warning("网格重置失败")
                 return False
-            
-            # 更新锚点
+
             new_grid.anchor_price = current_price
             new_grid.anchor_ts = int(time.time())
             self.position_manager._save_state()
-            
-            # 重建后允许重新提交 TP 和 SL
+
+            # 6) 基于当前持仓计算挂单
+            current_contracts = float(self._gate_position.get("contracts", 0) or 0)
+            exchange_min_qty = self._get_exchange_min_contracts()
+            contract_size = float(getattr(self, "_contract_size", 0) or self.config.default_contract_size)
+            exchange_min_qty_btc = exchange_min_qty * contract_size
+            per_grid_contracts = float(self.position_manager.state.base_amount_per_grid or 0)
+
+            buy_actions = []
+            if per_grid_contracts <= 0:
+                self.logger.warning("单格数量无效，跳过买单")
+            else:
+                filled_levels = 0
+                if current_contracts > 0:
+                    filled_levels = int(current_contracts // per_grid_contracts)
+                for idx, lvl in enumerate(self.position_manager.state.support_levels_state):
+                    if idx < filled_levels:
+                        continue
+                    buy_actions.append({
+                        "action": "place",
+                        "side": "buy",
+                        "price": lvl.price,
+                        "qty": max(per_grid_contracts, exchange_min_qty_btc),
+                        "level_id": lvl.level_id,
+                        "reason": "force_rebuild_buy",
+                    })
+
+            # 7) 卖单按 Recon 逻辑分配
+            sell_actions = []
+            total_sell_qty = self.position_manager.compute_total_sell_qty(current_contracts)
+            base_amount_contracts = self.position_manager.state.base_amount_per_grid
+            min_price = self.position_manager.state.avg_entry_price * (1 + self.position_manager.state.min_profit_pct) \
+                if self.position_manager.state.avg_entry_price > 0 else 0
+            eligible_levels = [
+                lvl for lvl in self.position_manager.state.resistance_levels_state
+                if not min_price or lvl.price >= min_price
+            ]
+            self.logger.info(
+                "🧾 强制重置卖单过滤: total_levels=%d, eligible=%d, min_price=%.2f, avg_entry=%.2f, min_profit=%.4f",
+                len(self.position_manager.state.resistance_levels_state),
+                len(eligible_levels),
+                min_price,
+                self.position_manager.state.avg_entry_price,
+                self.position_manager.state.min_profit_pct,
+            )
+            targets = self.position_manager.allocate_sell_targets(
+                total_sell_qty,
+                base_amount_contracts,
+                exchange_min_qty_btc,
+                levels_count=len(eligible_levels),
+            )
+            eligible_idx = 0
+            for idx, lvl in enumerate(self.position_manager.state.resistance_levels_state):
+                target_qty = 0.0
+                if (not min_price or lvl.price >= min_price) and eligible_idx < len(targets):
+                    target_qty = targets[eligible_idx]
+                    eligible_idx += 1
+                if target_qty <= 0:
+                    continue
+                if min_price and lvl.price < min_price:
+                    continue
+                sell_actions.append({
+                    "action": "place",
+                    "side": "sell",
+                    "price": lvl.price,
+                    "qty": target_qty,
+                    "level_id": lvl.level_id,
+                    "reason": "force_rebuild_sell",
+                })
+
+            await self._execute_recon_actions(buy_actions + sell_actions)
+
+            # 8) 重置止损状态，等待后续同步
             self._tp_orders_submitted = False
-            self._stop_loss_order_id = None  # 重置止损单状态（已被全部撤销）
+            self._stop_loss_order_id = None
             self._stop_loss_contracts = 0
-            
-            # 7) 提交买单
-            await self._submit_grid_orders(new_grid, rebuild_mode=True)
+
             self._last_rebuild_at = time.time()
             self._need_rebuild_after_fill = False
-            
-            # 8) 发送通知
+
+            # 9) 通知
             await self._notify_grid_rebuild(
                 reason="手动触发",
                 old_anchor=old_anchor,
                 new_anchor=current_price,
-                new_orders=[{"side": "buy", "price": o.price, "amount": o.amount_usdt} 
-                           for o in new_grid.buy_orders if not o.is_filled],
+                new_orders=[
+                    {"side": a.get("side"), "price": a.get("price"), "amount": 0}
+                    for a in buy_actions
+                ],
             )
-            
-            self.logger.info(f"✅ 网格强制重建完成: 新锚点={current_price:.2f}")
+
+            self.logger.info(
+                f"✅ 网格强制重置完成: 新锚点={current_price:.2f}, "
+                f"买单={len(buy_actions)}档, 卖单={len(sell_actions)}档"
+            )
             return True
-            
+
         except Exception as e:
-            self.logger.error(f"强制重建网格失败: {e}", exc_info=True)
-            await self._notify_error("RebuildError", str(e), "强制重建网格")
+            self.logger.error(f"强制重置网格失败: {e}", exc_info=True)
+            await self._notify_error("RebuildError", str(e), "强制重置网格")
             return False
     
     async def _update_account_balance(self) -> None:
@@ -888,7 +869,8 @@ class KeyLevelGridStrategy:
                     "side": o.get("side", ""),
                     "price": price,
                     "amount": amount_usdt,  # USDT 价值
-                    "contracts": real_btc,  # 真实 BTC 数量（用于显示）
+                    "contracts": remaining_contracts,  # 原始张数（合约张数）
+                    "base_amount": real_btc,  # 真实币数量（用于展示）
                     "raw_contracts": remaining_contracts,  # 原始张数（用于调试）
                     "filled": float(o.get("filled", 0) or 0),
                     "remaining": remaining_contracts,
@@ -994,8 +976,7 @@ class KeyLevelGridStrategy:
             
             self._position_updated_at = time.time()
             
-            # ⭐ 持仓同步后立即检测成交（不等待 K 线收盘）
-            await self._check_and_submit_take_profit_orders()
+            # ⭐ 持仓同步后不再提交旧版止盈单（Spec2.0 由 Recon/Event 管理）
             
         except Exception as e:
             self.logger.error(f"同步 Gate 持仓失败: {e}")
@@ -1026,6 +1007,14 @@ class KeyLevelGridStrategy:
             for trade in trades:
                 trade_time = trade.get("timestamp", 0)
                 trade_datetime = datetime.fromtimestamp(trade_time / 1000) if trade_time else None
+
+                amount_raw = float(trade.get("amount", 0) or 0)
+                amount = amount_raw
+                # 期货数量换算为币数量
+                if self.config.market_type == "futures":
+                    contract_size = float(getattr(self, "_contract_size", 0) or 0)
+                    if contract_size > 0:
+                        amount = amount_raw * contract_size
                 
                 self._gate_trades.append({
                     "id": trade.get("id", ""),
@@ -1033,7 +1022,7 @@ class KeyLevelGridStrategy:
                     "timestamp": trade_time,
                     "side": trade.get("side", ""),
                     "price": float(trade.get("price", 0) or 0),
-                    "amount": float(trade.get("amount", 0) or 0),
+                    "amount": amount,
                     "cost": float(trade.get("cost", 0) or 0),  # USDT 金额
                     "fee": float(trade.get("fee", {}).get("cost", 0) or 0),
                     "fee_currency": trade.get("fee", {}).get("currency", ""),
@@ -1049,15 +1038,309 @@ class KeyLevelGridStrategy:
             
         except Exception as e:
             self.logger.error(f"同步 Gate 成交记录失败: {e}")
+
+    def _get_exchange_min_contracts(self) -> float:
+        """获取交易所最小下单张数"""
+        try:
+            gate_symbol = self._convert_to_gate_symbol(self.config.symbol)
+            markets = self._executor._exchange.markets if self._executor else {}
+            if not markets:
+                return 1.0
+            market = markets.get(gate_symbol, {})
+            min_amount = market.get("limits", {}).get("amount", {}).get("min")
+            return float(min_amount) if min_amount else 1.0
+        except Exception:
+            return 1.0
+
+    async def _run_recon_track(self) -> None:
+        if not self._grid_created or not self.position_manager.state:
+            return
+
+        now_ts = time.time()
+        grid_cfg = self.position_manager.grid_config
+        if now_ts - self._recon_last_run_at < grid_cfg.recon_interval_sec:
+            return
+        if self._grid_lock_until and now_ts < self._grid_lock_until:
+            return
+
+        async with self._grid_lock:
+            # 更新持仓快照（币数量）
+            prev_holdings = 0.0
+            if self.position_manager.state:
+                prev_holdings = float(self.position_manager.state.total_position_contracts or 0)
+            holdings = float(self._gate_position.get("contracts", 0) or 0)
+            avg_entry = float(self._gate_position.get("entry_price", 0) or 0)
+            self.position_manager.update_position_snapshot(holdings, avg_entry)
+            if self.position_manager.state:
+                # 初始化底仓保护（仅首次持仓由 0 -> >0 时设置）
+                if (
+                    prev_holdings <= 0
+                    and holdings > 0
+                    and float(self.position_manager.state.base_position_locked or 0) <= 0
+                ):
+                    base_locked = holdings * max(1 - self.position_manager.state.sell_quota_ratio, 0)
+                    self.position_manager.state.base_position_locked = base_locked
+                    self.logger.info(
+                        "🧱 初始化底仓保护: base_locked=%.6f BTC (holdings=%.6f, ratio=%.2f)",
+                        base_locked,
+                        holdings,
+                        1 - self.position_manager.state.sell_quota_ratio,
+                    )
+                    self.position_manager._save_state()
+                self.position_manager.state.contract_size = getattr(self, "_contract_size", self.config.default_contract_size)
+                try:
+                    result = self.position_manager.reconcile_counters_with_position(
+                        current_price=self._current_state.close if self._current_state else 0,
+                        holdings_btc=holdings,
+                    )
+                    if result and self._notifier:
+                        await self._notifier.notify_quota_event(
+                            symbol=self.config.symbol,
+                            action=result.get("action", "reconcile"),
+                            detail=result.get("detail", ""),
+                        )
+                except Exception as e:
+                    self.logger.error(f"配额对齐失败: {e}", exc_info=True)
+
+            exchange_min_qty = self._get_exchange_min_contracts()
+            contract_size = float(getattr(self, "_contract_size", 0) or self.config.default_contract_size)
+            exchange_min_qty_btc = exchange_min_qty * contract_size
+            actions = self.position_manager.build_recon_actions(
+                current_price=self._current_state.close if self._current_state else 0,
+                open_orders=self._gate_open_orders,
+                exchange_min_qty_btc=exchange_min_qty_btc,
+            )
+
+        # Recon 需要撤单或重排时加锁，避免 Event 竞争
+        if any(a.get("action") == "cancel" for a in actions):
+            self._grid_lock_until = now_ts + grid_cfg.order_action_timeout_sec
+
+        await self._execute_recon_actions(actions)
+        self._recon_last_run_at = now_ts
+
+    async def _run_event_track(self) -> None:
+        if not self.position_manager.state:
+            return
+
+        # 处理成交事件
+        if not self._last_trade_ids and self._gate_trades:
+            self._last_trade_ids = {t.get("id") for t in self._gate_trades if t.get("id")}
+            return
+
+        new_trades = []
+        for trade in self._gate_trades:
+            trade_id = trade.get("id")
+            if not trade_id or trade_id in self._last_trade_ids:
+                continue
+            new_trades.append(trade)
+            self._last_trade_ids.add(trade_id)
+
+        if not new_trades:
+            return
+
+        async with self._grid_lock:
+            exchange_min_qty = self._get_exchange_min_contracts()
+            contract_size = float(getattr(self, "_contract_size", 0) or self.config.default_contract_size)
+            exchange_min_qty_btc = exchange_min_qty * contract_size
+            for trade in reversed(new_trades):
+                side = trade.get("side")
+                qty = float(trade.get("amount", 0) or 0)
+                price = float(trade.get("price", 0) or 0)
+                cost = float(trade.get("cost", 0) or 0)
+                if cost <= 0 and qty > 0 and price > 0:
+                    cost = qty * price
+
+                if side == "buy":
+                    self._mark_level_filled("buy", price)
+                    actions = self.position_manager.build_event_sell_increment(
+                        qty,
+                        exchange_min_qty_btc,
+                        self._current_state.close if self._current_state else 0,
+                    )
+                    if actions:
+                        self.logger.debug(
+                            f"⚡ Event买成补卖: price={price:.2f}, qty={qty:.6f}"
+                        )
+                    await self._execute_recon_actions(actions)
+                    if cost > 0:
+                        await self._notify_order_filled(
+                            side="buy",
+                            fill_price=price,
+                            fill_amount=cost,
+                            grid_index=0,
+                            realized_pnl=0,
+                        )
+                    self.position_manager.increment_fill_counter_by_qty(price, qty)
+                    self._mark_level_idle("buy", price)
+                elif side == "sell":
+                    self._mark_level_filled("sell", price)
+                    self.logger.debug(
+                        f"⚡ Event卖成补买: price={price:.2f}"
+                    )
+                    await self._handle_sell_rebuy(price, exchange_min_qty_btc)
+                    if cost > 0:
+                        await self._notify_order_filled(
+                            side="sell",
+                            fill_price=price,
+                            fill_amount=cost,
+                            grid_index=0,
+                            realized_pnl=0,
+                        )
+                    self.position_manager.release_fill_counter_by_qty(qty)
+                    self._mark_level_idle("sell", price)
+
+    async def _handle_sell_rebuy(self, sell_price: float, exchange_min_qty: float) -> None:
+        """卖单成交后尝试挂回买单"""
+        if not self.position_manager.state or not self._current_state:
+            return
+        current_price = self._current_state.close
+        from key_level_grid.position import LevelStatus
+        for lvl in self.position_manager.state.support_levels_state:
+            if lvl.price >= current_price:
+                continue
+            if (
+                lvl.status == LevelStatus.IDLE
+                and current_price > lvl.price * (1 + self.position_manager.state.buy_price_buffer_pct)
+            ):
+                if lvl.fill_counter >= self.position_manager.state.max_fill_per_level:
+                    self.logger.debug(
+                        "🧱 回补受限: price=%.2f, fill_counter=%d, max=%d",
+                        lvl.price,
+                        lvl.fill_counter,
+                        self.position_manager.state.max_fill_per_level,
+                    )
+                    continue
+                qty = max(self.position_manager.state.base_amount_per_grid, exchange_min_qty)
+                await self._execute_recon_actions([{
+                    "action": "place",
+                    "side": "buy",
+                    "price": lvl.price,
+                    "qty": qty,
+                    "level_id": lvl.level_id,
+                    "reason": "event_rebuy",
+                }])
+                self.logger.debug(
+                    f"⚡ Event卖成补买: price={lvl.price:.2f}, qty={qty:.6f}"
+                )
+                break
+
+    async def reset_fill_counters(self, reason: str = "manual") -> bool:
+        if not self.position_manager.state:
+            return False
+        async with self._grid_lock:
+            self.position_manager.clear_fill_counters(reason=reason)
+            if self._notifier:
+                await self._notifier.notify_quota_event(
+                    symbol=self.config.symbol,
+                    action="manual_reset",
+                    detail=f"原因: {reason}",
+                )
+        return True
+
+    async def _execute_recon_actions(self, actions: List[Dict[str, Any]]) -> None:
+        if not actions or not self._executor:
+            return
+        from key_level_grid.executor.base import Order, OrderSide, OrderType
+        from key_level_grid.position import LevelStatus
+
+        gate_symbol = self._convert_to_gate_symbol(self.config.symbol)
+        for action in actions:
+            if action.get("action") == "place":
+                side = OrderSide.BUY if action.get("side") == "buy" else OrderSide.SELL
+                qty_btc = float(action.get("qty", 0) or 0)
+                price = float(action.get("price", 0) or 0)
+                if qty_btc <= 0 or price <= 0:
+                    continue
+                contract_size = float(getattr(self, "_contract_size", 0) or self.config.default_contract_size)
+                min_contracts = self._get_exchange_min_contracts()
+                qty_contracts = qty_btc / contract_size if contract_size > 0 else qty_btc
+                # 向上取整并满足最小下单量
+                import math
+                qty_contracts = max(math.ceil(qty_contracts), math.ceil(min_contracts))
+                order = Order.create(
+                    symbol=gate_symbol,
+                    side=side,
+                    order_type=OrderType.LIMIT,
+                    quantity=qty_contracts,
+                    price=price,
+                )
+                if side == OrderSide.SELL:
+                    order.reduce_only = True
+                success = await self._executor.submit_order(order)
+                lvl = self._find_level_state(action.get("side"), price)
+                if lvl:
+                    lvl.status = LevelStatus.ACTIVE if success else LevelStatus.IDLE
+                    lvl.order_id = getattr(order, "exchange_order_id", "") or lvl.order_id
+                    lvl.active_order_id = lvl.order_id
+                    lvl.open_qty = qty_btc if success else 0.0
+                    lvl.last_action_ts = int(time.time())
+            elif action.get("action") == "cancel":
+                exchange_order_id = action.get("order_id")
+                if not exchange_order_id:
+                    continue
+                reason = action.get("reason", "unknown")
+                price = float(action.get("price", 0) or 0)
+                lvl = self._find_level_state(action.get("side"), price)
+                if lvl:
+                    self.logger.info(
+                        "🧹 撤单原因: side=%s, price=%.2f, reason=%s, "
+                        "target=%.6f, open=%.6f, avg_entry=%.2f",
+                        action.get("side"),
+                        price,
+                        reason,
+                        float(getattr(lvl, "target_qty", 0) or 0),
+                        float(getattr(lvl, "open_qty", 0) or 0),
+                        float(getattr(self.position_manager.state, "avg_entry_price", 0) or 0),
+                    )
+                order = Order.create(
+                    symbol=gate_symbol,
+                    side=OrderSide.BUY,
+                    order_type=OrderType.LIMIT,
+                    quantity=0.0,
+                    price=0.0,
+                )
+                order.exchange_order_id = exchange_order_id
+                success = await self._executor.cancel_order(order)
+                if not lvl:
+                    lvl = self._find_level_state(action.get("side"), price)
+                if lvl:
+                    lvl.status = LevelStatus.IDLE if success else LevelStatus.CANCELING
+                    lvl.order_id = "" if success else lvl.order_id
+                    if success:
+                        lvl.active_order_id = ""
+                    lvl.open_qty = 0.0 if success else lvl.open_qty
+                    lvl.last_action_ts = int(time.time())
+
+    def _find_level_state(self, side: str, price: float):
+        if not self.position_manager.state:
+            return None
+        price = float(price or 0)
+        levels = (
+            self.position_manager.state.support_levels_state +
+            self.position_manager.state.resistance_levels_state
+        )
+        for lvl in levels:
+            if abs(lvl.price - price) <= lvl.price * 0.001:
+                return lvl
+        return None
+
+    def _mark_level_filled(self, side: str, price: float) -> None:
+        from key_level_grid.position import LevelStatus
+        lvl = self._find_level_state(side, price)
+        if lvl:
+            lvl.status = LevelStatus.FILLED
+            lvl.last_action_ts = int(time.time())
+
+    def _mark_level_idle(self, side: str, price: float) -> None:
+        from key_level_grid.position import LevelStatus
+        lvl = self._find_level_state(side, price)
+        if lvl:
+            lvl.status = LevelStatus.IDLE
+            lvl.last_action_ts = int(time.time())
     
     async def _check_and_submit_take_profit_orders(self) -> None:
         """
-        检测持仓变化，提交止盈挂单
-        
-        修正版逻辑：
-        1. 检测持仓增加（买单成交）→ 重新计算并提交止盈单
-        2. 检测持仓减少（止盈成交）→ 记录日志
-        3. 止盈单数量 = 已成交买单数量（与买单对称）
+        旧版止盈挂单逻辑（Spec2.0 已废弃，保留但不使用）。
         """
         if self.config.dry_run or not self._executor:
             return
@@ -1475,17 +1758,7 @@ class KeyLevelGridStrategy:
     
     async def _submit_take_profit_orders(self, position_usdt: float) -> None:
         """
-        提交止盈卖单到 Gate (修正版：止盈单数量 = 已成交买单数量)
-        
-        逻辑：
-        1. 获取 Gate 真实持仓（张数、均价）
-        2. 计算每格张数（从 buy_orders 获取，与买单对称）
-        3. 计算已成交网格数 = ceil(持仓张数 / 每格张数)
-        4. 获取有效阻力位（高于均价），只取前 N 个
-        5. 逐档分配止盈，防重复检查
-        
-        Args:
-            position_usdt: 当前持仓价值 (USDT) - 仅用于日志
+        旧版止盈卖单逻辑（Spec2.0 已废弃，保留但不使用）。
         """
         import math
         from key_level_grid.executor.base import Order, OrderSide, OrderType
@@ -1732,21 +2005,12 @@ class KeyLevelGridStrategy:
                 f"{len(grid_state.sell_orders)} 档卖单, "
                 f"底线={grid_state.grid_floor:.2f}"
             )
-            
-            # 实盘模式：提交真实限价单到交易所
-            if not self.config.dry_run and self._executor:
-                await self._submit_grid_orders(grid_state)
         else:
             self.logger.warning("网格创建失败，将在下一周期重试")
     
     async def _submit_grid_orders(self, grid_state, rebuild_mode: bool = False) -> None:
         """
-        提交网格订单到交易所
-        
-        过滤规则：
-        - 规则 B：Gate 上已有的挂单（价格容差 0.1%）
-        - 规则 C：跳过 price >= avg_entry_price * 0.995（均价保护）
-          - 方案A：当 rebuild_mode=True（网格重建）时，跳过该规则
+        旧版网格挂单逻辑（Spec2.0 已废弃，保留但不使用）。
         """
         import math
         from key_level_grid.executor.base import Order, OrderSide, OrderType
@@ -2141,6 +2405,9 @@ class KeyLevelGridStrategy:
         """获取显示面板数据"""
         state = self._current_state
         pos = self.position_manager.state
+        grid_config = self.position_manager.grid_config
+        resistance_config = self.position_manager.resistance_config
+        levels_from_grid = False
         
         # 周期信息
         kline_config = self.config.kline_config
@@ -2178,45 +2445,48 @@ class KeyLevelGridStrategy:
             }
             
             # 实时计算阻力位和支撑位 (多周期融合)
-            klines = self.kline_feed.get_cached_klines(
-                self.config.kline_config.primary_timeframe
-            )
-            
-            if len(klines) >= 50:
-                # 构建多周期 K 线字典
-                klines_dict = self._build_klines_by_timeframe(klines)
-                resistance_calc = self.position_manager.resistance_calc
-                
-                # 阻力位始终是当前价格上方，支撑位始终是当前价格下方
-                resistances = resistance_calc.calculate_resistance_levels(
-                    state.close, klines, "long", klines_by_timeframe=klines_dict
-                )
-                supports = resistance_calc.calculate_support_levels(
-                    state.close, klines, klines_by_timeframe=klines_dict
+            if not (pos and (pos.support_levels_state or pos.resistance_levels_state)):
+                klines = self.kline_feed.get_cached_klines(
+                    self.config.kline_config.primary_timeframe
                 )
                 
-                data["resistance_levels"] = [
-                    {
-                        "price": r.price, 
-                        "type": r.level_type.value, 
-                        "strength": r.strength, 
-                        "timeframe": getattr(r, 'timeframe', '4h'),
-                        "source": getattr(r, 'source', ''),
-                        "description": getattr(r, 'description', ''),
-                    }
-                    for r in resistances[:10]
-                ]
-                data["support_levels"] = [
-                    {
-                        "price": s.price, 
-                        "type": s.level_type.value, 
-                        "strength": s.strength, 
-                        "timeframe": getattr(s, 'timeframe', '4h'),
-                        "source": getattr(s, 'source', ''),
-                        "description": getattr(s, 'description', ''),
-                    }
-                    for s in supports[:10]
-                ]
+                if len(klines) >= 50:
+                    # 构建多周期 K 线字典
+                    klines_dict = self._build_klines_by_timeframe(klines)
+                    resistance_calc = self.position_manager.resistance_calc
+                    
+                    # 阻力位始终是当前价格上方，支撑位始终是当前价格下方
+                    resistances = resistance_calc.calculate_resistance_levels(
+                        state.close, klines, "long", klines_by_timeframe=klines_dict
+                    )
+                    supports = resistance_calc.calculate_support_levels(
+                        state.close, klines, klines_by_timeframe=klines_dict
+                    )
+                    
+                    data["resistance_levels"] = [
+                        {
+                            "price": r.price, 
+                            "type": r.level_type.value, 
+                            "strength": r.strength, 
+                            "timeframe": getattr(r, 'timeframe', '4h'),
+                            "source": getattr(r, 'source', ''),
+                            "description": getattr(r, 'description', ''),
+                            "fill_counter": 0,
+                        }
+                        for r in resistances[:10]
+                    ]
+                    data["support_levels"] = [
+                        {
+                            "price": s.price, 
+                            "type": s.level_type.value, 
+                            "strength": s.strength, 
+                            "timeframe": getattr(s, 'timeframe', '4h'),
+                            "source": getattr(s, 'source', ''),
+                            "description": getattr(s, 'description', ''),
+                            "fill_counter": 0,
+                        }
+                        for s in supports[:10]
+                    ]
         
         # 仓位信息
         if pos:
@@ -2237,29 +2507,94 @@ class KeyLevelGridStrategy:
                     for tp in pos.take_profit_plan.levels if tp.close_pct > 0
                 ]
             
-            # 使用仓位中的阻力/支撑位覆盖 (GridState 中存储的是字典列表)
-            data["resistance_levels"] = [
-                {
-                    "price": r.get("price", 0) if isinstance(r, dict) else r.price, 
-                    "type": r.get("type", "resistance") if isinstance(r, dict) else getattr(r, 'level_type', 'resistance'), 
-                    "strength": r.get("strength", 0) if isinstance(r, dict) else r.strength, 
-                    "timeframe": r.get("timeframe", "4h") if isinstance(r, dict) else getattr(r, 'timeframe', '4h'),
-                    "source": r.get("source", "") if isinstance(r, dict) else getattr(r, 'source', ''),
-                    "description": r.get("description", "") if isinstance(r, dict) else getattr(r, 'description', ''),
-                }
-                for r in pos.resistance_levels[:10]
-            ]
-            data["support_levels"] = [
-                {
-                    "price": s.get("price", 0) if isinstance(s, dict) else s.price, 
-                    "type": s.get("type", "support") if isinstance(s, dict) else getattr(s, 'level_type', 'support'), 
-                    "strength": s.get("strength", 0) if isinstance(s, dict) else s.strength, 
-                    "timeframe": s.get("timeframe", "4h") if isinstance(s, dict) else getattr(s, 'timeframe', '4h'),
-                    "source": s.get("source", "") if isinstance(s, dict) else getattr(s, 'source', ''),
-                    "description": s.get("description", "") if isinstance(s, dict) else getattr(s, 'description', ''),
-                }
-                for s in pos.support_levels[:10]
-            ]
+            # 使用网格固定水位覆盖（确保与挂单一致）
+            support_meta = {
+                float(s.get("price", 0) if isinstance(s, dict) else s.price): s
+                for s in (pos.support_levels or [])
+            }
+            resistance_meta = {
+                float(r.get("price", 0) if isinstance(r, dict) else r.price): r
+                for r in (pos.resistance_levels or [])
+            }
+
+            if pos.support_levels_state or pos.resistance_levels_state:
+                levels_from_grid = True
+                data["support_levels"] = [
+                    {
+                        "price": lvl.price,
+                        "type": "support",
+                        "strength": support_meta.get(lvl.price, {}).get("strength", 0),
+                        "timeframe": support_meta.get(lvl.price, {}).get("timeframe", "4h"),
+                        "source": support_meta.get(lvl.price, {}).get("source", ""),
+                        "description": support_meta.get(lvl.price, {}).get("description", ""),
+                        "fill_counter": int(getattr(lvl, "fill_counter", 0) or 0),
+                    }
+                    for lvl in pos.support_levels_state
+                ]
+                data["resistance_levels"] = [
+                    {
+                        "price": lvl.price,
+                        "type": "resistance",
+                        "strength": resistance_meta.get(lvl.price, {}).get("strength", 0),
+                        "timeframe": resistance_meta.get(lvl.price, {}).get("timeframe", "4h"),
+                        "source": resistance_meta.get(lvl.price, {}).get("source", ""),
+                        "description": resistance_meta.get(lvl.price, {}).get("description", ""),
+                        "fill_counter": int(getattr(lvl, "fill_counter", 0) or 0),
+                    }
+                    for lvl in pos.resistance_levels_state
+                ]
+            else:
+                data["resistance_levels"] = [
+                    {
+                        "price": r.get("price", 0) if isinstance(r, dict) else r.price,
+                        "type": r.get("type", "resistance") if isinstance(r, dict) else getattr(r, 'level_type', 'resistance'),
+                        "strength": r.get("strength", 0) if isinstance(r, dict) else r.strength,
+                        "timeframe": r.get("timeframe", "4h") if isinstance(r, dict) else getattr(r, 'timeframe', '4h'),
+                        "source": r.get("source", "") if isinstance(r, dict) else getattr(r, 'source', ''),
+                        "description": r.get("description", "") if isinstance(r, dict) else getattr(r, 'description', ''),
+                        "fill_counter": r.get("fill_counter", 0) if isinstance(r, dict) else int(getattr(r, "fill_counter", 0) or 0),
+                    }
+                    for r in pos.resistance_levels[:10]
+                ]
+                data["support_levels"] = [
+                    {
+                        "price": s.get("price", 0) if isinstance(s, dict) else s.price,
+                        "type": s.get("type", "support") if isinstance(s, dict) else getattr(s, 'level_type', 'support'),
+                        "strength": s.get("strength", 0) if isinstance(s, dict) else s.strength,
+                        "timeframe": s.get("timeframe", "4h") if isinstance(s, dict) else getattr(s, 'timeframe', '4h'),
+                        "source": s.get("source", "") if isinstance(s, dict) else getattr(s, 'source', ''),
+                        "description": s.get("description", "") if isinstance(s, dict) else getattr(s, 'description', ''),
+                        "fill_counter": s.get("fill_counter", 0) if isinstance(s, dict) else int(getattr(s, "fill_counter", 0) or 0),
+                    }
+                    for s in pos.support_levels[:10]
+                ]
+
+        # 统一应用强度阈值与手动区间过滤
+        min_strength = getattr(resistance_config, "min_strength", 0) or 0
+        lower = grid_config.manual_lower if grid_config.range_mode == "manual" else 0
+        upper = grid_config.manual_upper if grid_config.range_mode == "manual" else 0
+        if lower <= 0 or upper <= 0:
+            lower, upper = 0, 0
+
+        def _filter_levels(levels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            filtered = []
+            for lvl in levels or []:
+                price = float(lvl.get("price", 0) or 0)
+                strength = float(lvl.get("strength", 0) or 0)
+                if min_strength and strength < min_strength:
+                    continue
+                if lower and price < lower:
+                    continue
+                if upper and price > upper:
+                    continue
+                filtered.append(lvl)
+            return filtered
+
+        if not levels_from_grid:
+            if "resistance_levels" in data:
+                data["resistance_levels"] = _filter_levels(data.get("resistance_levels", []))
+            if "support_levels" in data:
+                data["support_levels"] = _filter_levels(data.get("support_levels", []))
         
         # 交易历史 - 使用 Gate 真实成交记录
         data["trade_history"] = self._gate_trades[:10] if self._gate_trades else []
@@ -2432,7 +2767,7 @@ class KeyLevelGridStrategy:
         if not state:
             return []
         
-        # 1) 实盘模式且有同步到 Gate 挂单时，优先展示真实挂单
+        # 1) 实盘模式且有同步到 Gate 挂单时，展示真实挂单
         # Gate 挂单的 amount 已在 _update_gate_orders 中正确计算为 USDT 价值
         if not self.config.dry_run and self._gate_open_orders:
             orders = []
@@ -2441,7 +2776,7 @@ class KeyLevelGridStrategy:
                     "side": o.get("side", ""),
                     "price": o.get("price", 0),
                     "amount": o.get("amount", 0),  # 已计算为 USDT 价值
-                    "contracts": o.get("contracts", 0),  # 原始张数
+                    "contracts": o.get("base_amount", 0),  # 真实币数量（用于展示）
                     "status": o.get("status", "pending"),
                     "source": "Gate",
                     "strength": 0,
@@ -2451,10 +2786,42 @@ class KeyLevelGridStrategy:
             sell_orders = sorted([o for o in orders if o.get("side") == "sell"], key=lambda x: x["price"], reverse=True)
             return sell_orders + buy_orders
         
-        # 2) 回退：使用本地网格状态，保证挂单与显示一致且不随实时支撑数量跳变
+        # 2) 回退：使用本地网格状态
         orders = []
         pos_state = self.position_manager.state
         if pos_state:
+            # 优先使用新水位状态机展示
+            if pos_state.support_levels_state or pos_state.resistance_levels_state:
+                contract_size = float(getattr(pos_state, "contract_size", 0) or 0) or float(getattr(self, "_contract_size", 0) or 1.0)
+                base_btc = float(getattr(pos_state, "base_amount_per_grid", 0) or 0)
+                buy_orders = [
+                    {
+                        "side": "buy",
+                        "price": lvl.price,
+                        "amount": base_btc * lvl.price,
+                        "contracts": base_btc,
+                        "status": "pending",
+                        "source": "support",
+                        "strength": 0,
+                    }
+                    for lvl in sorted(pos_state.support_levels_state, key=lambda x: x.price, reverse=True)
+                ]
+                sell_orders = [
+                    {
+                        "side": "sell",
+                        "price": lvl.price,
+                        "amount": lvl.target_qty * lvl.price,
+                        "contracts": lvl.target_qty,
+                        "status": "pending",
+                        "source": "resistance",
+                        "strength": 0,
+                    }
+                    for lvl in sorted(pos_state.resistance_levels_state, key=lambda x: x.price, reverse=True)
+                    if lvl.target_qty > 0
+                ]
+                return buy_orders + sell_orders
+
+            # 兼容旧网格状态
             buy_orders = [
                 {
                     "side": "buy",
@@ -2478,7 +2845,7 @@ class KeyLevelGridStrategy:
                 for o in sorted(pos_state.sell_orders, key=lambda x: x.price, reverse=True)
             ]
             return buy_orders + sell_orders
-        
+
         # 3) 若尚未建网格，则回退使用当前计算的支撑/阻力位生成初始挂单
         config = self.position_manager.position_config
         support_levels = support_levels or []

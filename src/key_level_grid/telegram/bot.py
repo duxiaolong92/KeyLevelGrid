@@ -104,6 +104,7 @@ class KeyLevelTelegramBot:
         self.app.add_handler(TGCommandHandler("indicators", self._cmd_indicators))
         self.app.add_handler(TGCommandHandler("levels", self._cmd_levels))
         self.app.add_handler(TGCommandHandler("rebuild", self._cmd_rebuild))
+        self.app.add_handler(TGCommandHandler("reset_counters", self._cmd_reset_counters))
         self.app.add_handler(TGCommandHandler("stop", self._cmd_stop))
         self.app.add_handler(TGCommandHandler("closeall", self._cmd_close_all))
         
@@ -155,7 +156,7 @@ class KeyLevelTelegramBot:
         keyboard = [
             [KeyboardButton("📊 当前持仓"), KeyboardButton("📋 当前挂单")],
             [KeyboardButton("🔄 更新网格"), KeyboardButton("📍 关键价位")],
-            [KeyboardButton("🔍 查询价位")],  # 查询任意标的的支撑/阻力位
+            [KeyboardButton("🔍 查询价位"), KeyboardButton("🧹 重置配额")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
@@ -372,10 +373,40 @@ class KeyLevelTelegramBot:
                         await query.message.reply_text("⚠️ 网格更新失败，请查看日志")
                 except Exception as e:
                     await query.message.reply_text(f"❌ 更新失败: {e}")
+            else:
+                await query.message.reply_text("❌ 策略未连接，无法更新网格")
         
         elif data == "rebuild_cancel":
             try:
                 await query.edit_message_text("❌ 已取消更新网格")
+            except Exception:
+                pass
+
+        elif data == "reset_counters_confirm":
+            try:
+                await query.edit_message_text("🧹 正在清空配额计数器...")
+            except Exception:
+                pass
+            
+            if self.strategy:
+                try:
+                    ok = await self.strategy.reset_fill_counters(reason="tg_manual_override")
+                    if ok:
+                        await query.message.reply_text(
+                            "✅ <b>配额计数器已清空</b>\n\n"
+                            "所有水位已恢复为可买入状态",
+                            parse_mode="HTML"
+                        )
+                    else:
+                        await query.message.reply_text("⚠️ 清空失败，请查看日志")
+                except Exception as e:
+                    await query.message.reply_text(f"❌ 清空失败: {e}")
+            else:
+                await query.message.reply_text("❌ 策略未连接，无法清空")
+
+        elif data == "reset_counters_cancel":
+            try:
+                await query.edit_message_text("❌ 已取消清空配额")
             except Exception:
                 pass
         
@@ -430,6 +461,7 @@ class KeyLevelTelegramBot:
 /position - 当前持仓
 /orders - 当前挂单
 /rebuild - 更新网格
+/reset_counters - 清空配额
 /levels - 关键价位
 /help - 更多帮助
 """
@@ -455,6 +487,7 @@ class KeyLevelTelegramBot:
 <b>控制命令:</b>
 /stop - 停止策略
 /closeall - 平掉所有仓位
+/reset_counters - 清空配额
 
 <b>信号确认:</b>
 收到信号后点击按钮确认或拒绝
@@ -573,7 +606,7 @@ class KeyLevelTelegramBot:
 💼 <b>当前持仓</b>
 
 ├ 方向: {dir_emoji} {direction.upper()}
-├ 数量: {qty:.6f} BTC
+├ 数量: {qty:.6f} BTC (由合约张数换算)
 ├ 价值: {value:,.2f} USDT
 ├ 均价: ${entry_price:,.2f}
 ├ 当前价: ${current_price:,.2f}
@@ -665,6 +698,43 @@ class KeyLevelTelegramBot:
         price = data.get("price", {}).get("current", 0)
         resistance = data.get("resistance_levels", [])
         support = data.get("support_levels", [])
+
+        # 优先使用“固定网格水位”作为 /levels 输出（与挂单一致）
+        pos_state = getattr(self.strategy, "position_manager", None)
+        pos_state = pos_state.state if pos_state else None
+        if pos_state and (pos_state.support_levels_state or pos_state.resistance_levels_state):
+            support_meta = {
+                float(s.get("price", 0) if isinstance(s, dict) else s.price): s
+                for s in (pos_state.support_levels or [])
+            }
+            resistance_meta = {
+                float(r.get("price", 0) if isinstance(r, dict) else r.price): r
+                for r in (pos_state.resistance_levels or [])
+            }
+            support = [
+                {
+                    "price": lvl.price,
+                    "type": "support",
+                    "strength": support_meta.get(lvl.price, {}).get("strength", 0),
+                    "timeframe": support_meta.get(lvl.price, {}).get("timeframe", "4h"),
+                    "source": support_meta.get(lvl.price, {}).get("source", ""),
+                    "description": support_meta.get(lvl.price, {}).get("description", ""),
+                    "fill_counter": int(getattr(lvl, "fill_counter", 0) or 0),
+                }
+                for lvl in pos_state.support_levels_state
+            ]
+            resistance = [
+                {
+                    "price": lvl.price,
+                    "type": "resistance",
+                    "strength": resistance_meta.get(lvl.price, {}).get("strength", 0),
+                    "timeframe": resistance_meta.get(lvl.price, {}).get("timeframe", "4h"),
+                    "source": resistance_meta.get(lvl.price, {}).get("source", ""),
+                    "description": resistance_meta.get(lvl.price, {}).get("description", ""),
+                    "fill_counter": int(getattr(lvl, "fill_counter", 0) or 0),
+                }
+                for lvl in pos_state.resistance_levels_state
+            ]
         
         text = self._format_levels_text(
             symbol="当前标的",
@@ -933,6 +1003,15 @@ class KeyLevelTelegramBot:
         def get_type_abbr(level_type: str) -> str:
             return type_map.get(level_type, level_type[:3].upper() if level_type else "?")
         
+        def get_fill_display(level: dict) -> str:
+            value = level.get("fill_counter", None)
+            if value is None:
+                return "-"
+            try:
+                return str(int(value))
+            except (TypeError, ValueError):
+                return "-"
+        
         # 阻力位按价格降序排列
         resistance = sorted(resistance, key=lambda x: -x.get("price", 0))[:10]
         # 支撑位按价格降序排列
@@ -948,7 +1027,11 @@ class KeyLevelTelegramBot:
                 strength = r.get("strength", 0)
                 level_type = get_type_abbr(r.get("type", ""))
                 pct = ((r_price - price) / price * 100) if price > 0 else 0
-                text += f"├ R{i+1}: ${r_price:,.2f} (+{pct:.1f}%) [{level_type}] 💪{strength:.0f}\n"
+                fill_display = get_fill_display(r)
+                text += (
+                    f"├ R{i+1}: ${r_price:,.2f} (+{pct:.1f}%) "
+                    f"[{level_type}] 💪{strength:.0f} | 已买入:{fill_display}\n"
+                )
         else:
             text += "├ 无阻力位数据\n"
         
@@ -959,7 +1042,11 @@ class KeyLevelTelegramBot:
                 strength = s.get("strength", 0)
                 level_type = get_type_abbr(s.get("type", ""))
                 pct = ((price - s_price) / price * 100) if price > 0 else 0
-                text += f"├ S{i+1}: ${s_price:,.2f} (-{pct:.1f}%) [{level_type}] 💪{strength:.0f}\n"
+                fill_display = get_fill_display(s)
+                text += (
+                    f"├ S{i+1}: ${s_price:,.2f} (-{pct:.1f}%) "
+                    f"[{level_type}] 💪{strength:.0f} | 已买入:{fill_display}\n"
+                )
         else:
             text += "├ 无支撑位数据\n"
         
@@ -1037,7 +1124,7 @@ class KeyLevelTelegramBot:
         # 菜单按钮列表（点击这些按钮时清除等待状态）
         menu_buttons = [
             "📊 当前持仓", "📋 当前挂单", "🔄 更新网格", 
-            "📍 关键价位", "🔍 查询价位", "📈 市场指标", "❓ 帮助"
+            "📍 关键价位", "🔍 查询价位", "🧹 重置配额", "📈 市场指标", "❓ 帮助"
         ]
         
         try:
@@ -1057,6 +1144,8 @@ class KeyLevelTelegramBot:
                 await self._cmd_levels(update, context)
             elif text == "🔍 查询价位":
                 await self._prompt_levels_query(update, context)
+            elif text == "🧹 重置配额":
+                await self._cmd_reset_counters(update, context)
             elif text == "📈 市场指标":
                 await self._cmd_indicators(update, context)
             elif text == "❓ 帮助":
@@ -1162,7 +1251,7 @@ class KeyLevelTelegramBot:
         buy_orders = [o for o in pending_orders if o.get("side") == "buy"]
         sell_orders = [o for o in pending_orders if o.get("side") == "sell"]
         
-        text = f"📋 <b>当前挂单</b>\n\n当前价格: ${current_price:,.2f}\n"
+        text = f"📋 <b>当前挂单</b>\n\n当前价格: ${current_price:,.2f}\n<i>数量为币数量（由合约张数换算）</i>\n"
 
         # 卖单在上，按价格降序（显示全部）
         if sell_orders:
@@ -1216,12 +1305,39 @@ class KeyLevelTelegramBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            "🔄 <b>确认更新网格?</b>\n\n"
+            "🔄 <b>确认重置网格?</b>\n\n"
             "此操作将:\n"
             "1. 撤销所有现有挂单\n"
             "2. 重新计算支撑/阻力位\n"
-            "3. 根据新价位重新挂单\n\n"
+            "3. 无持仓：全量挂买单\n"
+            "4. 有持仓：从 N+1 支撑位开始挂买单，卖单按 Recon 逻辑分配\n\n"
             "⚠️ 已成交的仓位不会受影响",
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+
+    async def _cmd_reset_counters(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """处理 /reset_counters 命令 - 清空配额计数器"""
+        user_id = update.effective_user.id
+        if self.config.admin_user_ids and user_id not in self.config.admin_user_ids:
+            await update.message.reply_text("❌ 权限不足")
+            return
+        if not self.strategy:
+            await update.message.reply_text("❌ 策略未连接")
+            return
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ 确认清空", callback_data="reset_counters_confirm"),
+                InlineKeyboardButton("❌ 取消", callback_data="reset_counters_cancel"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "🧹 <b>确认清空配额计数器?</b>\n\n"
+            "此操作将:\n"
+            "1. 清空所有水位 fill_counter\n"
+            "2. 允许水位重新挂买\n\n"
+            "⚠️ 持仓与挂单不会被改变",
             parse_mode="HTML",
             reply_markup=reply_markup
         )

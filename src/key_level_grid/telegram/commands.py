@@ -178,7 +178,11 @@ class CommandHandler:
             source = self._format_source(r.get("source", ""))
             tf = self._format_timeframe(r.get("timeframe", ""))
             strength = r.get("strength", 0)
-            text += f"├ R{i+1}: {r_price:.4f} (+{pct:.1f}%) [{source}] {tf} 💪{strength:.0f}\n"
+            fill_counter = int(r.get("fill_counter", 0) or 0)
+            text += (
+                f"├ R{i+1}: {r_price:.4f} (+{pct:.1f}%) [{source}] {tf} "
+                f"💪{strength:.0f} | 已买入{fill_counter}次\n"
+            )
         
         text += "\n<b>支撑位:</b>\n"
         for i, s in enumerate(support):
@@ -187,7 +191,11 @@ class CommandHandler:
             source = self._format_source(s.get("source", ""))
             tf = self._format_timeframe(s.get("timeframe", ""))
             strength = s.get("strength", 0)
-            text += f"├ S{i+1}: {s_price:.4f} (-{pct:.1f}%) [{source}] {tf} 💪{strength:.0f}\n"
+            fill_counter = int(s.get("fill_counter", 0) or 0)
+            text += (
+                f"├ S{i+1}: {s_price:.4f} (-{pct:.1f}%) [{source}] {tf} "
+                f"💪{strength:.0f} | 已买入{fill_counter}次\n"
+            )
         
         return text
     

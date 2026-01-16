@@ -98,6 +98,15 @@ class ResistanceCalculator:
     def __init__(self, config: Optional[ResistanceConfig] = None):
         self.config = config or ResistanceConfig()
         self.logger = get_logger(__name__)
+
+    def _apply_strength_boost(self, base_strength: float, boost_ratio: float) -> float:
+        """以递减方式应用强度加成，避免直接顶到 100"""
+        if base_strength <= 0 or boost_ratio <= 0:
+            return base_strength
+        if base_strength >= 100:
+            return 100.0
+        boosted = base_strength + (100 - base_strength) * boost_ratio
+        return min(100.0, boosted)
     
     # ==================== 主入口 ====================
     
@@ -635,7 +644,7 @@ class ResistanceCalculator:
             
             if len(timeframes) > 1:
                 # 多周期叠加，强度提升
-                best.strength = min(100, best.strength * (1 + self.config.mtf_boost))
+                best.strength = self._apply_strength_boost(best.strength, self.config.mtf_boost)
                 best.timeframe = "multi"
                 sources = set(l.source for l in group_levels)
                 best.source = "+".join(sources)
@@ -759,9 +768,9 @@ class ResistanceCalculator:
             # 多来源叠加加成
             num_sources = len(sources)
             if num_sources > 1:
-                # 每多一个来源，强度 +15%
-                source_boost = 1 + 0.15 * (num_sources - 1)
-                best.strength = min(100, best.strength * source_boost)
+                # 每多一个来源，强度递减提升
+                source_boost = 0.15 * (num_sources - 1)
+                best.strength = self._apply_strength_boost(best.strength, source_boost)
                 
                 # 更新来源信息
                 best.source = "+".join(sorted(sources))
@@ -790,7 +799,7 @@ class ResistanceCalculator:
             # 多周期叠加
             if len(timeframes) > 1:
                 best.timeframe = "multi"
-                best.strength = min(100, best.strength * (1 + self.config.mtf_boost))
+                best.strength = self._apply_strength_boost(best.strength, self.config.mtf_boost)
             
             # 累加触及次数
             best.touches = sum(l.touches for l in group_levels)

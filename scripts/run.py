@@ -112,7 +112,7 @@ def create_position_panel(data: dict) -> Panel:
         pnl_pct = pos.get("unrealized_pnl_pct", 0)
     
     table.add_row("方向", side_text)
-    table.add_row("数量", f"{qty:.6f} BTC")
+    table.add_row("数量", f"{qty:.6f} BTC (由合约张数换算)")
     table.add_row("价值", f"{value:.2f} USDT")
     table.add_row("均价", f"{format_price(avg_price)}")
     
@@ -133,6 +133,7 @@ def create_position_panel(data: dict) -> Panel:
 def create_orders_panel(data: dict) -> Panel:
     """创建挂单面板"""
     orders = data.get("pending_orders", [])
+    unit_note = "数量列为币数量（合约张数已换算）"
     
     # 处理两种格式：列表格式和字典格式
     if isinstance(orders, dict):
@@ -155,7 +156,7 @@ def create_orders_panel(data: dict) -> Panel:
     # 卖单（降序）
     table.add_row("卖单", "", "", "", "", style="bold red")
     sell_orders_sorted = sorted(sell_orders, key=lambda x: -x.get("price", 0))
-    for i, order in enumerate(sell_orders_sorted[:10], 1):
+    for i, order in enumerate(sell_orders_sorted, 1):
         price = order.get("price", 0)
         btc = order.get("contracts", 0)
         usdt = order.get("amount", 0)
@@ -173,7 +174,7 @@ def create_orders_panel(data: dict) -> Panel:
     # 买单（降序）
     table.add_row("买单", "", "", "", "", style="bold green")
     buy_orders_sorted = sorted(buy_orders, key=lambda x: -x.get("price", 0))
-    for i, order in enumerate(buy_orders_sorted[:10], 1):
+    for i, order in enumerate(buy_orders_sorted, 1):
         price = order.get("price", 0)
         btc = order.get("contracts", 0)
         usdt = order.get("amount", 0)
@@ -186,7 +187,7 @@ def create_orders_panel(data: dict) -> Panel:
             f"{distance:.1%}"
         )
     
-    return Panel(table, title="📋 当前挂单", border_style="yellow")
+    return Panel(table, title=f"📋 当前挂单 ({unit_note})", border_style="yellow")
 
 
 def translate_source(source: str) -> str:
@@ -257,12 +258,13 @@ def create_levels_panel(data: dict) -> Panel:
     table.add_column("涨跌幅", justify="right")
     table.add_column("周期", justify="center")
     table.add_column("评分", justify="right")
+    table.add_column("已买入次数", justify="right")
     
     current_price = data.get("current_price", 0)
     
     # 阻力位（按价格降序，高价在上）
-    table.add_row("阻力位", "", "", "", "", style="bold red")
-    resistances = sorted(data.get("resistance_levels", []), key=lambda x: -x.get("price", 0))[:10]
+    table.add_row("阻力位", "", "", "", "", "", style="bold red")
+    resistances = sorted(data.get("resistance_levels", []), key=lambda x: -x.get("price", 0))
     for r in resistances:
         price = r.get("price", 0)
         pct = (price - current_price) / current_price if current_price > 0 else 0
@@ -273,16 +275,17 @@ def create_levels_panel(data: dict) -> Panel:
             f"[red]{format_price(price)}[/red]",
             format_pct(pct),
             tf_cn,
-            f"{r.get('strength', 0):.0f}"
+            f"{r.get('strength', 0):.0f}",
+            str(int(r.get("fill_counter", 0) or 0)),
         )
     
-    table.add_row("──────────", "──────────", "───────", "────────", "─────")
-    table.add_row("当前价格", f"[bold]{format_price(current_price)}[/bold]", "基准", "", "")
-    table.add_row("──────────", "──────────", "───────", "────────", "─────")
+    table.add_row("──────────", "──────────", "───────", "────────", "─────", "──────────")
+    table.add_row("当前价格", f"[bold]{format_price(current_price)}[/bold]", "基准", "", "", "")
+    table.add_row("──────────", "──────────", "───────", "────────", "─────", "──────────")
     
     # 支撑位（按价格降序，高价在上，靠近当前价的在前）
-    table.add_row("支撑位", "", "", "", "", style="bold green")
-    supports = sorted(data.get("support_levels", []), key=lambda x: -x.get("price", 0))[:10]
+    table.add_row("支撑位", "", "", "", "", "", style="bold green")
+    supports = sorted(data.get("support_levels", []), key=lambda x: -x.get("price", 0))
     for s in supports:
         price = s.get("price", 0)
         pct = (price - current_price) / current_price if current_price > 0 else 0
@@ -293,7 +296,8 @@ def create_levels_panel(data: dict) -> Panel:
             f"[green]{format_price(price)}[/green]",
             format_pct(pct),
             tf_cn,
-            f"{s.get('strength', 0):.0f}"
+            f"{s.get('strength', 0):.0f}",
+            str(int(s.get("fill_counter", 0) or 0)),
         )
     
     return Panel(table, title="📍 关键价位", border_style="cyan")

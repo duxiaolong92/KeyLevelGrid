@@ -416,9 +416,26 @@ class GateExecutor(ExchangeExecutor):
                 order.reject_reason = f"安全检查失败: {reason}"
                 return False
         
+        contract_size = None
+        try:
+            market = self._exchange.markets.get(order.symbol, {}) if self._exchange else {}
+            contract_size = market.get("contractSize")
+        except Exception:
+            contract_size = None
+        qty_btc = None
+        if contract_size:
+            try:
+                qty_btc = float(order.quantity or 0) * float(contract_size)
+            except Exception:
+                qty_btc = None
+        price_display = order.price if order.price is not None else 0
+        qty_display = f"{order.quantity}"
+        if qty_btc is not None:
+            qty_display = f"{order.quantity}张 ({qty_btc:.6f} BTC)"
+
         self.logger.info(
             f"提交订单: {order.symbol} {order.side.value.upper()} "
-            f"{order.quantity} @ ${order.price}",
+            f"{qty_display} @ ${price_display}",
             extra={
                 "order_id": order.order_id,
                 "symbol": order.symbol,

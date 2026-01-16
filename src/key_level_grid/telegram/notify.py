@@ -26,6 +26,7 @@ class NotifyConfig:
     order_cancelled: bool = False     # 取消通知
     grid_rebuild: bool = True         # 网格重建
     orders_summary: bool = True       # 挂单汇总（启动时发送）
+    quota_event: bool = True          # 配额对齐/清空通知
     
     # 风险通知
     risk_warning: bool = True         # 风险预警
@@ -529,6 +530,31 @@ class NotificationManager:
 📋 新网格: {len(buy_orders)}档买单, 共 {total_buy:,.0f} USDT
 """
         
+        await self._send_message(text.strip())
+
+    async def notify_quota_event(
+        self,
+        symbol: str,
+        action: str,
+        detail: str,
+    ) -> None:
+        """配额对齐/清空通知"""
+        if not self.config.quota_event:
+            return
+        if not self._can_notify("quota_event"):
+            return
+        action_text = {
+            "reconcile": "🧩 配额对齐",
+            "auto_clear": "🧹 配额清零",
+            "manual_reset": "🧹 手动清空配额",
+        }.get(action, "🧩 配额事件")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        text = (
+            f"{action_text}\n\n"
+            f"📊 <b>{symbol}</b>\n"
+            f"{detail}\n"
+            f"\n🕐 {timestamp}"
+        )
         await self._send_message(text.strip())
     
     async def notify_error(

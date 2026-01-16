@@ -5,9 +5,11 @@
 """
 
 import json
+import time
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from key_level_grid.utils.logger import get_logger
 from key_level_grid.resistance import (
@@ -35,11 +37,19 @@ class GridConfig:
     # 网格底线
     floor_buffer: float = 0.005       # 最低支撑下方 0.5%
     
-    # 网格重建 (价格大幅偏离锚点时自动重建)
-    rebuild_enabled: bool = True      # 是否启用自动重建
-    rebuild_threshold_pct: float = 0.02  # 价格偏离阈值 2%
-    rebuild_cooldown_sec: int = 900   # 重建冷却时间 15分钟
-    rebuild_cooldown_on_fill_sec: int = 600  # 因成交触发重建的冷却时间（秒）
+    # ============================================
+    # Spec2.0 核心策略参数
+    # ============================================
+    sell_quota_ratio: float = 0.7        # 动态止盈比例
+    min_profit_pct: float = 0.005        # 均价利润保护阈值
+    buy_price_buffer_pct: float = 0.002   # 买单空间缓冲
+    sell_price_buffer_pct: float = 0.002  # 卖单空间缓冲
+    max_fill_per_level: int = 1           # 单水位最大补买次数
+    base_amount_per_grid: float = 1.0    # 标准网格单位（BTC数量）
+    base_position_locked: float = 0.0    # 固定底仓数量（BTC数量）
+    recon_interval_sec: int = 30         # Recon 周期
+    order_action_timeout_sec: int = 10   # 挂/撤单超时
+    restore_state_enabled: bool = True   # 是否从持久化恢复网格
 
 
 @dataclass
@@ -89,6 +99,81 @@ class ResistanceConfig:
 
 
 # ============================================
+# 水位状态机
+# ============================================
+
+class LevelStatus(str, Enum):
+    IDLE = "IDLE"
+    PLACING = "PLACING"
+    ACTIVE = "ACTIVE"
+    FILLED = "FILLED"
+    CANCELING = "CANCELING"
+
+
+@dataclass
+class GridLevelState:
+    """网格水位状态"""
+    level_id: int
+    price: float
+    side: str  # buy | sell
+    role: str = "support"  # support | resistance
+    status: LevelStatus = LevelStatus.IDLE
+    active_order_id: str = ""
+    order_id: str = ""
+    target_qty: float = 0.0          # 目标数量（合约张数）
+    open_qty: float = 0.0            # 实际挂单数量（合约张数）
+    filled_qty: float = 0.0          # 已成交数量（合约张数）
+    fill_counter: int = 0            # 水位补买计数
+    last_action_ts: int = 0
+    last_error: str = ""
+    role_candidate: str = ""         # 极性翻转候选角色
+    role_candidate_ts: int = 0       # 候选开始时间（秒）
+
+    def to_dict(self) -> dict:
+        return {
+            "level_id": self.level_id,
+            "price": self.price,
+            "side": self.side,
+            "role": self.role,
+            "status": self.status.value if isinstance(self.status, LevelStatus) else str(self.status),
+            "active_order_id": self.active_order_id,
+            "order_id": self.order_id,
+            "target_qty": self.target_qty,
+            "open_qty": self.open_qty,
+            "filled_qty": self.filled_qty,
+            "fill_counter": self.fill_counter,
+            "last_action_ts": self.last_action_ts,
+            "last_error": self.last_error,
+            "role_candidate": self.role_candidate,
+            "role_candidate_ts": self.role_candidate_ts,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "GridLevelState":
+        status = data.get("status", LevelStatus.IDLE)
+        try:
+            status = LevelStatus(status)
+        except Exception:
+            status = LevelStatus.IDLE
+        return cls(
+            level_id=int(data.get("level_id", 0)),
+            price=float(data.get("price", 0)),
+            side=data.get("side", "buy"),
+            role=data.get("role", "support" if data.get("side") == "buy" else "resistance"),
+            status=status,
+            active_order_id=data.get("active_order_id", ""),
+            order_id=data.get("order_id", ""),
+            target_qty=float(data.get("target_qty", 0) or 0),
+            open_qty=float(data.get("open_qty", 0) or 0),
+            filled_qty=float(data.get("filled_qty", 0) or 0),
+            fill_counter=int(data.get("fill_counter", 0) or 0),
+            last_action_ts=int(data.get("last_action_ts", 0) or 0),
+            last_error=data.get("last_error", ""),
+            role_candidate=data.get("role_candidate", ""),
+            role_candidate_ts=int(data.get("role_candidate_ts", 0) or 0),
+        )
+
+# ============================================
 # 网格订单数据类
 # ============================================
 
@@ -131,23 +216,39 @@ class GridState:
     lower_price: float = 0.0          # 下边界 (支撑位)
     grid_floor: float = 0.0           # 网格底线 (止损线)
     
-    # 网格订单
+    # 网格订单（旧结构，保留兼容）
     buy_orders: List[GridOrder] = field(default_factory=list)   # 买入挂单 (支撑位)
     sell_orders: List[GridOrder] = field(default_factory=list)  # 卖出挂单 (阻力位)
+
+    # 水位状态机
+    support_levels_state: List[GridLevelState] = field(default_factory=list)
+    resistance_levels_state: List[GridLevelState] = field(default_factory=list)
     
     # 网格配置 (初始化时计算，重启后恢复)
     per_grid_contracts: int = 0       # 每格张数（整数）
     contract_size: float = 0.0001     # 合约大小
     num_grids: int = 0                # 网格总数
 
+    # Spec2.0 参数快照
+    sell_quota_ratio: float = 0.7
+    min_profit_pct: float = 0.005
+    buy_price_buffer_pct: float = 0.002
+    sell_price_buffer_pct: float = 0.002
+    base_amount_per_grid: float = 1.0  # BTC数量
+    base_position_locked: float = 0.0  # BTC数量
+    max_fill_per_level: int = 1
+    recon_interval_sec: int = 30
+    order_action_timeout_sec: int = 10
+
     # 网格锚点（用于判断是否需要重建网格）
     anchor_price: float = 0.0         # 创建/重建网格时的参考价格
     anchor_ts: int = 0                # 创建/重建网格时间戳（秒）
     
     # 持仓
-    total_position_usdt: float = 0.0  # 总持仓
+    total_position_usdt: float = 0.0  # 总持仓（展示用）
     avg_entry_price: float = 0.0      # 平均入场价
     unrealized_pnl: float = 0.0       # 未实现盈亏
+    total_position_contracts: float = 0.0  # 合约张数（内部口径）
     
     # 兼容属性 (空列表)
     resistance_levels: List = field(default_factory=list)
@@ -187,16 +288,28 @@ class GridState:
             "grid_floor": self.grid_floor,
             "buy_orders": [o.to_dict() for o in self.buy_orders],
             "sell_orders": [o.to_dict() for o in self.sell_orders],
+            "support_levels_state": [s.to_dict() for s in self.support_levels_state],
+            "resistance_levels_state": [r.to_dict() for r in self.resistance_levels_state],
             # 网格配置 (初始化时计算，重启后恢复)
             "per_grid_contracts": self.per_grid_contracts,
             "contract_size": self.contract_size,
             "num_grids": self.num_grids,
+            "sell_quota_ratio": self.sell_quota_ratio,
+            "min_profit_pct": self.min_profit_pct,
+            "buy_price_buffer_pct": self.buy_price_buffer_pct,
+            "sell_price_buffer_pct": self.sell_price_buffer_pct,
+            "base_amount_per_grid": self.base_amount_per_grid,
+            "base_position_locked": self.base_position_locked,
+            "max_fill_per_level": self.max_fill_per_level,
+            "recon_interval_sec": self.recon_interval_sec,
+            "order_action_timeout_sec": self.order_action_timeout_sec,
             "anchor_price": self.anchor_price,
             "anchor_ts": self.anchor_ts,
             # 持仓
             "total_position_usdt": self.total_position_usdt,
             "avg_entry_price": self.avg_entry_price,
             "unrealized_pnl": self.unrealized_pnl,
+            "total_position_contracts": self.total_position_contracts,
             "resistance_levels": self.resistance_levels,
             "support_levels": self.support_levels,
         }
@@ -269,13 +382,35 @@ class GridPositionManager:
         # 过滤强支撑/阻力位 (>= min_strength)
         min_strength = self.resistance_config.min_strength
         strong_supports = [
-            s for s in support_levels 
+            s for s in support_levels
             if s.strength >= min_strength and s.price < current_price
         ]
         strong_resistances = [
-            r for r in resistance_levels 
+            r for r in resistance_levels
             if r.strength >= min_strength and r.price > current_price
         ]
+
+        # 去重：相近价位保留强度更高者
+        def _deduplicate_levels(levels: List[PriceLevel]) -> List[PriceLevel]:
+            if not levels:
+                return []
+            levels_sorted = sorted(levels, key=lambda x: x.price)
+            deduped: List[PriceLevel] = []
+            tolerance = self.resistance_config.merge_tolerance or 0.0
+            for lvl in levels_sorted:
+                if not deduped:
+                    deduped.append(lvl)
+                    continue
+                last = deduped[-1]
+                if last.price > 0 and abs(lvl.price - last.price) / last.price <= tolerance:
+                    if lvl.strength > last.strength:
+                        deduped[-1] = lvl
+                else:
+                    deduped.append(lvl)
+            return deduped
+
+        strong_supports = _deduplicate_levels(strong_supports)
+        strong_resistances = _deduplicate_levels(strong_resistances)
         
         # 限制网格数量
         max_grids = self.grid_config.max_grids
@@ -294,6 +429,15 @@ class GridPositionManager:
             # auto 模式: 基于 S/R
             upper_price = strong_resistances[0].price if strong_resistances else current_price * 1.1
             lower_price = strong_supports[-1].price  # 最低支撑
+
+        # 手动区间过滤（确保支撑/阻力位在区间内）
+        if self.grid_config.range_mode == "manual" and upper_price > 0 and lower_price > 0:
+            strong_supports = [
+                s for s in strong_supports if lower_price <= s.price <= upper_price
+            ]
+            strong_resistances = [
+                r for r in strong_resistances if lower_price <= r.price <= upper_price
+            ]
         
         # 网格底线 (止损线)
         grid_floor = lower_price * (1 - self.grid_config.floor_buffer)
@@ -371,6 +515,16 @@ class GridPositionManager:
             grid_floor=grid_floor,
             buy_orders=buy_orders,
             sell_orders=sell_orders,
+            # Spec2.0 参数快照
+            sell_quota_ratio=self.grid_config.sell_quota_ratio,
+            min_profit_pct=self.grid_config.min_profit_pct,
+            buy_price_buffer_pct=self.grid_config.buy_price_buffer_pct,
+            sell_price_buffer_pct=self.grid_config.sell_price_buffer_pct,
+            base_amount_per_grid=self.grid_config.base_amount_per_grid,
+            base_position_locked=self.grid_config.base_position_locked,
+            max_fill_per_level=self.grid_config.max_fill_per_level,
+            recon_interval_sec=self.grid_config.recon_interval_sec,
+            order_action_timeout_sec=self.grid_config.order_action_timeout_sec,
             # 锚点（用于重建判断）
             anchor_price=current_price,
             anchor_ts=int(time.time()),
@@ -391,6 +545,28 @@ class GridPositionManager:
                 } for s in strong_supports
             ],
         )
+
+        # 初始化水位状态机
+        self.state.support_levels_state = [
+            GridLevelState(
+                level_id=i + 1,
+                price=s.price,
+                side="buy",
+                role="support",
+                status=LevelStatus.IDLE,
+            )
+            for i, s in enumerate(strong_supports)
+        ]
+        self.state.resistance_levels_state = [
+            GridLevelState(
+                level_id=i + 1,
+                price=r.price,
+                side="sell",
+                role="resistance",
+                status=LevelStatus.IDLE,
+            )
+            for i, r in enumerate(strong_resistances)
+        ]
         
         # 保存状态
         self._save_state()
@@ -405,6 +581,13 @@ class GridPositionManager:
         )
         
         return self.state
+
+    def get_base_amount_contracts(self, exchange_min_qty: float = 0.0) -> float:
+        """将 base_amount_per_grid (BTC) 转为合约张数"""
+        if not self.state:
+            return 0.0
+        base_btc = float(self.state.base_amount_per_grid or 0)
+        return self._btc_to_contracts(base_btc, exchange_min_qty)
     
     def check_buy_trigger(self, current_price: float) -> Optional[GridOrder]:
         """
@@ -561,6 +744,607 @@ class GridPositionManager:
             "pnl_pct": pnl_pct,
             "remaining_position": self.state.total_position_usdt,
         }
+
+    # ============================================
+    # Spec2.0 核心算法辅助方法
+    # ============================================
+
+    def update_position_snapshot(self, holdings_contracts: float, avg_entry_price: float) -> None:
+        if not self.state:
+            return
+        # holdings_contracts 语义改为币数量 (BTC)
+        self.state.total_position_contracts = max(holdings_contracts, 0.0)
+        self.state.avg_entry_price = max(avg_entry_price, 0.0)
+
+    def clear_fill_counters(self, reason: str = "manual") -> None:
+        if not self.state:
+            return
+        for lvl in self.state.support_levels_state:
+            lvl.fill_counter = 0
+        self.logger.info("🧹 fill_counter 清零: reason=%s", reason)
+        self._save_state()
+
+    def reconcile_counters_with_position(self, current_price: float, holdings_btc: float) -> Optional[Dict[str, str]]:
+        if not self.state:
+            return None
+        base_qty = float(self.state.base_amount_per_grid or 0)
+        if base_qty <= 0:
+            return None
+        holdings_btc = max(float(holdings_btc or 0), 0.0)
+        expected = int(holdings_btc // base_qty)
+        current = sum(int(lvl.fill_counter or 0) for lvl in self.state.support_levels_state)
+        current_qty = current * base_qty
+        if holdings_btc == 0:
+            if current > 0:
+                self.clear_fill_counters("auto_clear_zero_position")
+                return {"action": "auto_clear", "detail": "持仓为 0，已清空配额"}
+            return None
+        if abs(current_qty - holdings_btc) <= base_qty:
+            return None
+        self.logger.warning(
+            "⚠️ fill_counter 不一致: expected=%d, current=%d, holdings=%.6f, base=%.6f",
+            expected,
+            current,
+            holdings_btc,
+            base_qty,
+        )
+        # 重建配额：从远到近（最低价到高价）依次锁定
+        for lvl in self.state.support_levels_state:
+            lvl.fill_counter = 0
+        supports = [
+            lvl for lvl in self.state.support_levels_state
+            if not current_price or lvl.price < current_price
+        ]
+        supports_sorted = sorted(supports, key=lambda x: x.price)
+        assigned = 0
+        for lvl in supports_sorted:
+            if assigned >= expected:
+                break
+            lvl.fill_counter = 1
+            assigned += 1
+        if assigned < expected:
+            self.logger.warning(
+                "⚠️ fill_counter 锁定不足: expected=%d, assigned=%d",
+                expected,
+                assigned,
+            )
+        self._save_state()
+        return {
+            "action": "reconcile",
+            "detail": f"expected={expected}, assigned={assigned}, holdings={holdings_btc:.6f}",
+        }
+
+    def _btc_to_contracts(self, btc_qty: float, exchange_min_qty: float = 0.0) -> float:
+        if not self.state:
+            return 0.0
+        if btc_qty <= 0:
+            return 0.0
+        contract_size = float(getattr(self.state, "contract_size", 0) or 0)
+        if contract_size > 0:
+            import math
+            contracts = math.ceil(btc_qty / contract_size)
+        else:
+            contracts = btc_qty
+        if exchange_min_qty:
+            import math
+            contracts = max(contracts, math.ceil(exchange_min_qty))
+        return float(contracts)
+
+    def update_polarity(self, current_price: float, now_ts: float) -> None:
+        """极性转换：1% 价差 + 15min 时空过滤"""
+        if not self.state:
+            return
+        threshold = float(getattr(self.grid_config, "polarity_flip_threshold", 0) or 0)
+        duration_sec = int(getattr(self.grid_config, "polarity_flip_duration_min", 0) or 0) * 60
+        if threshold <= 0 or duration_sec <= 0:
+            return
+
+        def _check_level(lvl: GridLevelState) -> None:
+            if lvl.price <= 0:
+                return
+            candidate = ""
+            if current_price >= lvl.price * (1 + threshold):
+                candidate = "support"
+            elif current_price <= lvl.price * (1 - threshold):
+                candidate = "resistance"
+
+            if not candidate:
+                lvl.role_candidate = ""
+                lvl.role_candidate_ts = 0
+                return
+
+            if candidate != lvl.role:
+                if lvl.role_candidate == candidate and lvl.role_candidate_ts:
+                    if now_ts - lvl.role_candidate_ts >= duration_sec:
+                        lvl.role = candidate
+                        lvl.side = "buy" if candidate == "support" else "sell"
+                        self.logger.info(
+                            f"🔁 极性翻转确认: price={lvl.price:.2f}, role={lvl.role}"
+                        )
+                        lvl.role_candidate = ""
+                        lvl.role_candidate_ts = 0
+                else:
+                    lvl.role_candidate = candidate
+                    lvl.role_candidate_ts = int(now_ts)
+                    self.logger.info(
+                        f"⏳ 极性翻转候选: price={lvl.price:.2f}, candidate={candidate}"
+                    )
+            else:
+                lvl.role_candidate = ""
+                lvl.role_candidate_ts = 0
+
+        for lvl in self.state.support_levels_state:
+            _check_level(lvl)
+        for lvl in self.state.resistance_levels_state:
+            _check_level(lvl)
+
+    def compute_total_sell_qty(self, current_holdings: float) -> float:
+        if not self.state:
+            return 0.0
+        # 当前口径为币数量
+        base_locked = max(self.state.base_position_locked, 0.0)
+        tradable = max(current_holdings - base_locked, 0.0)
+        return tradable * self.state.sell_quota_ratio
+
+    def allocate_sell_targets(
+        self,
+        total_sell_qty: float,
+        base_amount_per_grid: float,
+        min_order_qty: float,
+        levels_count: Optional[int] = None,
+    ) -> List[float]:
+        """瀑布流分配，返回每层目标数量列表（币数量）"""
+        if total_sell_qty <= 0 or not self.state:
+            return []
+        targets: List[float] = []
+        q_rem = total_sell_qty
+        max_levels = levels_count if levels_count is not None else len(self.state.resistance_levels_state)
+        while q_rem > 0 and len(targets) < max_levels:
+            q = min(q_rem, base_amount_per_grid)
+            targets.append(q)
+            q_rem -= q
+        if q_rem > 0 and targets:
+            targets[-1] += q_rem
+
+        # 最小订单校验：向下合并
+        for i in range(len(targets) - 1, -1, -1):
+            if targets[i] < min_order_qty:
+                if i > 0:
+                    targets[i - 1] += targets[i]
+                targets[i] = 0.0
+        # 总量校正：避免合并后总量不足/过量
+        if targets:
+            total_after = sum(targets)
+            if total_after < total_sell_qty:
+                targets[-1] += (total_sell_qty - total_after)
+            elif total_after > total_sell_qty:
+                targets[-1] = max(targets[-1] - (total_after - total_sell_qty), 0.0)
+        return targets
+
+    def build_recon_actions(
+        self,
+        current_price: float,
+        open_orders: List[Dict],
+        exchange_min_qty_btc: float,
+    ) -> List[Dict[str, Any]]:
+        """生成 Recon 需要执行的挂/撤单动作（数量口径=币数量）"""
+        if not self.state:
+            return []
+
+        actions: List[Dict[str, Any]] = []
+        price_tol = 0.001
+
+        # 构建 open orders 索引（按 side + 价格分组）
+        order_by_price: Dict[str, Dict[float, List[Dict]]] = {}
+        for o in open_orders:
+            price = float(o.get("price", 0) or 0)
+            if price <= 0:
+                continue
+            side = o.get("side", "")
+            order_by_price.setdefault(side, {}).setdefault(price, []).append(o)
+
+        def _match_orders(side: str, price: float) -> List[Dict]:
+            matches: List[Dict] = []
+            for p, orders in order_by_price.get(side, {}).items():
+                if abs(p - price) <= price * price_tol:
+                    matches.extend(orders)
+            return matches
+
+        def _sum_open_qty(orders: List[Dict]) -> float:
+            total_qty = 0.0
+            for o in orders:
+                qty = float(o.get("base_amount", 0) or 0)
+                if qty <= 0:
+                    qty = float(o.get("contracts", 0) or 0) * float(self.state.contract_size or 0)
+                total_qty += qty
+            return total_qty
+
+        # 动态角色判定：基于现价上下
+        all_levels = self.state.support_levels_state + self.state.resistance_levels_state
+        for lvl in all_levels:
+            if lvl.price < current_price:
+                lvl.role = "support"
+                lvl.side = "buy"
+            elif lvl.price > current_price:
+                lvl.role = "resistance"
+                lvl.side = "sell"
+            else:
+                lvl.role = "neutral"
+
+        buy_levels = [lvl for lvl in all_levels if lvl.role == "support"]
+        sell_levels = [lvl for lvl in all_levels if lvl.role == "resistance"]
+
+        for lvl in buy_levels:
+            existing_orders = _match_orders("buy", lvl.price)
+            if existing_orders:
+                lvl.status = LevelStatus.ACTIVE
+                lvl.order_id = existing_orders[0].get("id", "")
+                lvl.active_order_id = lvl.order_id
+                lvl.open_qty = _sum_open_qty(existing_orders)
+                if int(lvl.fill_counter or 0) >= int(self.state.max_fill_per_level or 1):
+                    for existing in existing_orders:
+                        actions.append({
+                            "action": "cancel",
+                            "side": "buy",
+                            "price": lvl.price,
+                            "order_id": existing.get("id", ""),
+                            "level_id": lvl.level_id,
+                            "reason": "fill_counter_limit",
+                        })
+                    lvl.status = LevelStatus.CANCELING
+                    lvl.last_action_ts = int(time.time())
+                    continue
+                target_qty = max(self.state.base_amount_per_grid, exchange_min_qty_btc)
+                if abs(lvl.open_qty - target_qty) >= exchange_min_qty_btc:
+                    for existing in existing_orders:
+                        actions.append({
+                            "action": "cancel",
+                            "side": "buy",
+                            "price": lvl.price,
+                            "order_id": existing.get("id", ""),
+                            "level_id": lvl.level_id,
+                            "reason": "rebalance_qty",
+                        })
+                    lvl.status = LevelStatus.CANCELING
+                    lvl.last_action_ts = int(time.time())
+                continue
+            # 如果角色切换为 support 但存在卖单，先撤卖单
+            existing_sells = _match_orders("sell", lvl.price)
+            if existing_sells:
+                for existing_sell in existing_sells:
+                    actions.append({
+                        "action": "cancel",
+                        "side": "sell",
+                        "price": lvl.price,
+                        "order_id": existing_sell.get("id", ""),
+                        "level_id": lvl.level_id,
+                        "reason": "polarity_flip_cancel_sell",
+                    })
+                lvl.status = LevelStatus.CANCELING
+                lvl.last_action_ts = int(time.time())
+                continue
+            # 实盘无单但状态为 ACTIVE，纠正为 IDLE
+            if lvl.status == LevelStatus.ACTIVE:
+                lvl.status = LevelStatus.IDLE
+                lvl.order_id = ""
+                lvl.open_qty = 0.0
+
+            # 状态回收
+            if lvl.status in (LevelStatus.PLACING, LevelStatus.CANCELING) and lvl.last_action_ts:
+                if time.time() - (lvl.last_action_ts or 0) > self.state.order_action_timeout_sec:
+                    lvl.status = LevelStatus.IDLE
+                    lvl.last_error = "action_timeout"
+
+            if lvl.status == LevelStatus.IDLE:
+                if lvl.fill_counter >= self.state.max_fill_per_level:
+                    self.logger.debug(
+                        f"🧱 填充上限: price={lvl.price:.2f}, fill_counter={lvl.fill_counter}, "
+                        f"max={self.state.max_fill_per_level}"
+                    )
+                elif current_price > lvl.price * (1 + self.state.buy_price_buffer_pct):
+                    qty = max(self.state.base_amount_per_grid, exchange_min_qty_btc)
+                    actions.append({
+                        "action": "place",
+                        "side": "buy",
+                        "price": lvl.price,
+                        "qty": qty,
+                        "level_id": lvl.level_id,
+                        "reason": "recon_buy_sync",
+                    })
+                    lvl.status = LevelStatus.PLACING
+                    lvl.target_qty = qty
+                    lvl.last_action_ts = int(time.time())
+                    self.logger.debug(
+                        f"🧾 Recon补买: price={lvl.price:.2f}, qty={qty:.6f}"
+                    )
+            # 僵尸状态回收
+            elif lvl.status in (LevelStatus.PLACING, LevelStatus.CANCELING):
+                if lvl.last_action_ts and (time.time() - lvl.last_action_ts) > self.state.order_action_timeout_sec:
+                    lvl.status = LevelStatus.IDLE
+                    lvl.last_error = "action_timeout"
+
+        # 卖单比例纠偏 + 均价利润校验（角色=resistance）
+        total_sell_qty = self.compute_total_sell_qty(self.state.total_position_contracts)
+        base_amount_contracts = self.state.base_amount_per_grid
+        min_price = self.state.avg_entry_price * (1 + self.state.min_profit_pct) if self.state.avg_entry_price > 0 else 0
+        eligible_levels = [
+            lvl for lvl in sell_levels
+            if not min_price or lvl.price >= min_price
+        ]
+        self.logger.info(
+            "🧾 卖单水位过滤: total_levels=%d, eligible=%d, min_price=%.2f, avg_entry=%.2f, min_profit=%.4f",
+            len(sell_levels),
+            len(eligible_levels),
+            min_price,
+            self.state.avg_entry_price,
+            self.state.min_profit_pct,
+        )
+        if total_sell_qty > 0 and not eligible_levels:
+            self.logger.warning(
+                "⚠️ 无可用卖单水位: total_sell=%.6f, avg_entry=%.2f, min_profit=%.4f",
+                total_sell_qty,
+                self.state.avg_entry_price,
+                self.state.min_profit_pct,
+            )
+        targets = self.allocate_sell_targets(
+            total_sell_qty,
+            base_amount_contracts,
+            exchange_min_qty_btc,
+            levels_count=len(eligible_levels),
+        )
+        eligible_idx = 0
+
+        for idx, lvl in enumerate(sell_levels):
+            is_eligible = (not min_price) or (lvl.price >= min_price)
+            target_qty = 0.0
+            if is_eligible and eligible_idx < len(targets):
+                target_qty = targets[eligible_idx]
+                eligible_idx += 1
+            lvl.target_qty = target_qty
+
+            # 利润校验
+            existing_orders = _match_orders("sell", lvl.price)
+            # 如果角色切换为 resistance 但存在买单，先撤买单
+            existing_buys = _match_orders("buy", lvl.price)
+            if existing_buys:
+                for existing_buy in existing_buys:
+                    actions.append({
+                        "action": "cancel",
+                        "side": "buy",
+                        "price": lvl.price,
+                        "order_id": existing_buy.get("id", ""),
+                        "level_id": lvl.level_id,
+                        "reason": "polarity_flip_cancel_buy",
+                    })
+                lvl.status = LevelStatus.CANCELING
+                lvl.last_action_ts = int(time.time())
+                continue
+            if existing_orders:
+                lvl.open_qty = _sum_open_qty(existing_orders)
+
+            if min_price and lvl.price < min_price:
+                if existing_orders:
+                    for existing in existing_orders:
+                        actions.append({
+                            "action": "cancel",
+                            "side": "sell",
+                            "price": lvl.price,
+                            "order_id": existing.get("id", ""),
+                            "level_id": lvl.level_id,
+                            "reason": "min_profit_guard",
+                        })
+                    lvl.status = LevelStatus.CANCELING
+                    lvl.last_action_ts = int(time.time())
+                continue
+
+            if target_qty <= 0:
+                if existing_orders:
+                    for existing in existing_orders:
+                        actions.append({
+                            "action": "cancel",
+                            "side": "sell",
+                            "price": lvl.price,
+                            "order_id": existing.get("id", ""),
+                            "level_id": lvl.level_id,
+                            "reason": "no_target_qty",
+                        })
+                    lvl.status = LevelStatus.CANCELING
+                    lvl.last_action_ts = int(time.time())
+                continue
+
+            if existing_orders:
+                lvl.status = LevelStatus.ACTIVE
+                lvl.active_order_id = existing_orders[0].get("id", "")
+                if abs(lvl.open_qty - target_qty) >= exchange_min_qty_btc:
+                    for existing in existing_orders:
+                        actions.append({
+                            "action": "cancel",
+                            "side": "sell",
+                            "price": lvl.price,
+                            "order_id": existing.get("id", ""),
+                            "level_id": lvl.level_id,
+                            "reason": "rebalance_qty",
+                        })
+                    lvl.status = LevelStatus.CANCELING
+                    lvl.last_action_ts = int(time.time())
+                continue
+            # 实盘无单但状态为 ACTIVE，纠正为 IDLE
+            if lvl.status == LevelStatus.ACTIVE:
+                lvl.status = LevelStatus.IDLE
+                lvl.order_id = ""
+                lvl.open_qty = 0.0
+
+            if (
+                lvl.status == LevelStatus.IDLE
+                and target_qty >= exchange_min_qty_btc
+                and current_price < lvl.price * (1 - self.state.sell_price_buffer_pct)
+            ):
+                actions.append({
+                    "action": "place",
+                    "side": "sell",
+                    "price": lvl.price,
+                    "qty": target_qty,
+                    "level_id": lvl.level_id,
+                    "reason": "recon_sell_rebalance",
+                })
+                lvl.status = LevelStatus.PLACING
+                lvl.last_action_ts = int(time.time())
+                self.logger.debug(
+                    f"🧾 Recon补卖: price={lvl.price:.2f}, qty={target_qty:.6f}"
+                )
+            elif lvl.status == LevelStatus.IDLE and target_qty > 0:
+                self.logger.warning(
+                    f"⚠️ 最小卖单量不足: price={lvl.price:.2f}, "
+                    f"target={target_qty:.6f}, min={exchange_min_qty_btc:.6f}"
+                )
+            elif lvl.status in (LevelStatus.PLACING, LevelStatus.CANCELING):
+                if lvl.last_action_ts and (time.time() - lvl.last_action_ts) > self.state.order_action_timeout_sec:
+                    lvl.status = LevelStatus.IDLE
+                    lvl.last_error = "action_timeout"
+
+        return actions
+
+    def build_event_sell_increment(
+        self,
+        delta_buy_qty: float,
+        exchange_min_qty_btc: float,
+        current_price: float,
+    ) -> List[Dict[str, Any]]:
+        """买单成交后，增量补卖单"""
+        if not self.state or delta_buy_qty <= 0:
+            return []
+        delta_sell = delta_buy_qty * self.state.sell_quota_ratio
+        if delta_sell < exchange_min_qty_btc:
+            self.logger.warning(
+                f"⚠️ 最小卖单量不足: delta_sell={delta_sell:.6f}, "
+                f"min={exchange_min_qty_btc:.6f}"
+            )
+            return []
+
+        # 优先补齐已存在卖单的水位
+        base_amount_contracts = self.state.base_amount_per_grid
+        min_price = self.state.avg_entry_price * (1 + self.state.min_profit_pct) if self.state.avg_entry_price > 0 else 0
+        for lvl in self.state.resistance_levels_state:
+            if lvl.price <= current_price:
+                continue
+            if min_price and lvl.price < min_price:
+                continue
+            if current_price >= lvl.price * (1 - self.state.sell_price_buffer_pct):
+                continue
+            if lvl.target_qty > 0 and lvl.open_qty < base_amount_contracts:
+                inc = min(delta_sell, base_amount_contracts - lvl.open_qty)
+                if inc >= exchange_min_qty_btc:
+                    self.logger.debug(
+                        f"⚡ Event补卖(补齐): price={lvl.price:.2f}, qty={inc:.6f}"
+                    )
+                    return [{
+                        "action": "place",
+                        "side": "sell",
+                        "price": lvl.price,
+                        "qty": inc,
+                        "level_id": lvl.level_id,
+                        "reason": "event_sell_increment",
+                    }]
+        # 找空水位
+        for lvl in self.state.resistance_levels_state:
+            if lvl.price <= current_price:
+                continue
+            if min_price and lvl.price < min_price:
+                continue
+            if current_price >= lvl.price * (1 - self.state.sell_price_buffer_pct):
+                continue
+            if lvl.status == LevelStatus.IDLE:
+                self.logger.debug(
+                    f"⚡ Event补卖(新水位): price={lvl.price:.2f}, qty={delta_sell:.6f}"
+                )
+                return [{
+                    "action": "place",
+                    "side": "sell",
+                    "price": lvl.price,
+                    "qty": delta_sell,
+                    "level_id": lvl.level_id,
+                    "reason": "event_sell_new_level",
+                }]
+        self.logger.warning(
+            "⚠️ 无可用卖单水位(Event): delta_sell=%.6f, current=%.2f, min_price=%.2f",
+            delta_sell,
+            current_price,
+            min_price,
+        )
+        return []
+
+    def _find_support_level_for_price(self, price: float) -> Optional[GridLevelState]:
+        if not self.state:
+            return None
+        price = float(price or 0)
+        if price <= 0:
+            return None
+        price_tol = 0.001
+        for lvl in self.state.support_levels_state:
+            if abs(lvl.price - price) <= lvl.price * price_tol:
+                return lvl
+        # 若未找到完全匹配，选择最接近的下方支撑位
+        candidates = [lvl for lvl in self.state.support_levels_state if lvl.price < price]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda x: x.price)
+
+    def increment_fill_counter_by_qty(self, buy_price: float, buy_qty: float) -> None:
+        if not self.state:
+            return
+        base_qty = float(self.state.base_amount_per_grid or 0)
+        if base_qty <= 0:
+            return
+        buy_qty = max(float(buy_qty or 0), 0.0)
+        count = int(buy_qty // base_qty)
+        if count <= 0:
+            count = 1
+        # 从最近的支撑位向下认领
+        supports = [
+            lvl for lvl in self.state.support_levels_state
+            if lvl.price <= buy_price
+        ]
+        supports_sorted = sorted(supports, key=lambda x: x.price, reverse=True)
+        applied = 0
+        for _ in range(count):
+            for lvl in supports_sorted:
+                if int(lvl.fill_counter or 0) < int(self.state.max_fill_per_level or 1):
+                    lvl.fill_counter = int(lvl.fill_counter or 0) + 1
+                    applied += 1
+                    break
+        if applied > 0:
+            self.logger.info(
+                "🧱 fill_counter +%d: price<=%.2f",
+                applied,
+                buy_price,
+            )
+            self._save_state()
+
+    def release_fill_counter_by_qty(self, sell_qty: float) -> None:
+        if not self.state:
+            return
+        base_qty = float(self.state.base_amount_per_grid or 0)
+        if base_qty <= 0:
+            return
+        sell_qty = max(float(sell_qty or 0), 0.0)
+        count = int(sell_qty // base_qty)
+        if count <= 0:
+            count = 1
+        released = 0
+        for _ in range(count):
+            candidates = [
+                lvl for lvl in self.state.support_levels_state
+                if int(lvl.fill_counter or 0) > 0
+            ]
+            if not candidates:
+                break
+            # 释放最低（最远）支撑位
+            lvl = min(candidates, key=lambda x: x.price)
+            lvl.fill_counter = max(int(lvl.fill_counter or 0) - 1, 0)
+            released += 1
+        if released > 0:
+            self.logger.info("🧱 fill_counter -%d", released)
+            self._save_state()
     
     def check_stop_loss(self, current_price: float) -> bool:
         """
@@ -745,10 +1529,31 @@ class GridPositionManager:
                 grid_floor=grid_data.get("grid_floor", 0.0),
                 buy_orders=buy_orders,
                 sell_orders=sell_orders,
+                support_levels_state=[
+                    GridLevelState.from_dict(s) for s in grid_data.get("support_levels_state", [])
+                ],
+                resistance_levels_state=[
+                    GridLevelState.from_dict(r) for r in grid_data.get("resistance_levels_state", [])
+                ],
                 # 恢复网格配置
                 per_grid_contracts=grid_data.get("per_grid_contracts", 0),
                 contract_size=grid_data.get("contract_size", 0.0001),
                 num_grids=grid_data.get("num_grids", 0),
+                sell_quota_ratio=grid_data.get("sell_quota_ratio", self.grid_config.sell_quota_ratio),
+                min_profit_pct=grid_data.get("min_profit_pct", self.grid_config.min_profit_pct),
+                buy_price_buffer_pct=grid_data.get(
+                    "buy_price_buffer_pct",
+                    self.grid_config.buy_price_buffer_pct,
+                ),
+                sell_price_buffer_pct=grid_data.get(
+                    "sell_price_buffer_pct",
+                    self.grid_config.sell_price_buffer_pct,
+                ),
+                base_amount_per_grid=grid_data.get("base_amount_per_grid", self.grid_config.base_amount_per_grid),
+                base_position_locked=grid_data.get("base_position_locked", self.grid_config.base_position_locked),
+                max_fill_per_level=int(grid_data.get("max_fill_per_level", self.grid_config.max_fill_per_level) or 1),
+                recon_interval_sec=grid_data.get("recon_interval_sec", self.grid_config.recon_interval_sec),
+                order_action_timeout_sec=grid_data.get("order_action_timeout_sec", self.grid_config.order_action_timeout_sec),
                 # 恢复锚点
                 anchor_price=grid_data.get("anchor_price", 0.0),
                 anchor_ts=grid_data.get("anchor_ts", 0),
@@ -756,9 +1561,30 @@ class GridPositionManager:
                 total_position_usdt=grid_data.get("total_position_usdt", 0.0),
                 avg_entry_price=grid_data.get("avg_entry_price", 0.0),
                 unrealized_pnl=grid_data.get("unrealized_pnl", 0.0),
+                total_position_contracts=grid_data.get("total_position_contracts", 0.0),
                 resistance_levels=grid_data.get("resistance_levels", []),
                 support_levels=grid_data.get("support_levels", []),
             )
+
+            # 使用当前配置覆盖关键网格参数，避免旧状态导致数量不一致
+            if restored_state.base_amount_per_grid != self.grid_config.base_amount_per_grid:
+                self.logger.info(
+                    f"📊 覆盖 base_amount_per_grid: {restored_state.base_amount_per_grid} -> "
+                    f"{self.grid_config.base_amount_per_grid}"
+                )
+                restored_state.base_amount_per_grid = self.grid_config.base_amount_per_grid
+            if self.grid_config.base_position_locked > 0 and restored_state.base_position_locked != self.grid_config.base_position_locked:
+                self.logger.info(
+                    f"📊 覆盖 base_position_locked: {restored_state.base_position_locked} -> "
+                    f"{self.grid_config.base_position_locked}"
+                )
+                restored_state.base_position_locked = self.grid_config.base_position_locked
+            if restored_state.max_fill_per_level != self.grid_config.max_fill_per_level:
+                self.logger.info(
+                    f"📊 覆盖 max_fill_per_level: {restored_state.max_fill_per_level} -> "
+                    f"{self.grid_config.max_fill_per_level}"
+                )
+                restored_state.max_fill_per_level = self.grid_config.max_fill_per_level
             
             # 日志打印恢复的网格配置
             if restored_state.per_grid_contracts > 0:
@@ -779,7 +1605,8 @@ class GridPositionManager:
                     return False
             
             self.state = restored_state
-            self.logger.info("已恢复网格状态和交易历史")           
+            self._save_state()
+            self.logger.info("已恢复网格状态和交易历史")
             return True
         except Exception as e:
             self.logger.error(f"恢复网格状态失败: {e}", exc_info=True)

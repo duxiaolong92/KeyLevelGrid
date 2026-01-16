@@ -42,28 +42,32 @@ grid:
   # 网格数量
   count_mode: "by_levels"     # by_levels: 按有效支撑位数量 | fixed: 固定数量
   # fixed_count: 10              # fixed 模式: 网格数量
-  # max_grids: 20               # 最大网格数量
+  max_grids: 50               # 最大网格数量
   
   # 网格底线 (止损线)
   floor_buffer: 0.005         # 最低支撑下方 0.5%
   
-  # 网格重建 (价格大幅偏离锚点时自动重建)
-  rebuild_enabled: true       # 是否启用自动重建
-  rebuild_threshold_pct: 1 # 价格偏离阈值 2%
-  rebuild_cooldown_sec: 900   # 重建冷却时间 15分钟 (900秒)
-  rebuild_cooldown_on_fill_sec: 900 #成交驱动重建冷却
+  # Spec2.0 核心参数
+  sell_quota_ratio: 0.7        # 动态止盈比例
+  min_profit_pct: 0.0001        # 均价利润保护阈值
+  buy_price_buffer_pct: 0.002   # 买单空间缓冲
+  sell_price_buffer_pct: 0.002  # 卖单空间缓冲
+  base_amount_per_grid: 0.001   # 标准网格单位（btc数量）
+  max_fill_per_level: 3         # 单水位最大补买次数
+  base_position_locked: 0.0    # 固定底仓数量（btc数量）
+  recon_interval_sec: 30       # Recon 对账周期
+  order_action_timeout_sec: 10 # 挂/撤单超时
+  restore_state_enabled: true  # 是否从持久化恢复网格
 
 # ============================================
 # 仓位配置
 # ============================================
 position:
-  total_capital: 800         # 账户总金额 (USDT)
+  # total_capital: 自动从交易所读取，无需手动配置
   max_leverage: 10            # 最大杠杆 (需与 trading.leverage 保持一致)
   max_capital_usage: 0.8      # 使用 80% 资金，留 20% 缓冲
   
-  # 仓位分配
-  allocation_mode: "equal"    # equal: 等额分配 | weighted: 按强度加权
-  # 每档仓位 = (total_capital × max_leverage × max_capital_usage) / 网格数量
+  # Spec2.0：头寸由 Recon/Event 控制，仓位分配不再使用
 
 # ============================================
 # 止损配置 (总仓位止损)
@@ -73,20 +77,14 @@ stop_loss:
   trigger: "grid_floor"       # grid_floor: 跌破网格底线触发 | fixed_pct: 固定比例
   # fixed_pct: 0.10             # fixed_pct 模式: 10% 止损
 
-# ============================================
-# 止盈配置 (按阻力位)
-# ============================================
-take_profit:
-  mode: "by_resistance"       # by_resistance: 按阻力位止盈 | fixed_pct: 固定比例
-  # fixed_pct: 0.05             # fixed_pct 模式: 5% 止盈
-  # by_resistance 模式: 每个阻力位止盈 = 总持仓 / 有效阻力位数量
+
 
 # ============================================
 # 支撑/阻力位计算
 # ============================================
 resistance:
   # 强度阈值 (核心参数)
-  min_strength: 60            # 只使用 >= 80 分的支撑/阻力位
+  min_strength: 30            # 只使用 >= 80 分的支撑/阻力位
   
   # 摆动高低点 (三尺度)
   swing_lookbacks:
@@ -126,7 +124,7 @@ resistance:
 # 日志配置
 # ============================================
 logging:
-  level: "INFO"
+  level: "DEBUG"
   file: "logs/key_level_grid.log"
   console: true
 
@@ -155,8 +153,8 @@ telegram:
     
     # 可选通知
     order_placed: false       # 挂单通知（较频繁，建议关闭）
-    grid_rebuild: true        # 网格重建通知
     orders_summary: true      # 挂单汇总（启动时发送）
+    quota_event: true         # 配额对齐/清空通知
     
     # 风险通知
     risk_warning: true        # 风险预警
