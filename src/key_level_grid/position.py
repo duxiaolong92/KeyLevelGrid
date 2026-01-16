@@ -779,7 +779,7 @@ class GridPositionManager:
                 self.clear_fill_counters("auto_clear_zero_position")
                 return {"action": "auto_clear", "detail": "持仓为 0，已清空配额"}
             return None
-        if abs(current_qty - holdings_btc) <= base_qty:
+        if expected == current:
             return None
         self.logger.warning(
             "⚠️ fill_counter 不一致: expected=%d, current=%d, holdings=%.6f, base=%.6f",
@@ -788,14 +788,15 @@ class GridPositionManager:
             holdings_btc,
             base_qty,
         )
-        # 重建配额：从远到近（最低价到高价）依次锁定
+        # 重建配额：从近到远（高价到低价）依次锁定
         for lvl in self.state.support_levels_state:
             lvl.fill_counter = 0
+        price_ceiling = max(float(current_price or 0), float(self.state.avg_entry_price or 0))
         supports = [
             lvl for lvl in self.state.support_levels_state
-            if not current_price or lvl.price < current_price
+            if not price_ceiling or lvl.price <= price_ceiling
         ]
-        supports_sorted = sorted(supports, key=lambda x: x.price)
+        supports_sorted = sorted(supports, key=lambda x: x.price, reverse=True)
         assigned = 0
         for lvl in supports_sorted:
             if assigned >= expected:
@@ -1319,6 +1320,36 @@ class GridPositionManager:
                 buy_price,
             )
             self._save_state()
+
+    def increment_fill_counter_by_order(self, order_id: str, buy_qty: float) -> bool:
+        if not self.state:
+            return False
+        order_id = str(order_id or "").strip()
+        if not order_id:
+            return False
+        base_qty = float(self.state.base_amount_per_grid or 0)
+        if base_qty <= 0:
+            return False
+        buy_qty = max(float(buy_qty or 0), 0.0)
+        count = int(buy_qty // base_qty)
+        if count <= 0:
+            count = 1
+        for lvl in self.state.support_levels_state:
+            if lvl.order_id == order_id or lvl.active_order_id == order_id:
+                max_fill = int(self.state.max_fill_per_level or 1)
+                new_value = min(int(lvl.fill_counter or 0) + count, max_fill)
+                delta = new_value - int(lvl.fill_counter or 0)
+                if delta > 0:
+                    lvl.fill_counter = new_value
+                    self.logger.info(
+                        "🧱 fill_counter +%d: order_id=%s price=%.2f",
+                        delta,
+                        order_id,
+                        lvl.price,
+                    )
+                    self._save_state()
+                return True
+        return False
 
     def release_fill_counter_by_qty(self, sell_qty: float) -> None:
         if not self.state:

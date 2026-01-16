@@ -1018,6 +1018,9 @@ class KeyLevelGridStrategy:
                 
                 self._gate_trades.append({
                     "id": trade.get("id", ""),
+                    "order_id": trade.get("order")
+                    or trade.get("order_id")
+                    or trade.get("orderId", ""),
                     "time": trade_datetime.strftime("%Y-%m-%d %H:%M:%S") if trade_datetime else "",
                     "timestamp": trade_time,
                     "side": trade.get("side", ""),
@@ -1170,7 +1173,10 @@ class KeyLevelGridStrategy:
                             grid_index=0,
                             realized_pnl=0,
                         )
-                    self.position_manager.increment_fill_counter_by_qty(price, qty)
+                    order_id = trade.get("order_id", "")
+                    marked = self.position_manager.increment_fill_counter_by_order(order_id, qty)
+                    if not marked:
+                        self.position_manager.increment_fill_counter_by_qty(price, qty)
                     self._mark_level_idle("buy", price)
                 elif side == "sell":
                     self._mark_level_filled("sell", price)
