@@ -357,6 +357,64 @@ def get_current_price(data: dict) -> float:
     return 0.0
 
 
+def get_scoring_version(strategy: KeyLevelGridStrategy) -> str:
+    """获取当前使用的评分系统版本"""
+    try:
+        # 方法1: 检查 _is_v3_enabled 方法
+        if hasattr(strategy, '_is_v3_enabled') and strategy._is_v3_enabled():
+            return "V3.0"
+        # 方法2: 检查 v3_features.level_generation_enabled
+        raw_config = getattr(strategy, '_raw_config', {})
+        v3_features = raw_config.get('v3_features', {})
+        if v3_features.get('level_generation_enabled', False):
+            return "V3.0"
+        # 方法3: 检查 grid.level_generation.enabled
+        grid_config = raw_config.get('grid', {})
+        level_gen = grid_config.get('level_generation', {})
+        if level_gen.get('enabled', False):
+            return "V3.0"
+    except Exception:
+        pass
+    return "V2.0"
+
+
+def get_grid_boundary(strategy: KeyLevelGridStrategy) -> str:
+    """获取网格边界设置"""
+    try:
+        raw_config = getattr(strategy, '_raw_config', {})
+        grid_config = raw_config.get('grid', {})
+        level_gen = grid_config.get('level_generation', {})
+        manual_boundary = level_gen.get('manual_boundary', {})
+        
+        if manual_boundary.get('enabled', False):
+            upper = manual_boundary.get('upper_price', 0)
+            lower = manual_boundary.get('lower_price', 0)
+            if upper > 0 and lower > 0:
+                return f"${format_price(lower)} - ${format_price(upper)}"
+        
+        # 备选: 检查旧版配置
+        if grid_config.get('range_mode') == 'manual':
+            upper = grid_config.get('manual_upper', 0)
+            lower = grid_config.get('manual_lower', 0)
+            if upper > 0 and lower > 0:
+                return f"${format_price(lower)} - ${format_price(upper)}"
+        
+        return "自动"
+    except Exception:
+        return "自动"
+
+
+def get_leverage_info(strategy: KeyLevelGridStrategy) -> str:
+    """获取杠杆和保证金模式信息"""
+    try:
+        leverage = getattr(strategy.config, 'leverage', 3)
+        margin_mode = getattr(strategy.config, 'margin_mode', 'cross')
+        mode_cn = "全仓" if margin_mode == "cross" else "逐仓"
+        return f"{leverage}x ({mode_cn})"
+    except Exception:
+        return "N/A"
+
+
 def create_display(strategy: KeyLevelGridStrategy) -> Layout:
     """创建显示布局"""
     data = strategy.get_display_data()
@@ -367,20 +425,34 @@ def create_display(strategy: KeyLevelGridStrategy) -> Layout:
     
     layout = Layout()
     layout.split_column(
-        Layout(name="header", size=3),
+        Layout(name="header", size=5),  # 增加头部高度以容纳更多信息
         Layout(name="body"),
     )
     
-    # 头部
+    # 头部信息
     symbol = strategy.config.symbol
     timeframe = strategy.config.kline_config.primary_timeframe.value
     aux_tfs = [tf.value for tf in strategy.config.kline_config.auxiliary_timeframes]
     
-    header_text = (
-        f" Key Level Grid Strategy | {symbol} | ${format_price(current_price)} | "
-        f"周期: {timeframe} + {', '.join(aux_tfs)} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    # 获取评分版本和配置
+    scoring_version = get_scoring_version(strategy)
+    leverage_info = get_leverage_info(strategy)
+    grid_boundary = get_grid_boundary(strategy)
+    
+    # 构建头部文本 (两行)
+    line1 = (
+        f" Key Level Grid Strategy [{scoring_version}] | {symbol} | "
+        f"${format_price(current_price)} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
-    layout["header"].update(Panel(Text(header_text, style="bold magenta"), style="magenta"))
+    line2 = (
+        f" 杠杆: {leverage_info} | 周期: {timeframe} + {', '.join(aux_tfs)} | "
+        f"网格区间: {grid_boundary}"
+    )
+    header_text = Text()
+    header_text.append(line1 + "\n", style="bold magenta")
+    header_text.append(line2, style="dim cyan")
+    
+    layout["header"].update(Panel(header_text, title=f"📊 评分系统: {scoring_version}", style="magenta"))
     
     # 主体
     layout["body"].split_row(

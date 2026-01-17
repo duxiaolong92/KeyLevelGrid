@@ -633,6 +633,9 @@ class KeyLevelGridStrategy:
         instance = cls(config)
         instance._config_path = config_path
         
+        # 🆕 保存完整原始配置，供显示面板等使用
+        instance._raw_config = raw_config
+        
         # 🆕 V3.0: 存储原始配置用于 LevelCalculator
         level_gen_config = grid_raw.get("level_generation", {})
         instance._v3_config = {
