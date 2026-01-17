@@ -103,6 +103,7 @@ class ResistanceConfig:
 # ============================================
 
 class LevelStatus(str, Enum):
+    """订单操作状态"""
     IDLE = "IDLE"
     PLACING = "PLACING"
     ACTIVE = "ACTIVE"
@@ -110,14 +111,41 @@ class LevelStatus(str, Enum):
     CANCELING = "CANCELING"
 
 
+class LevelLifecycleStatus(str, Enum):
+    """
+    水位生命周期状态 (SPEC_LEVEL_LIFECYCLE.md v2.0.0)
+    
+    状态行为:
+    - ACTIVE: 活跃，允许买入和卖出
+    - RETIRED: 退役，仅允许卖出清仓
+    - DEAD: 销毁，待物理删除
+    """
+    ACTIVE = "ACTIVE"
+    RETIRED = "RETIRED"
+    DEAD = "DEAD"
+
+
 @dataclass
 class GridLevelState:
-    """网格水位状态"""
+    """
+    网格水位状态 (SPEC_LEVEL_LIFECYCLE.md v2.0.0)
+    
+    支持两种状态维度:
+    - status: 订单操作状态 (IDLE/PLACING/ACTIVE/FILLED/CANCELING)
+    - lifecycle_status: 生命周期状态 (ACTIVE/RETIRED/DEAD)
+    """
     level_id: int
     price: float
     side: str  # buy | sell
     role: str = "support"  # support | resistance
+    
+    # 订单操作状态
     status: LevelStatus = LevelStatus.IDLE
+    
+    # 🆕 生命周期状态 (v2.0)
+    lifecycle_status: LevelLifecycleStatus = LevelLifecycleStatus.ACTIVE
+    
+    # 订单相关
     active_order_id: str = ""
     order_id: str = ""
     target_qty: float = 0.0          # 目标数量（合约张数）
@@ -126,6 +154,10 @@ class GridLevelState:
     fill_counter: int = 0            # 水位补买计数
     last_action_ts: int = 0
     last_error: str = ""
+    
+    # 🆕 继承追踪 (v2.0)
+    inherited_from_index: Optional[int] = None  # 继承自旧数组的哪个索引
+    inheritance_ts: Optional[int] = None        # 继承时间戳
 
     def to_dict(self) -> dict:
         return {
@@ -134,6 +166,8 @@ class GridLevelState:
             "side": self.side,
             "role": self.role,
             "status": self.status.value if isinstance(self.status, LevelStatus) else str(self.status),
+            # 🆕 生命周期状态
+            "lifecycle_status": self.lifecycle_status.value if isinstance(self.lifecycle_status, LevelLifecycleStatus) else str(self.lifecycle_status),
             "active_order_id": self.active_order_id,
             "order_id": self.order_id,
             "target_qty": self.target_qty,
@@ -142,21 +176,34 @@ class GridLevelState:
             "fill_counter": self.fill_counter,
             "last_action_ts": self.last_action_ts,
             "last_error": self.last_error,
+            # 🆕 继承追踪
+            "inherited_from_index": self.inherited_from_index,
+            "inheritance_ts": self.inheritance_ts,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "GridLevelState":
+        # 订单状态
         status = data.get("status", LevelStatus.IDLE)
         try:
             status = LevelStatus(status)
         except Exception:
             status = LevelStatus.IDLE
+        
+        # 🆕 生命周期状态（向后兼容：旧版数据默认 ACTIVE）
+        lifecycle_status = data.get("lifecycle_status", "ACTIVE")
+        try:
+            lifecycle_status = LevelLifecycleStatus(lifecycle_status)
+        except Exception:
+            lifecycle_status = LevelLifecycleStatus.ACTIVE
+        
         return cls(
             level_id=int(data.get("level_id", 0)),
             price=float(data.get("price", 0)),
             side=data.get("side", "buy"),
             role=data.get("role", "support" if data.get("side") == "buy" else "resistance"),
             status=status,
+            lifecycle_status=lifecycle_status,
             active_order_id=data.get("active_order_id", ""),
             order_id=data.get("order_id", ""),
             target_qty=float(data.get("target_qty", 0) or 0),
@@ -165,7 +212,22 @@ class GridLevelState:
             fill_counter=int(data.get("fill_counter", 0) or 0),
             last_action_ts=int(data.get("last_action_ts", 0) or 0),
             last_error=data.get("last_error", ""),
+            # 🆕 继承追踪（兼容旧版：默认 None）
+            inherited_from_index=data.get("inherited_from_index"),
+            inheritance_ts=data.get("inheritance_ts"),
         )
+    
+    def is_active(self) -> bool:
+        """是否为活跃水位"""
+        return self.lifecycle_status == LevelLifecycleStatus.ACTIVE
+    
+    def is_retired(self) -> bool:
+        """是否为退役水位"""
+        return self.lifecycle_status == LevelLifecycleStatus.RETIRED
+    
+    def can_place_buy(self) -> bool:
+        """是否允许挂买单（退役水位禁止买入）"""
+        return self.lifecycle_status == LevelLifecycleStatus.ACTIVE
 
 # ============================================
 # 网格订单数据类
@@ -242,11 +304,24 @@ class ActiveFill:
         )
 
 
+# 状态版本（用于迁移）
+STATE_VERSION = 2
+
+
 @dataclass
 class GridState:
-    """网格状态"""
+    """
+    网格状态 (SPEC_LEVEL_LIFECYCLE.md v2.0.0)
+    
+    新增:
+    - retired_levels: 退役水位列表（等待清仓）
+    - state_version: 状态版本号
+    """
     symbol: str
     direction: str = "long"           # 只做多
+    
+    # 🆕 状态版本 (v2.0)
+    state_version: int = STATE_VERSION
     
     # 网格区间
     upper_price: float = 0.0          # 上边界 (阻力位)
@@ -257,9 +332,12 @@ class GridState:
     buy_orders: List[GridOrder] = field(default_factory=list)   # 买入挂单 (支撑位)
     sell_orders: List[GridOrder] = field(default_factory=list)  # 卖出挂单 (阻力位)
 
-    # 水位状态机
+    # 水位状态机（活跃水位，按价格降序排列）
     support_levels_state: List[GridLevelState] = field(default_factory=list)
     resistance_levels_state: List[GridLevelState] = field(default_factory=list)
+    
+    # 🆕 退役水位（等待清仓，v2.0）
+    retired_levels: List[GridLevelState] = field(default_factory=list)
     
     # 精确仓位清单 (Spec 3.3+)
     active_inventory: List[ActiveFill] = field(default_factory=list)
@@ -327,6 +405,8 @@ class GridState:
         return {
             "symbol": self.symbol,
             "direction": self.direction,
+            # 🆕 状态版本
+            "state_version": self.state_version,
             "upper_price": self.upper_price,
             "lower_price": self.lower_price,
             "grid_floor": self.grid_floor,
@@ -334,6 +414,8 @@ class GridState:
             "sell_orders": [o.to_dict() for o in self.sell_orders],
             "support_levels_state": [s.to_dict() for s in self.support_levels_state],
             "resistance_levels_state": [r.to_dict() for r in self.resistance_levels_state],
+            # 🆕 退役水位
+            "retired_levels": [r.to_dict() for r in self.retired_levels],
             "active_inventory": [f.to_dict() for f in self.active_inventory],
             "settled_inventory": [f.to_dict() for f in self.settled_inventory],
             # T1.1: 逐级邻位映射表
@@ -1996,9 +2078,18 @@ class GridPositionManager:
                 for o in grid_data.get("sell_orders", [])
             ]
             
+            # 🆕 检测状态版本并记录迁移信息
+            old_version = grid_data.get("state_version", 1)
+            if old_version < STATE_VERSION:
+                self.logger.info(
+                    f"📦 检测到旧版状态 v{old_version}，自动迁移到 v{STATE_VERSION}"
+                )
+            
             restored_state = GridState(
                 symbol=grid_data.get("symbol", self.symbol),
                 direction=grid_data.get("direction", "long"),
+                # 🆕 状态版本（始终使用最新版本）
+                state_version=STATE_VERSION,
                 upper_price=grid_data.get("upper_price", 0.0),
                 lower_price=grid_data.get("lower_price", 0.0),
                 grid_floor=grid_data.get("grid_floor", 0.0),
@@ -2009,6 +2100,10 @@ class GridPositionManager:
                 ],
                 resistance_levels_state=[
                     GridLevelState.from_dict(r) for r in grid_data.get("resistance_levels_state", [])
+                ],
+                # 🆕 退役水位（兼容旧版：默认空列表）
+                retired_levels=[
+                    GridLevelState.from_dict(r) for r in grid_data.get("retired_levels", [])
                 ],
                 active_inventory=[
                     ActiveFill.from_dict(f) for f in grid_data.get("active_inventory", [])
