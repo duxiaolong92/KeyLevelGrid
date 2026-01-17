@@ -5,7 +5,9 @@ Telegram Bot 核心模块
 """
 
 import asyncio
+import json
 import time
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, TYPE_CHECKING
 
@@ -98,6 +100,7 @@ class KeyLevelTelegramBot:
         # 注册命令处理器
         self.app.add_handler(TGCommandHandler("start", self._cmd_start))
         self.app.add_handler(TGCommandHandler("help", self._cmd_help))
+        self.app.add_handler(TGCommandHandler("menu", self._cmd_menu))
         self.app.add_handler(TGCommandHandler("status", self._cmd_status))
         self.app.add_handler(TGCommandHandler("position", self._cmd_position))
         self.app.add_handler(TGCommandHandler("orders", self._cmd_orders))
@@ -154,11 +157,113 @@ class KeyLevelTelegramBot:
     def _get_main_menu(self) -> ReplyKeyboardMarkup:
         """获取主菜单键盘"""
         keyboard = [
-            [KeyboardButton("📊 当前持仓"), KeyboardButton("📋 当前挂单")],
-            [KeyboardButton("🔄 更新网格"), KeyboardButton("📍 关键价位")],
-            [KeyboardButton("🔍 查询价位"), KeyboardButton("🧹 重置配额")],
+            [KeyboardButton("📊 实时监控"), KeyboardButton("⚙️ 策略设置")],
+            [KeyboardButton("🛠 系统运维"), KeyboardButton("🚨 紧急全平")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+    def _get_home_keyboard(self) -> InlineKeyboardMarkup:
+        keyboard = [
+            [
+                InlineKeyboardButton("📊 实时监控", callback_data="menu_monitor"),
+                InlineKeyboardButton("⚙️ 策略设置", callback_data="menu_settings"),
+            ],
+            [
+                InlineKeyboardButton("🛠 系统运维", callback_data="menu_ops"),
+                InlineKeyboardButton("🚨 紧急全平", callback_data="menu_emergency"),
+            ],
+        ]
+        return InlineKeyboardMarkup(keyboard)
+
+    def _get_monitor_keyboard(self) -> InlineKeyboardMarkup:
+        keyboard = [
+            [
+                InlineKeyboardButton("🔄 刷新数据", callback_data="monitor_refresh"),
+                InlineKeyboardButton("🏠 返回主菜单", callback_data="menu_home"),
+            ]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+
+    def _get_settings_keyboard(self) -> InlineKeyboardMarkup:
+        keyboard = [
+            [InlineKeyboardButton("网格区间", callback_data="settings_range")],
+            [InlineKeyboardButton("底仓保留", callback_data="settings_base_locked")],
+            [InlineKeyboardButton("全局止损", callback_data="settings_stop_loss")],
+            [InlineKeyboardButton("杠杆/模式", callback_data="settings_leverage")],
+            [InlineKeyboardButton("🏠 返回主菜单", callback_data="menu_home")],
+        ]
+        return InlineKeyboardMarkup(keyboard)
+
+    def _get_ops_keyboard(self) -> InlineKeyboardMarkup:
+        keyboard = [
+            [InlineKeyboardButton("智能对账", callback_data="ops_recon")],
+            [InlineKeyboardButton("计数重置", callback_data="ops_reset")],
+            [InlineKeyboardButton("网格重构", callback_data="ops_rebuild")],
+            [InlineKeyboardButton("日志提取", callback_data="ops_logs")],
+            [InlineKeyboardButton("🏠 返回主菜单", callback_data="menu_home")],
+        ]
+        return InlineKeyboardMarkup(keyboard)
+
+    def _get_emergency_keyboard(self) -> InlineKeyboardMarkup:
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ 确认全平", callback_data="emergency_confirm"),
+                InlineKeyboardButton("❌ 取消", callback_data="menu_home"),
+            ]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+
+    def _get_base_locked_keyboard(self) -> InlineKeyboardMarkup:
+        keyboard = [
+            [
+                InlineKeyboardButton("0%", callback_data="base_locked_0"),
+                InlineKeyboardButton("10%", callback_data="base_locked_10"),
+                InlineKeyboardButton("30%", callback_data="base_locked_30"),
+                InlineKeyboardButton("50%", callback_data="base_locked_50"),
+            ],
+            [InlineKeyboardButton("🏠 返回主菜单", callback_data="menu_home")],
+        ]
+        return InlineKeyboardMarkup(keyboard)
+
+    async def _reply_or_edit(self, update: Update, text: str, reply_markup=None) -> None:
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
+
+    def _load_config_json(self) -> dict:
+        config_path = None
+        if self.strategy:
+            config_path = getattr(self.strategy, "_config_path", None)
+        if not config_path:
+            config_path = str(Path(__file__).resolve().parents[3] / "configs" / "config.yaml")
+        json_path = Path(config_path).with_suffix(".json")
+        if json_path.exists():
+            try:
+                return json.loads(json_path.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+        return {}
+
+    def _persist_config_json(self, updates: dict) -> None:
+        config_path = None
+        if self.strategy:
+            config_path = getattr(self.strategy, "_config_path", None)
+        if not config_path:
+            config_path = str(Path(__file__).resolve().parents[3] / "configs" / "config.yaml")
+        json_path = Path(config_path).with_suffix(".json")
+        base = self._load_config_json()
+
+        def _deep_update(dst: dict, src: dict) -> dict:
+            for k, v in src.items():
+                if isinstance(v, dict) and isinstance(dst.get(k), dict):
+                    dst[k] = _deep_update(dst.get(k, {}), v)
+                else:
+                    dst[k] = v
+            return dst
+
+        merged = _deep_update(base or {}, updates or {})
+        json_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
     
     async def stop(self) -> None:
         """停止 Bot"""
@@ -324,6 +429,108 @@ class KeyLevelTelegramBot:
         self._mark_alive()
         
         data = query.data
+
+        if data == "menu_home":
+            await self._send_home_dashboard(update)
+            return
+        if data == "menu_monitor":
+            await self._send_monitoring(update)
+            return
+        if data == "menu_settings":
+            await self._send_settings(update)
+            return
+        if data == "menu_ops":
+            await self._send_ops(update)
+            return
+        if data == "menu_emergency":
+            await query.edit_message_text(
+                "🚨 <b>紧急全平</b>\n\n确认将立即平仓所有头寸并撤销所有挂单？",
+                parse_mode="HTML",
+                reply_markup=self._get_emergency_keyboard(),
+            )
+            return
+        if data == "monitor_refresh":
+            await self._send_monitoring(update)
+            return
+        if data == "settings_range":
+            user_id = update.effective_user.id
+            if not hasattr(self, "_user_states"):
+                self._user_states = {}
+            self._user_states[user_id] = {"waiting_for": "grid_range"}
+            await query.message.reply_text("请输入网格区间：例如 90000-98000", parse_mode="HTML")
+            return
+        if data == "settings_base_locked":
+            await query.edit_message_text(
+                "请选择底仓保留比例：",
+                parse_mode="HTML",
+                reply_markup=self._get_base_locked_keyboard(),
+            )
+            return
+        if data.startswith("base_locked_"):
+            if not self.strategy:
+                await query.message.reply_text("❌ 策略未连接")
+                return
+            pct = int(data.replace("base_locked_", "") or 0)
+            pos_qty = float(self.strategy.get_display_data().get("position", {}).get("qty", 0) or 0)
+            locked = pos_qty * (pct / 100.0)
+            await self.strategy.tg_update_base_position_locked(locked)
+            self._persist_config_json({"grid": {"base_position_locked": locked}})
+            await self._send_settings(update)
+            return
+        if data == "settings_stop_loss":
+            user_id = update.effective_user.id
+            if not hasattr(self, "_user_states"):
+                self._user_states = {}
+            self._user_states[user_id] = {"waiting_for": "stop_loss_pct"}
+            await query.message.reply_text("请输入止损百分比，例如 1 表示 1%", parse_mode="HTML")
+            return
+        if data == "settings_leverage":
+            user_id = update.effective_user.id
+            if not hasattr(self, "_user_states"):
+                self._user_states = {}
+            self._user_states[user_id] = {"waiting_for": "leverage_mode"}
+            await query.message.reply_text("请输入模式与杠杆，例如：cross 10 或 isolated 5", parse_mode="HTML")
+            return
+        if data == "ops_recon":
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ 确认对账", callback_data="ops_recon_confirm"),
+                    InlineKeyboardButton("❌ 取消", callback_data="menu_ops"),
+                ]
+            ]
+            await query.edit_message_text("确认触发一次深度对账？", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+        if data == "ops_recon_confirm":
+            if self.strategy:
+                await self.strategy.tg_deep_recon()
+            await query.edit_message_text("✅ 已触发智能对账", parse_mode="HTML", reply_markup=self._get_ops_keyboard())
+            return
+        if data == "ops_reset":
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ 确认清空", callback_data="reset_counters_confirm"),
+                    InlineKeyboardButton("❌ 取消", callback_data="reset_counters_cancel"),
+                ]
+            ]
+            await query.edit_message_text("计数重置后每个支撑位成交次数将清零，确认？", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+        if data == "ops_rebuild":
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ 确认更新", callback_data="rebuild_confirm"),
+                    InlineKeyboardButton("❌ 取消", callback_data="rebuild_cancel"),
+                ]
+            ]
+            await query.edit_message_text("确认重新计算支撑/阻力位并更新所有挂单？", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+        if data == "ops_logs":
+            await self._send_logs(update)
+            return
+        if data == "emergency_confirm":
+            if self.strategy:
+                await self.strategy.tg_emergency_close()
+            await query.edit_message_text("🛑 已触发紧急全平，机器人停止", parse_mode="HTML")
+            return
         
         if data.startswith("confirm_"):
             signal_id = data.replace("confirm_", "")
@@ -362,7 +569,7 @@ class KeyLevelTelegramBot:
             
             if self.strategy:
                 try:
-                    result = await self.strategy.force_rebuild_grid()
+                    result = await self.strategy.tg_force_rebuild()
                     if result:
                         await query.message.reply_text(
                             "✅ <b>网格更新成功</b>\n\n"
@@ -451,26 +658,12 @@ class KeyLevelTelegramBot:
         """处理 /start 命令"""
         user = update.effective_user
         self.logger.info(f"收到 /start 命令，用户: {user.id} ({user.username})")
-        
-        text = """
-🎰 <b>Key Level Grid Strategy Bot</b>
+        await self._send_home_dashboard(update)
+        self.logger.info("已发送主菜单")
 
-关键位网格交易策略机器人
-
-请使用下方菜单操作，或输入命令：
-/position - 当前持仓
-/orders - 当前挂单
-/rebuild - 更新网格
-/reset_counters - 清空配额
-/levels - 关键价位
-/help - 更多帮助
-"""
-        await update.message.reply_text(
-            text, 
-            parse_mode="HTML",
-            reply_markup=self._get_main_menu()
-        )
-        self.logger.info("已发送欢迎消息和菜单")
+    async def _cmd_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """处理 /menu 命令"""
+        await self._send_home_dashboard(update)
     
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理 /help 命令"""
@@ -493,6 +686,144 @@ class KeyLevelTelegramBot:
 收到信号后点击按钮确认或拒绝
 """
         await update.message.reply_text(text, parse_mode="HTML")
+
+    def _format_home_text(self) -> str:
+        if not self.strategy:
+            return "❌ 策略未连接"
+        status = self.strategy.get_status()
+        data = self.strategy.get_display_data()
+        running = "🟢 运行中" if status.get("running") else "🔴 已停止"
+        margin_mode = getattr(self.strategy.config, "margin_mode", "N/A")
+        leverage = getattr(self.strategy.config, "leverage", "N/A")
+        account = data.get("account", {})
+        position = data.get("position", {})
+        equity = account.get("total_balance", 0)
+        available = account.get("available", 0)
+        qty = position.get("qty", 0)
+        avg_price = position.get("avg_entry_price", 0)
+        pnl = position.get("unrealized_pnl", 0)
+        sl_trigger = getattr(self.strategy, "_stop_loss_trigger_price", 0) or position.get("grid_floor", 0)
+        return (
+            "📱 <b>Key Level Grid 控制台</b>\n\n"
+            f"运行状态: {running}\n"
+            f"保证金模式: {margin_mode} | 杠杆: {leverage}x\n\n"
+            f"账户权益: {equity:,.2f} USDT\n"
+            f"可用余额: {available:,.2f} USDT\n\n"
+            f"持仓数量: {qty:.6f} BTC\n"
+            f"持仓均价: ${avg_price:,.2f}\n"
+            f"未实现盈亏: {pnl:+,.2f} USDT\n\n"
+            f"风险预警: 止损触发价 ${sl_trigger:,.2f}"
+        )
+
+    async def _send_home_dashboard(self, update: Update) -> None:
+        text = self._format_home_text()
+        await self._reply_or_edit(update, text, reply_markup=self._get_home_keyboard())
+
+    def _format_monitor_text(self) -> str:
+        if not self.strategy:
+            return "❌ 策略未连接"
+        data = self.strategy.get_display_data()
+        price_obj = data.get("price", {})
+        current_price = price_obj.get("current", 0) if isinstance(price_obj, dict) else 0
+        pending = data.get("pending_orders", [])
+        supports = data.get("support_levels", [])
+        resistances = data.get("resistance_levels", [])
+        grid_cfg = self.strategy.position_manager.grid_config
+
+        def _find_fill_counter(side: str, price: float) -> str:
+            state = self.strategy.position_manager.state
+            if not state:
+                return "-"
+            levels = state.support_levels_state if side == "buy" else state.resistance_levels_state
+            for lvl in levels:
+                if abs(lvl.price - price) <= lvl.price * 0.001:
+                    return f"{int(lvl.fill_counter or 0)}/{int(state.max_fill_per_level or 1)}"
+            return "-"
+
+        buy_orders = [o for o in pending if o.get("side") == "buy"]
+        sell_orders = [o for o in pending if o.get("side") == "sell"]
+        lines = [
+            "📊 <b>实时监控</b>",
+            f"当前价格: ${current_price:,.2f}",
+            "",
+            "🔴 <b>阻力位卖单</b>",
+        ]
+        for o in sorted(sell_orders, key=lambda x: -x.get("price", 0)):
+            price = o.get("price", 0)
+            qty = o.get("base_amount", 0) or 0
+            counter = _find_fill_counter("sell", price)
+            lines.append(f"- ${price:,.2f} | {qty:.6f} BTC | 配额 {counter}")
+        if not sell_orders:
+            lines.append("- 无")
+        lines.append("")
+        lines.append("🟢 <b>支撑位买单</b>")
+        for o in sorted(buy_orders, key=lambda x: -x.get("price", 0)):
+            price = o.get("price", 0)
+            qty = o.get("base_amount", 0) or 0
+            counter = _find_fill_counter("buy", price)
+            lines.append(f"- ${price:,.2f} | {qty:.6f} BTC | 配额 {counter}")
+        if not buy_orders:
+            lines.append("- 无")
+        lines.append("")
+        lines.append("🧭 <b>支撑和阻力列表</b>")
+        lines.append("价格 | 涨跌幅 | 周期 | 评分")
+        for lvl in sorted(resistances, key=lambda x: -x.get("price", 0)):
+            price = float(lvl.get("price", 0) or 0)
+            if grid_cfg.range_mode == "manual":
+                if price < grid_cfg.manual_lower or price > grid_cfg.manual_upper:
+                    continue
+            pct = ((price - current_price) / current_price * 100) if current_price > 0 else 0
+            tf = lvl.get("timeframe", "")
+            strength = lvl.get("strength", 0)
+            lines.append(f"{price:,.2f} | {pct:+.2f}% | {tf} | {strength:.0f}")
+        for lvl in sorted(supports, key=lambda x: -x.get("price", 0)):
+            price = float(lvl.get("price", 0) or 0)
+            if grid_cfg.range_mode == "manual":
+                if price < grid_cfg.manual_lower or price > grid_cfg.manual_upper:
+                    continue
+            pct = ((price - current_price) / current_price * 100) if current_price > 0 else 0
+            tf = lvl.get("timeframe", "")
+            strength = lvl.get("strength", 0)
+            lines.append(f"{price:,.2f} | {pct:+.2f}% | {tf} | {strength:.0f}")
+        if not supports and not resistances:
+            lines.append("- 无")
+        return "\n".join(lines)
+
+    async def _send_monitoring(self, update: Update) -> None:
+        text = self._format_monitor_text()
+        await self._reply_or_edit(update, text, reply_markup=self._get_monitor_keyboard())
+
+    def _format_settings_text(self) -> str:
+        if not self.strategy:
+            return "❌ 策略未连接"
+        grid_cfg = self.strategy.position_manager.grid_config
+        sl_cfg = getattr(self.strategy.position_manager, "stop_loss_config", None)
+        sl_pct = getattr(sl_cfg, "fixed_pct", 0) if sl_cfg else 0
+        return (
+            "⚙️ <b>策略设置</b>\n\n"
+            f"网格区间: {grid_cfg.manual_lower:.2f} - {grid_cfg.manual_upper:.2f}\n"
+            f"底仓保留: {grid_cfg.base_position_locked:.6f} BTC\n"
+            f"全局止损: {sl_pct:.2%}\n"
+            f"保证金模式: {self.strategy.config.margin_mode} | 杠杆: {self.strategy.config.leverage}x"
+        )
+
+    async def _send_settings(self, update: Update) -> None:
+        text = self._format_settings_text()
+        await self._reply_or_edit(update, text, reply_markup=self._get_settings_keyboard())
+
+    async def _send_ops(self, update: Update) -> None:
+        text = "🛠 <b>系统运维</b>\n\n选择操作："
+        await self._reply_or_edit(update, text, reply_markup=self._get_ops_keyboard())
+
+    async def _send_logs(self, update: Update) -> None:
+        log_path = Path(__file__).resolve().parents[3] / "logs" / "key_level_grid.log"
+        if not log_path.exists():
+            await self._reply_or_edit(update, "❌ 未找到日志文件", reply_markup=self._get_ops_keyboard())
+            return
+        lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        tail = "\n".join(lines[-5:]) if lines else "无日志"
+        text = f"📄 <b>最近 5 条日志</b>\n\n<code>{tail}</code>"
+        await self._reply_or_edit(update, text, reply_markup=self._get_ops_keyboard())
     
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理 /status 命令"""
@@ -1123,8 +1454,7 @@ class KeyLevelTelegramBot:
         
         # 菜单按钮列表（点击这些按钮时清除等待状态）
         menu_buttons = [
-            "📊 当前持仓", "📋 当前挂单", "🔄 更新网格", 
-            "📍 关键价位", "🔍 查询价位", "🧹 重置配额", "📈 市场指标", "❓ 帮助"
+            "📊 实时监控", "⚙️ 策略设置", "🛠 系统运维", "🚨 紧急全平", "❓ 帮助"
         ]
         
         try:
@@ -1134,26 +1464,34 @@ class KeyLevelTelegramBot:
                     del self._user_states[user_id]
             
             # 处理菜单按钮
-            if text == "📊 当前持仓":
-                await self._cmd_position(update, context)
-            elif text == "📋 当前挂单":
-                await self._cmd_orders(update, context)
-            elif text == "🔄 更新网格":
-                await self._cmd_rebuild(update, context)
-            elif text == "📍 关键价位":
-                await self._cmd_levels(update, context)
-            elif text == "🔍 查询价位":
-                await self._prompt_levels_query(update, context)
-            elif text == "🧹 重置配额":
-                await self._cmd_reset_counters(update, context)
-            elif text == "📈 市场指标":
-                await self._cmd_indicators(update, context)
+            if text == "📊 实时监控":
+                await self._send_monitoring(update)
+            elif text == "⚙️ 策略设置":
+                await self._send_settings(update)
+            elif text == "🛠 系统运维":
+                await self._send_ops(update)
+            elif text == "🚨 紧急全平":
+                await update.message.reply_text(
+                    "🚨 <b>紧急全平</b>\n\n确认将立即平仓所有头寸并撤销所有挂单？",
+                    parse_mode="HTML",
+                    reply_markup=self._get_emergency_keyboard(),
+                )
             elif text == "❓ 帮助":
                 await self._cmd_help(update, context)
             else:
                 # 非菜单按钮消息，检查是否在等待输入
-                if user_id in self._user_states and self._user_states[user_id].get("waiting_for") == "levels_query":
-                    await self._handle_levels_query_input(update, context, text)
+                if user_id in self._user_states:
+                    waiting_for = self._user_states[user_id].get("waiting_for")
+                    if waiting_for == "levels_query":
+                        await self._handle_levels_query_input(update, context, text)
+                    elif waiting_for == "grid_range":
+                        await self._handle_grid_range_input(update, text)
+                    elif waiting_for == "stop_loss_pct":
+                        await self._handle_stop_loss_input(update, text)
+                    elif waiting_for == "leverage_mode":
+                        await self._handle_leverage_input(update, text)
+                    else:
+                        self.logger.debug(f"忽略未知消息: {text}")
                 else:
                     self.logger.debug(f"忽略未知消息: {text}")
         except Exception as e:
@@ -1229,6 +1567,70 @@ class KeyLevelTelegramBot:
         # 调用现有的查询逻辑
         args = parts  # [symbol, tf1, tf2, ...]
         await self._query_external_levels(update, args)
+
+    async def _handle_grid_range_input(self, update: Update, text: str) -> None:
+        user_id = update.effective_user.id
+        if hasattr(self, "_user_states") and user_id in self._user_states:
+            del self._user_states[user_id]
+        if not self.strategy:
+            await update.message.reply_text("❌ 策略未连接")
+            return
+        try:
+            normalized = text.replace("—", "-").replace("～", "-").replace("~", "-")
+            parts = [p.strip() for p in normalized.split("-") if p.strip()]
+            if len(parts) != 2:
+                raise ValueError("格式错误")
+            lower = float(parts[0])
+            upper = float(parts[1])
+            ok = await self.strategy.tg_update_grid_range(lower, upper)
+            if ok:
+                self._persist_config_json({"grid": {"range_mode": "manual", "manual_lower": lower, "manual_upper": upper}})
+                await update.message.reply_text("✅ 网格区间已更新", reply_markup=self._get_main_menu())
+            else:
+                await update.message.reply_text("❌ 网格区间无效", reply_markup=self._get_main_menu())
+        except Exception:
+            await update.message.reply_text("❌ 格式错误，请输入：最低价-最高价", reply_markup=self._get_main_menu())
+
+    async def _handle_stop_loss_input(self, update: Update, text: str) -> None:
+        user_id = update.effective_user.id
+        if hasattr(self, "_user_states") and user_id in self._user_states:
+            del self._user_states[user_id]
+        if not self.strategy:
+            await update.message.reply_text("❌ 策略未连接")
+            return
+        try:
+            pct = float(text.strip())
+            pct = pct / 100 if pct > 1 else pct
+            ok = await self.strategy.tg_update_stop_loss_pct(pct)
+            if ok:
+                self._persist_config_json({"stop_loss": {"trigger": "fixed_pct", "fixed_pct": pct}})
+                await update.message.reply_text("✅ 止损参数已更新", reply_markup=self._get_main_menu())
+            else:
+                await update.message.reply_text("❌ 止损百分比无效", reply_markup=self._get_main_menu())
+        except Exception:
+            await update.message.reply_text("❌ 格式错误，请输入数字百分比", reply_markup=self._get_main_menu())
+
+    async def _handle_leverage_input(self, update: Update, text: str) -> None:
+        user_id = update.effective_user.id
+        if hasattr(self, "_user_states") and user_id in self._user_states:
+            del self._user_states[user_id]
+        if not self.strategy:
+            await update.message.reply_text("❌ 策略未连接")
+            return
+        try:
+            parts = [p.strip().lower() for p in text.split() if p.strip()]
+            if len(parts) < 2:
+                raise ValueError("格式错误")
+            margin_mode = parts[0]
+            leverage = int(parts[1])
+            ok = await self.strategy.tg_update_margin_leverage(margin_mode, leverage)
+            if not ok:
+                await update.message.reply_text("❌ 仅支持在无持仓时修改", reply_markup=self._get_main_menu())
+                return
+            self._persist_config_json({"trading": {"margin_mode": margin_mode, "leverage": leverage}})
+            await update.message.reply_text("✅ 杠杆/模式已更新", reply_markup=self._get_main_menu())
+        except Exception:
+            await update.message.reply_text("❌ 格式错误，请输入：cross 10 或 isolated 5", reply_markup=self._get_main_menu())
     
     async def _cmd_orders(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理 /orders 命令 - 查看当前挂单"""

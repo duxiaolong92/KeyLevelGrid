@@ -126,8 +126,6 @@ class GridLevelState:
     fill_counter: int = 0            # 水位补买计数
     last_action_ts: int = 0
     last_error: str = ""
-    role_candidate: str = ""         # 极性翻转候选角色
-    role_candidate_ts: int = 0       # 候选开始时间（秒）
 
     def to_dict(self) -> dict:
         return {
@@ -144,8 +142,6 @@ class GridLevelState:
             "fill_counter": self.fill_counter,
             "last_action_ts": self.last_action_ts,
             "last_error": self.last_error,
-            "role_candidate": self.role_candidate,
-            "role_candidate_ts": self.role_candidate_ts,
         }
 
     @classmethod
@@ -169,8 +165,6 @@ class GridLevelState:
             fill_counter=int(data.get("fill_counter", 0) or 0),
             last_action_ts=int(data.get("last_action_ts", 0) or 0),
             last_error=data.get("last_error", ""),
-            role_candidate=data.get("role_candidate", ""),
-            role_candidate_ts=int(data.get("role_candidate_ts", 0) or 0),
         )
 
 # ============================================
@@ -206,6 +200,49 @@ class GridOrder:
 
 
 @dataclass
+class ActiveFill:
+    """正在持仓中的买入成交记录"""
+    order_id: str
+    price: float
+    qty: float
+    level_id: int
+    timestamp: int
+    
+    # T1.2: 逐级邻位映射追踪字段
+    target_sell_level_id: Optional[int] = None  # 止盈应挂在哪个水位
+    sell_order_id: Optional[str] = None         # 已挂卖单的订单 ID
+    sell_qty: float = 0.0                        # 已挂卖单数量
+
+    def to_dict(self) -> dict:
+        return {
+            "order_id": self.order_id,
+            "price": self.price,
+            "qty": self.qty,
+            "level_id": self.level_id,
+            "timestamp": self.timestamp,
+            # T1.2: 映射追踪字段
+            "target_sell_level_id": self.target_sell_level_id,
+            "sell_order_id": self.sell_order_id,
+            "sell_qty": self.sell_qty,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ActiveFill":
+        # T1.3: 兼容性处理 - 旧版数据可能缺少新字段
+        return cls(
+            order_id=data.get("order_id", ""),
+            price=float(data.get("price", 0)),
+            qty=float(data.get("qty", 0)),
+            level_id=int(data.get("level_id", 0)),
+            timestamp=int(data.get("timestamp", 0)),
+            # T1.3: 新字段使用默认值（兼容旧版）
+            target_sell_level_id=data.get("target_sell_level_id"),  # None if missing
+            sell_order_id=data.get("sell_order_id"),                # None if missing
+            sell_qty=float(data.get("sell_qty", 0)),                # 0 if missing
+        )
+
+
+@dataclass
 class GridState:
     """网格状态"""
     symbol: str
@@ -223,6 +260,13 @@ class GridState:
     # 水位状态机
     support_levels_state: List[GridLevelState] = field(default_factory=list)
     resistance_levels_state: List[GridLevelState] = field(default_factory=list)
+    
+    # 精确仓位清单 (Spec 3.3+)
+    active_inventory: List[ActiveFill] = field(default_factory=list)
+    settled_inventory: List[ActiveFill] = field(default_factory=list) # 最近平仓记录
+    
+    # T1.1: 逐级邻位映射表 {support_level_id: adjacent_sell_level_id}
+    level_mapping: Dict[int, int] = field(default_factory=dict)
     
     # 网格配置 (初始化时计算，重启后恢复)
     per_grid_contracts: int = 0       # 每格张数（整数）
@@ -290,6 +334,10 @@ class GridState:
             "sell_orders": [o.to_dict() for o in self.sell_orders],
             "support_levels_state": [s.to_dict() for s in self.support_levels_state],
             "resistance_levels_state": [r.to_dict() for r in self.resistance_levels_state],
+            "active_inventory": [f.to_dict() for f in self.active_inventory],
+            "settled_inventory": [f.to_dict() for f in self.settled_inventory],
+            # T1.1: 逐级邻位映射表
+            "level_mapping": self.level_mapping,
             # 网格配置 (初始化时计算，重启后恢复)
             "per_grid_contracts": self.per_grid_contracts,
             "contract_size": self.contract_size,
@@ -379,25 +427,21 @@ class GridPositionManager:
         Returns:
             GridState
         """
-        # 过滤强支撑/阻力位 (>= min_strength)
+        # 1. 汇总所有原始价位，统一进行全局去重
+        all_raw_levels = support_levels + resistance_levels
+        
+        # 过滤强度
         min_strength = self.resistance_config.min_strength
-        strong_supports = [
-            s for s in support_levels
-            if s.strength >= min_strength and s.price < current_price
-        ]
-        strong_resistances = [
-            r for r in resistance_levels
-            if r.strength >= min_strength and r.price > current_price
-        ]
-
-        # 去重：相近价位保留强度更高者
-        def _deduplicate_levels(levels: List[PriceLevel]) -> List[PriceLevel]:
+        qualified_levels = [l for l in all_raw_levels if l.strength >= min_strength]
+        
+        # 全局去重：相近价位保留强度更高者
+        def _deduplicate_all(levels: List[PriceLevel]) -> List[PriceLevel]:
             if not levels:
                 return []
-            levels_sorted = sorted(levels, key=lambda x: x.price)
+            sorted_lvls = sorted(levels, key=lambda x: x.price)
             deduped: List[PriceLevel] = []
-            tolerance = self.resistance_config.merge_tolerance or 0.0
-            for lvl in levels_sorted:
+            tolerance = self.resistance_config.merge_tolerance or 0.005
+            for lvl in sorted_lvls:
                 if not deduped:
                     deduped.append(lvl)
                     continue
@@ -409,8 +453,15 @@ class GridPositionManager:
                     deduped.append(lvl)
             return deduped
 
-        strong_supports = _deduplicate_levels(strong_supports)
-        strong_resistances = _deduplicate_levels(strong_resistances)
+        final_pool = _deduplicate_all(qualified_levels)
+        
+        # 2. 根据现价将去重后的池子划分为支撑和阻力
+        strong_supports = [l for l in final_pool if l.price < current_price]
+        strong_resistances = [l for l in final_pool if l.price > current_price]
+
+        # 排序：支撑从高到低（近到远），阻力从低到高（近到远）
+        strong_supports = sorted(strong_supports, key=lambda x: x.price, reverse=True)
+        strong_resistances = sorted(strong_resistances, key=lambda x: x.price)
         
         # 限制网格数量
         max_grids = self.grid_config.max_grids
@@ -546,7 +597,11 @@ class GridPositionManager:
             ],
         )
 
-        # 初始化水位状态机
+        # 初始化水位状态机（使用全局唯一 level_id）
+        # 支撑位 ID: 1, 2, 3, ...
+        # 阻力位 ID: 1001, 1002, 1003, ... (避免与支撑位 ID 重叠)
+        RESISTANCE_ID_OFFSET = 1000
+        
         self.state.support_levels_state = [
             GridLevelState(
                 level_id=i + 1,
@@ -559,7 +614,7 @@ class GridPositionManager:
         ]
         self.state.resistance_levels_state = [
             GridLevelState(
-                level_id=i + 1,
+                level_id=RESISTANCE_ID_OFFSET + i + 1,
                 price=r.price,
                 side="sell",
                 role="resistance",
@@ -567,6 +622,9 @@ class GridPositionManager:
             )
             for i, r in enumerate(strong_resistances)
         ]
+        
+        # T2.2: 构建逐级邻位映射
+        self.state.level_mapping = self.build_level_mapping()
         
         # 保存状态
         self._save_state()
@@ -756,63 +814,496 @@ class GridPositionManager:
         self.state.total_position_contracts = max(holdings_contracts, 0.0)
         self.state.avg_entry_price = max(avg_entry_price, 0.0)
 
+    # ============================================
+    # T2.1: 逐级邻位映射构建
+    # ============================================
+    
+    def build_level_mapping(self) -> Dict[int, int]:
+        """
+        构建逐级邻位映射表
+        
+        规则：每个支撑位映射到其物理价格上方的第一个水位（邻位）
+        
+        Returns:
+            {support_level_id: adjacent_level_id}
+        """
+        if not self.state:
+            return {}
+        
+        # 合并所有水位并按价格升序排列
+        all_levels: List[GridLevelState] = (
+            self.state.support_levels_state + self.state.resistance_levels_state
+        )
+        sorted_levels = sorted(all_levels, key=lambda x: x.price)
+        
+        mapping: Dict[int, int] = {}
+        min_profit_pct = float(self.state.min_profit_pct or 0)
+        missing_adjacent_levels: List[float] = []  # 记录无邻位的支撑位价格
+        
+        for i, level in enumerate(sorted_levels):
+            # 只为支撑位建立映射
+            if level.role != "support":
+                continue
+            
+            # 最小利润价格阈值
+            min_sell_price = level.price * (1 + min_profit_pct)
+            
+            # 查找上方第一个有效水位（邻位）
+            target_level = None
+            for j in range(i + 1, len(sorted_levels)):
+                candidate = sorted_levels[j]
+                if candidate.price > min_sell_price:
+                    target_level = candidate
+                    break
+            
+            if target_level:
+                mapping[level.level_id] = target_level.level_id
+                self.logger.debug(
+                    f"📍 映射: L_{level.level_id}({level.price:.2f}) → L_{target_level.level_id}({target_level.price:.2f})"
+                )
+            else:
+                # 边界情况：最高支撑位无上方邻位
+                missing_adjacent_levels.append(level.price)
+        
+        # 边界告警：有支撑位无邻位
+        if missing_adjacent_levels:
+            self.logger.warning(
+                f"⚠️ [Mapping] 以下支撑位无上方邻位，止盈单无法自动挂出: {missing_adjacent_levels}"
+            )
+        
+        self.logger.info(
+            f"📍 [Mapping] 构建完成: {len(mapping)} 个映射, "
+            f"{len(missing_adjacent_levels)} 个无邻位"
+        )
+        
+        return mapping
+    
+    def rebuild_level_mapping(self) -> None:
+        """重建邻位映射（网格重建后调用）"""
+        if not self.state:
+            return
+        self.state.level_mapping = self.build_level_mapping()
+        self._save_state()
+        self.logger.info("📍 [Mapping] 已重建邻位映射")
+    
+    def _normalize_level_ids_and_rebuild_mapping(self) -> None:
+        """
+        规范化 level_id 并重建映射（兼容旧版状态文件）
+        
+        旧版状态文件中，支撑位和阻力位的 level_id 可能重叠（都从 1 开始）。
+        新版要求全局唯一：支撑位 1-999，阻力位 1001+。
+        
+        此方法在 restore_state 后调用，确保 ID 唯一并重建映射。
+        """
+        if not self.state:
+            return
+        
+        RESISTANCE_ID_OFFSET = 1000
+        needs_rebuild = False
+        
+        # 检查是否有 ID 冲突
+        support_ids = {lvl.level_id for lvl in self.state.support_levels_state}
+        resistance_ids = {lvl.level_id for lvl in self.state.resistance_levels_state}
+        
+        # 如果阻力位 ID 都小于 1000，说明是旧版格式，需要重新分配
+        if self.state.resistance_levels_state:
+            max_resistance_id = max(lvl.level_id for lvl in self.state.resistance_levels_state)
+            if max_resistance_id < RESISTANCE_ID_OFFSET:
+                self.logger.info("📍 [Mapping] 检测到旧版 level_id 格式，正在规范化...")
+                
+                # 重新分配阻力位 ID
+                for i, lvl in enumerate(self.state.resistance_levels_state):
+                    old_id = lvl.level_id
+                    lvl.level_id = RESISTANCE_ID_OFFSET + i + 1
+                    self.logger.debug(f"📍 阻力位 ID 重分配: {old_id} → {lvl.level_id}")
+                
+                needs_rebuild = True
+        
+        # 检查是否有 ID 重叠
+        overlap = support_ids & resistance_ids
+        if overlap:
+            self.logger.warning(f"📍 [Mapping] 检测到 ID 重叠: {overlap}，正在修复...")
+            for i, lvl in enumerate(self.state.resistance_levels_state):
+                lvl.level_id = RESISTANCE_ID_OFFSET + i + 1
+            needs_rebuild = True
+        
+        # 如果映射为空或需要重建，则重建映射
+        if needs_rebuild or not self.state.level_mapping:
+            self.state.level_mapping = self.build_level_mapping()
+            self.logger.info(f"📍 [Mapping] 已重建邻位映射: {len(self.state.level_mapping)} 个映射")
+
+    # ============================================
+    # T3.1 & T3.2: 逐级邻位同步
+    # ============================================
+    
+    # 价格容差常量（0.01%）
+    PRICE_TOLERANCE = 0.0001
+    
+    @staticmethod
+    def price_matches(p1: float, p2: float, tolerance: float = PRICE_TOLERANCE) -> bool:
+        """判断两个价格是否匹配（考虑容差）"""
+        if p2 == 0:
+            return False
+        return abs(p1 - p2) / p2 < tolerance
+    
+    def _get_level_by_id(self, level_id: int) -> Optional[GridLevelState]:
+        """通过 level_id 查找水位"""
+        if not self.state:
+            return None
+        for lvl in self.state.support_levels_state:
+            if lvl.level_id == level_id:
+                return lvl
+        for lvl in self.state.resistance_levels_state:
+            if lvl.level_id == level_id:
+                return lvl
+        return None
+    
+    def _index_orders_by_level(
+        self,
+        open_orders: List[Dict],
+        side: str = "sell",
+    ) -> Dict[int, List[Dict]]:
+        """
+        T3.2: 按水位索引交易所挂单
+        
+        Args:
+            open_orders: 交易所挂单列表
+            side: 订单方向 ("buy" | "sell")
+        
+        Returns:
+            {level_id: [orders]}
+        """
+        if not self.state:
+            return {}
+        
+        # 构建水位索引（支撑位 + 阻力位）
+        all_levels = self.state.support_levels_state + self.state.resistance_levels_state
+        
+        result: Dict[int, List[Dict]] = {}
+        
+        for order in open_orders:
+            if order.get("side", "") != side:
+                continue
+            
+            order_price = float(order.get("price", 0) or 0)
+            if order_price <= 0:
+                continue
+            
+            # 使用容差匹配找到对应水位
+            matched_level = None
+            for lvl in all_levels:
+                if self.price_matches(order_price, lvl.price):
+                    matched_level = lvl
+                    break
+            
+            if matched_level:
+                result.setdefault(matched_level.level_id, []).append(order)
+        
+        return result
+    
+    def sync_mapping(
+        self,
+        current_price: float,
+        open_orders: List[Dict],
+        exchange_min_qty: float,
+    ) -> List[Dict[str, Any]]:
+        """
+        T3.1: 逐级邻位映射同步
+        
+        遍历每个有成交的支撑位，根据邻位映射计算应挂卖单配额，
+        与实盘挂单对比，生成补单/撤单动作。
+        
+        Args:
+            current_price: 当前价格
+            open_orders: 交易所挂单列表
+            exchange_min_qty: 交易所最小下单量
+        
+        Returns:
+            卖单动作列表 [{"action": "place"|"cancel", ...}]
+        """
+        if not self.state:
+            return []
+        
+        actions: List[Dict[str, Any]] = []
+        base_qty = float(self.state.base_amount_per_grid or 0)
+        sell_quota_ratio = float(self.state.sell_quota_ratio or 0.7)
+        
+        # 索引交易所卖单
+        sell_orders_by_level = self._index_orders_by_level(open_orders, side="sell")
+        
+        # 汇总每个目标水位的期望卖单量
+        # {target_level_id: expected_qty}
+        expected_sell_by_level: Dict[int, float] = {}
+        
+        for support_lvl in self.state.support_levels_state:
+            fill_count = int(support_lvl.fill_counter or 0)
+            if fill_count <= 0:
+                continue
+            
+            # 查找邻位映射
+            target_level_id = self.state.level_mapping.get(support_lvl.level_id)
+            if not target_level_id:
+                # 无邻位映射（最高支撑位无上方水位）
+                self.logger.warning(
+                    f"⚠️ [SyncMapping] 支撑位 L_{support_lvl.level_id}({support_lvl.price:.2f}) "
+                    f"无邻位映射，跳过卖单同步"
+                )
+                continue
+            
+            # 计算该支撑位贡献的卖单量
+            contrib_qty = fill_count * base_qty * sell_quota_ratio
+            expected_sell_by_level[target_level_id] = (
+                expected_sell_by_level.get(target_level_id, 0) + contrib_qty
+            )
+        
+        # 获取所有目标水位（包括阻力位和可能的高位支撑位）
+        all_levels = self.state.support_levels_state + self.state.resistance_levels_state
+        level_by_id = {lvl.level_id: lvl for lvl in all_levels}
+        
+        # 收集所有涉及的目标水位
+        all_target_level_ids = set(expected_sell_by_level.keys()) | set(sell_orders_by_level.keys())
+        
+        for target_level_id in all_target_level_ids:
+            target_lvl = level_by_id.get(target_level_id)
+            if not target_lvl:
+                continue
+            
+            expected_qty = expected_sell_by_level.get(target_level_id, 0)
+            existing_orders = sell_orders_by_level.get(target_level_id, [])
+            
+            # 计算实盘已挂量
+            open_qty = sum(
+                float(o.get("base_amount", 0) or 0) or 
+                float(o.get("contracts", 0) or 0) * float(self.state.contract_size or 0)
+                for o in existing_orders
+            )
+            
+            # 计算 PLACING 状态的待挂单量（冲突防御）
+            placing_qty = 0.0
+            if target_lvl.status == LevelStatus.PLACING:
+                placing_qty = float(target_lvl.target_qty or 0)
+            
+            # 有效已挂量 = 实盘挂单 + 待挂单
+            effective_pending = open_qty + placing_qty
+            
+            # 计算缺口
+            deficit = expected_qty - effective_pending
+            
+            # 精度处理：向下取整到最小单位
+            deficit = max(0, deficit)
+            if deficit > 0 and deficit < exchange_min_qty:
+                deficit = 0  # 低于最小单位，丢弃
+            
+            # 5% 容差判断
+            tolerance_threshold = max(exchange_min_qty, expected_qty * 0.05)
+            
+            if deficit >= tolerance_threshold:
+                # 需要补单
+                place_qty = max(deficit, exchange_min_qty)
+                actions.append({
+                    "action": "place",
+                    "side": "sell",
+                    "price": target_lvl.price,
+                    "qty": place_qty,
+                    "level_id": target_level_id,
+                    "reason": "sync_mapping_deficit",
+                    "expected_qty": expected_qty,
+                    "open_qty": open_qty,
+                    "placing_qty": placing_qty,
+                })
+                target_lvl.status = LevelStatus.PLACING
+                target_lvl.target_qty = place_qty
+                target_lvl.last_action_ts = int(time.time())
+                self.logger.info(
+                    f"📈 [SyncMapping] 补卖单: L_{target_level_id}({target_lvl.price:.2f}), "
+                    f"expected={expected_qty:.6f}, open={open_qty:.6f}, placing={placing_qty:.6f}, "
+                    f"deficit={deficit:.6f}"
+                )
+            
+            elif expected_qty <= 0 and open_qty > 0:
+                # 期望量为 0 但有挂单，需要撤单
+                for order in existing_orders:
+                    actions.append({
+                        "action": "cancel",
+                        "side": "sell",
+                        "price": target_lvl.price,
+                        "order_id": order.get("id", ""),
+                        "level_id": target_level_id,
+                        "reason": "sync_mapping_no_target",
+                    })
+                target_lvl.status = LevelStatus.CANCELING
+                target_lvl.last_action_ts = int(time.time())
+                self.logger.info(
+                    f"📉 [SyncMapping] 撤卖单: L_{target_level_id}({target_lvl.price:.2f}), "
+                    f"expected=0, open={open_qty:.6f}"
+                )
+            
+            elif expected_qty > 0 and abs(open_qty - expected_qty) > tolerance_threshold:
+                # 数量偏差过大，撤单后重挂
+                for order in existing_orders:
+                    actions.append({
+                        "action": "cancel",
+                        "side": "sell",
+                        "price": target_lvl.price,
+                        "order_id": order.get("id", ""),
+                        "level_id": target_level_id,
+                        "reason": "sync_mapping_rebalance",
+                        "expected_qty": expected_qty,
+                        "open_qty": open_qty,
+                    })
+                target_lvl.status = LevelStatus.CANCELING
+                target_lvl.last_action_ts = int(time.time())
+                self.logger.info(
+                    f"🔄 [SyncMapping] 重平衡: L_{target_level_id}({target_lvl.price:.2f}), "
+                    f"expected={expected_qty:.6f}, open={open_qty:.6f}"
+                )
+            
+            else:
+                # 数量匹配，无需操作
+                if existing_orders:
+                    target_lvl.status = LevelStatus.ACTIVE
+                    target_lvl.active_order_id = existing_orders[0].get("id", "")
+                    target_lvl.open_qty = open_qty
+        
+        return actions
+
     def clear_fill_counters(self, reason: str = "manual") -> None:
         if not self.state:
             return
+        self.state.active_inventory = []
+        self.state.settled_inventory = [] # 同时也清理最近平仓，保持视图干净
         for lvl in self.state.support_levels_state:
             lvl.fill_counter = 0
-        self.logger.info("🧹 fill_counter 清零: reason=%s", reason)
+        self.logger.info("🧹 fill_counter & Inventory 清零: reason=%s", reason)
         self._save_state()
 
-    def reconcile_counters_with_position(self, current_price: float, holdings_btc: float) -> Optional[Dict[str, str]]:
+    def reconcile_counters_with_position(
+        self,
+        current_price: float,
+        holdings_btc: float,
+        recent_trades: Optional[List[Dict]] = None,
+    ) -> Optional[Dict[str, str]]:
         if not self.state:
             return None
         base_qty = float(self.state.base_amount_per_grid or 0)
         if base_qty <= 0:
             return None
+        
         holdings_btc = max(float(holdings_btc or 0), 0.0)
-        expected = int(holdings_btc // base_qty)
-        current = sum(int(lvl.fill_counter or 0) for lvl in self.state.support_levels_state)
-        current_qty = current * base_qty
+        # 计算网格部分持仓（扣除底仓）
+        locked_qty = float(self.state.base_position_locked or 0)
+        grid_holdings = max(holdings_btc - locked_qty, 0.0)
+        
+        expected = int(round(grid_holdings / base_qty))
+        current = len(self.state.active_inventory)
+        
         if holdings_btc == 0:
             if current > 0:
                 self.clear_fill_counters("auto_clear_zero_position")
-                return {"action": "auto_clear", "detail": "持仓为 0，已清空配额"}
+                return {"action": "auto_clear", "detail": "持仓为 0，已清空清单"}
             return None
+            
         if expected == current:
             return None
+            
         self.logger.warning(
-            "⚠️ fill_counter 不一致: expected=%d, current=%d, holdings=%.6f, base=%.6f",
-            expected,
-            current,
-            holdings_btc,
-            base_qty,
+            "⚠️ [Inventory] 持仓清单不一致，启动同步: expected=%d, current=%d, grid_holdings=%.6f",
+            expected, current, grid_holdings
         )
-        # 重建配额：从近到远（高价到低价）依次锁定
-        for lvl in self.state.support_levels_state:
-            lvl.fill_counter = 0
-        price_ceiling = max(float(current_price or 0), float(self.state.avg_entry_price or 0))
-        supports = [
-            lvl for lvl in self.state.support_levels_state
-            if not price_ceiling or lvl.price <= price_ceiling
-        ]
-        supports_sorted = sorted(supports, key=lambda x: x.price, reverse=True)
-        assigned = 0
-        for lvl in supports_sorted:
-            if assigned >= expected:
-                break
-            lvl.fill_counter = 1
-            assigned += 1
-        if assigned < expected:
-            self.logger.warning(
-                "⚠️ fill_counter 锁定不足: expected=%d, assigned=%d",
-                expected,
-                assigned,
-            )
+
+        # 情况 A: 清单记录少于实际持仓 -> 补齐清单
+        if current < expected:
+            diff = expected - current
+            added = 0
+            
+            # A1. 尝试从真实的成交记录补齐 (精确匹配)
+            if recent_trades:
+                # 已有记录的 order_id 集合
+                existing_ids = {f.order_id for f in self.state.active_inventory if f.order_id}
+                
+                # 按时间倒序尝试认领
+                for t in recent_trades:
+                    if added >= diff:
+                        break
+                    
+                    order_id = str(t.get("order_id") or t.get("id", ""))
+                    if order_id in existing_ids:
+                        continue
+                        
+                    price = float(t.get("price", 0) or 0)
+                    
+                    # 优先使用记录中的 level_id
+                    lvl = None
+                    trade_level_id = t.get("level_id")
+                    if trade_level_id is not None:
+                        # 在当前网格中寻找该 level_id
+                        for l in self.state.support_levels_state:
+                            if l.level_id == trade_level_id:
+                                lvl = l
+                                break
+                    
+                    # 如果记录中没有 level_id 或当前网格没匹配到，再按价格匹配
+                    if not lvl:
+                        lvl = self._find_support_level_for_price(price)
+                        
+                    if lvl:
+                        # 检查该水位是否已满
+                        lvl_count = sum(1 for f in self.state.active_inventory if f.level_id == lvl.level_id)
+                        if lvl_count < int(self.state.max_fill_per_level or 1):
+                            new_fill = ActiveFill(
+                                order_id=order_id,
+                                price=price,
+                                qty=float(t.get("amount", base_qty)),
+                                level_id=lvl.level_id,
+                                timestamp=int(t.get("timestamp", time.time()*1000) / 1000)
+                            )
+                            self.state.active_inventory.append(new_fill)
+                            existing_ids.add(order_id)
+                            added += 1
+            
+            # A2. 兜底补齐：按价格由近及远填入清单 (模拟填充)
+            if added < diff:
+                price_ceiling = max(float(current_price or 0), float(self.state.avg_entry_price or 0))
+                supports = sorted(
+                    [lvl for lvl in self.state.support_levels_state if lvl.price <= price_ceiling * 1.01],
+                    key=lambda x: x.price, reverse=True
+                )
+                
+                for lvl in supports:
+                    while added < diff:
+                        lvl_count = sum(1 for f in self.state.active_inventory if f.level_id == lvl.level_id)
+                        if lvl_count < int(self.state.max_fill_per_level or 1):
+                            new_fill = ActiveFill(
+                                order_id=f"recon_{int(time.time())}_{added}",
+                                price=lvl.price,
+                                qty=base_qty,
+                                level_id=lvl.level_id,
+                                timestamp=int(time.time())
+                            )
+                            self.state.active_inventory.append(new_fill)
+                            added += 1
+                        else:
+                            break
+            
+            self.logger.info("🧱 [Inventory] 补齐了 %d 条持仓记录", added)
+
+        # 情况 B: 清单记录多于实际持仓 -> 移除清单记录 (FIFO)
+        elif current > expected:
+            diff = current - expected
+            removed = 0
+            for _ in range(diff):
+                if self.state.active_inventory:
+                    self.state.active_inventory.pop(0) # 销账最早的
+                    removed += 1
+            self.logger.info("🧱 [Inventory] 移除了 %d 条多余记录", removed)
+
+        # 最后同步视图
+        self._update_fill_counters_from_inventory()
         self._save_state()
+        
         return {
             "action": "reconcile",
-            "detail": f"expected={expected}, assigned={assigned}, holdings={holdings_btc:.6f}",
+            "detail": f"synced_inventory, final_count={len(self.state.active_inventory)}, expected={expected}",
         }
 
     def _btc_to_contracts(self, btc_qty: float, exchange_min_qty: float = 0.0) -> float:
@@ -831,61 +1322,23 @@ class GridPositionManager:
             contracts = max(contracts, math.ceil(exchange_min_qty))
         return float(contracts)
 
-    def update_polarity(self, current_price: float, now_ts: float) -> None:
-        """极性转换：1% 价差 + 15min 时空过滤"""
-        if not self.state:
-            return
-        threshold = float(getattr(self.grid_config, "polarity_flip_threshold", 0) or 0)
-        duration_sec = int(getattr(self.grid_config, "polarity_flip_duration_min", 0) or 0) * 60
-        if threshold <= 0 or duration_sec <= 0:
-            return
-
-        def _check_level(lvl: GridLevelState) -> None:
-            if lvl.price <= 0:
-                return
-            candidate = ""
-            if current_price >= lvl.price * (1 + threshold):
-                candidate = "support"
-            elif current_price <= lvl.price * (1 - threshold):
-                candidate = "resistance"
-
-            if not candidate:
-                lvl.role_candidate = ""
-                lvl.role_candidate_ts = 0
-                return
-
-            if candidate != lvl.role:
-                if lvl.role_candidate == candidate and lvl.role_candidate_ts:
-                    if now_ts - lvl.role_candidate_ts >= duration_sec:
-                        lvl.role = candidate
-                        lvl.side = "buy" if candidate == "support" else "sell"
-                        self.logger.info(
-                            f"🔁 极性翻转确认: price={lvl.price:.2f}, role={lvl.role}"
-                        )
-                        lvl.role_candidate = ""
-                        lvl.role_candidate_ts = 0
-                else:
-                    lvl.role_candidate = candidate
-                    lvl.role_candidate_ts = int(now_ts)
-                    self.logger.info(
-                        f"⏳ 极性翻转候选: price={lvl.price:.2f}, candidate={candidate}"
-                    )
-            else:
-                lvl.role_candidate = ""
-                lvl.role_candidate_ts = 0
-
-        for lvl in self.state.support_levels_state:
-            _check_level(lvl)
-        for lvl in self.state.resistance_levels_state:
-            _check_level(lvl)
-
     def compute_total_sell_qty(self, current_holdings: float) -> float:
         if not self.state:
             return 0.0
         # 当前口径为币数量
         base_locked = max(self.state.base_position_locked, 0.0)
         tradable = max(current_holdings - base_locked, 0.0)
-        return tradable * self.state.sell_quota_ratio
+        total_sell = tradable * self.state.sell_quota_ratio
+        
+        self.logger.info(
+            "🧮 止盈总量计算: holdings=%.6f, locked=%.6f, tradable=%.6f, ratio=%.2f, total_sell=%.6f",
+            current_holdings,
+            base_locked,
+            tradable,
+            self.state.sell_quota_ratio,
+            total_sell,
+        )
+        return total_sell
 
     def allocate_sell_targets(
         self,
@@ -933,7 +1386,8 @@ class GridPositionManager:
             return []
 
         actions: List[Dict[str, Any]] = []
-        price_tol = 0.001
+        # 严格匹配容差：从 0.1% 降低到 0.01%，防止相近水位互相“抢夺”订单
+        price_tol = 0.0001 
 
         # 构建 open orders 索引（按 side + 价格分组）
         order_by_price: Dict[str, Dict[float, List[Dict]]] = {}
@@ -996,7 +1450,11 @@ class GridPositionManager:
                     lvl.last_action_ts = int(time.time())
                     continue
                 target_qty = max(self.state.base_amount_per_grid, exchange_min_qty_btc)
-                if abs(lvl.open_qty - target_qty) >= exchange_min_qty_btc:
+                # 增加 5% 的数量容差，防止浮点数计算或交易所微小差异导致的频繁撤单 (rebalance_qty)
+                diff = abs(lvl.open_qty - target_qty)
+                is_diff_significant = diff >= exchange_min_qty_btc and (diff / target_qty > 0.05 if target_qty > 0 else True)
+                
+                if is_diff_significant:
                     for existing in existing_orders:
                         actions.append({
                             "action": "cancel",
@@ -1064,144 +1522,84 @@ class GridPositionManager:
                     lvl.status = LevelStatus.IDLE
                     lvl.last_error = "action_timeout"
 
-        # 卖单比例纠偏 + 均价利润校验（角色=resistance）
-        total_sell_qty = self.compute_total_sell_qty(self.state.total_position_contracts)
-        base_amount_contracts = self.state.base_amount_per_grid
-        min_price = self.state.avg_entry_price * (1 + self.state.min_profit_pct) if self.state.avg_entry_price > 0 else 0
-        eligible_levels = [
-            lvl for lvl in sell_levels
-            if not min_price or lvl.price >= min_price
-        ]
-        self.logger.info(
-            "🧾 卖单水位过滤: total_levels=%d, eligible=%d, min_price=%.2f, avg_entry=%.2f, min_profit=%.4f",
-            len(sell_levels),
-            len(eligible_levels),
-            min_price,
-            self.state.avg_entry_price,
-            self.state.min_profit_pct,
-        )
-        if total_sell_qty > 0 and not eligible_levels:
-            self.logger.warning(
-                "⚠️ 无可用卖单水位: total_sell=%.6f, avg_entry=%.2f, min_profit=%.4f",
-                total_sell_qty,
-                self.state.avg_entry_price,
-                self.state.min_profit_pct,
+        # ============================================
+        # 孤儿买单清理：撤销不在当前水位列表中的买单
+        # ============================================
+        buy_level_prices = {lvl.price for lvl in buy_levels}
+        
+        for order_price, orders in order_by_price.get("buy", {}).items():
+            # 检查该价格是否匹配任何支撑位
+            is_matched = any(
+                abs(order_price - lvl_price) <= lvl_price * price_tol
+                for lvl_price in buy_level_prices
             )
-        targets = self.allocate_sell_targets(
-            total_sell_qty,
-            base_amount_contracts,
-            exchange_min_qty_btc,
-            levels_count=len(eligible_levels),
-        )
-        eligible_idx = 0
-
-        for idx, lvl in enumerate(sell_levels):
-            is_eligible = (not min_price) or (lvl.price >= min_price)
-            target_qty = 0.0
-            if is_eligible and eligible_idx < len(targets):
-                target_qty = targets[eligible_idx]
-                eligible_idx += 1
-            lvl.target_qty = target_qty
-
-            # 利润校验
-            existing_orders = _match_orders("sell", lvl.price)
-            # 如果角色切换为 resistance 但存在买单，先撤买单
-            existing_buys = _match_orders("buy", lvl.price)
-            if existing_buys:
-                for existing_buy in existing_buys:
+            
+            if not is_matched:
+                # 孤儿订单：不在任何支撑位，需要撤销
+                for orphan_order in orders:
                     actions.append({
                         "action": "cancel",
                         "side": "buy",
-                        "price": lvl.price,
-                        "order_id": existing_buy.get("id", ""),
-                        "level_id": lvl.level_id,
-                        "reason": "polarity_flip_cancel_buy",
+                        "price": order_price,
+                        "order_id": orphan_order.get("id", ""),
+                        "level_id": 0,  # 无对应水位
+                        "reason": "orphan_order_cleanup",
                     })
-                lvl.status = LevelStatus.CANCELING
-                lvl.last_action_ts = int(time.time())
-                continue
-            if existing_orders:
-                lvl.open_qty = _sum_open_qty(existing_orders)
+                    self.logger.warning(
+                        f"🧹 [Recon] 孤儿买单撤销: price={order_price:.2f}, "
+                        f"order_id={orphan_order.get('id', '')}"
+                    )
 
-            if min_price and lvl.price < min_price:
-                if existing_orders:
-                    for existing in existing_orders:
-                        actions.append({
-                            "action": "cancel",
-                            "side": "sell",
-                            "price": lvl.price,
-                            "order_id": existing.get("id", ""),
-                            "level_id": lvl.level_id,
-                            "reason": "min_profit_guard",
-                        })
-                    lvl.status = LevelStatus.CANCELING
-                    lvl.last_action_ts = int(time.time())
-                continue
-
-            if target_qty <= 0:
-                if existing_orders:
-                    for existing in existing_orders:
-                        actions.append({
-                            "action": "cancel",
-                            "side": "sell",
-                            "price": lvl.price,
-                            "order_id": existing.get("id", ""),
-                            "level_id": lvl.level_id,
-                            "reason": "no_target_qty",
-                        })
-                    lvl.status = LevelStatus.CANCELING
-                    lvl.last_action_ts = int(time.time())
-                continue
-
-            if existing_orders:
-                lvl.status = LevelStatus.ACTIVE
-                lvl.active_order_id = existing_orders[0].get("id", "")
-                if abs(lvl.open_qty - target_qty) >= exchange_min_qty_btc:
-                    for existing in existing_orders:
-                        actions.append({
-                            "action": "cancel",
-                            "side": "sell",
-                            "price": lvl.price,
-                            "order_id": existing.get("id", ""),
-                            "level_id": lvl.level_id,
-                            "reason": "rebalance_qty",
-                        })
-                    lvl.status = LevelStatus.CANCELING
-                    lvl.last_action_ts = int(time.time())
-                continue
-            # 实盘无单但状态为 ACTIVE，纠正为 IDLE
-            if lvl.status == LevelStatus.ACTIVE:
-                lvl.status = LevelStatus.IDLE
-                lvl.order_id = ""
-                lvl.open_qty = 0.0
-
-            if (
-                lvl.status == LevelStatus.IDLE
-                and target_qty >= exchange_min_qty_btc
-                and current_price < lvl.price * (1 - self.state.sell_price_buffer_pct)
-            ):
-                actions.append({
-                    "action": "place",
-                    "side": "sell",
-                    "price": lvl.price,
-                    "qty": target_qty,
-                    "level_id": lvl.level_id,
-                    "reason": "recon_sell_rebalance",
-                })
-                lvl.status = LevelStatus.PLACING
-                lvl.last_action_ts = int(time.time())
-                self.logger.debug(
-                    f"🧾 Recon补卖: price={lvl.price:.2f}, qty={target_qty:.6f}"
-                )
-            elif lvl.status == LevelStatus.IDLE and target_qty > 0:
-                self.logger.warning(
-                    f"⚠️ 最小卖单量不足: price={lvl.price:.2f}, "
-                    f"target={target_qty:.6f}, min={exchange_min_qty_btc:.6f}"
-                )
-            elif lvl.status in (LevelStatus.PLACING, LevelStatus.CANCELING):
-                if lvl.last_action_ts and (time.time() - lvl.last_action_ts) > self.state.order_action_timeout_sec:
-                    lvl.status = LevelStatus.IDLE
-                    lvl.last_error = "action_timeout"
+        # ============================================
+        # T3.3: 使用逐级邻位映射同步卖单
+        # ============================================
+        # 旧逻辑（已移除）：基于 avg_entry_price 的 min_profit_guard 和 allocate_sell_targets
+        # 新逻辑：基于 fill_counter 和 level_mapping 的逐级对冲
+        
+        sell_actions = self.sync_mapping(
+            current_price=current_price,
+            open_orders=open_orders,
+            exchange_min_qty=exchange_min_qty_btc,
+        )
+        actions.extend(sell_actions)
+        
+        # ============================================
+        # 孤儿卖单清理：撤销不在当前水位列表中的卖单
+        # ============================================
+        all_level_prices = {lvl.price for lvl in all_levels}
+        
+        for order_price, orders in order_by_price.get("sell", {}).items():
+            # 检查该价格是否匹配任何水位
+            is_matched = any(
+                abs(order_price - lvl_price) <= lvl_price * price_tol
+                for lvl_price in all_level_prices
+            )
+            
+            if not is_matched:
+                # 孤儿订单：不在任何水位，需要撤销
+                for orphan_order in orders:
+                    actions.append({
+                        "action": "cancel",
+                        "side": "sell",
+                        "price": order_price,
+                        "order_id": orphan_order.get("id", ""),
+                        "level_id": 0,
+                        "reason": "orphan_order_cleanup",
+                    })
+                    self.logger.warning(
+                        f"🧹 [Recon] 孤儿卖单撤销: price={order_price:.2f}, "
+                        f"order_id={orphan_order.get('id', '')}"
+                    )
+        
+        # 统计
+        buy_actions_count = len([a for a in actions if a.get('side') == 'buy'])
+        sell_actions_count = len([a for a in actions if a.get('side') == 'sell'])
+        orphan_cleanup_count = len([a for a in actions if a.get('reason') == 'orphan_order_cleanup'])
+        
+        self.logger.info(
+            f"📊 [Recon] 买单动作: {buy_actions_count}, 卖单动作: {sell_actions_count}, "
+            f"孤儿清理: {orphan_cleanup_count}"
+        )
 
         return actions
 
@@ -1210,10 +1608,23 @@ class GridPositionManager:
         delta_buy_qty: float,
         exchange_min_qty_btc: float,
         current_price: float,
+        filled_support_level_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """买单成交后，增量补卖单"""
+        """
+        T4.1: 买单成交后，基于逐级邻位映射增量补卖单
+        
+        Args:
+            delta_buy_qty: 买入数量
+            exchange_min_qty_btc: 交易所最小下单量
+            current_price: 当前价格
+            filled_support_level_id: 成交的支撑位 ID（可选，用于精确映射）
+        
+        Returns:
+            卖单动作列表
+        """
         if not self.state or delta_buy_qty <= 0:
             return []
+        
         delta_sell = delta_buy_qty * self.state.sell_quota_ratio
         if delta_sell < exchange_min_qty_btc:
             self.logger.warning(
@@ -1222,57 +1633,80 @@ class GridPositionManager:
             )
             return []
 
-        # 优先补齐已存在卖单的水位
-        base_amount_contracts = self.state.base_amount_per_grid
-        min_price = self.state.avg_entry_price * (1 + self.state.min_profit_pct) if self.state.avg_entry_price > 0 else 0
-        for lvl in self.state.resistance_levels_state:
-            if lvl.price <= current_price:
-                continue
-            if min_price and lvl.price < min_price:
-                continue
-            if current_price >= lvl.price * (1 - self.state.sell_price_buffer_pct):
-                continue
-            if lvl.target_qty > 0 and lvl.open_qty < base_amount_contracts:
-                inc = min(delta_sell, base_amount_contracts - lvl.open_qty)
-                if inc >= exchange_min_qty_btc:
+        # ============================================
+        # T3.4 & T4.1: 基于逐级邻位映射确定卖单目标
+        # 不再使用 avg_entry_price
+        # ============================================
+        
+        # 1. 确定目标卖单水位
+        target_level = None
+        
+        if filled_support_level_id:
+            # 有明确的支撑位 ID，使用映射查找
+            target_level_id = self.state.level_mapping.get(filled_support_level_id)
+            if target_level_id:
+                target_level = self._get_level_by_id(target_level_id)
+                if target_level:
                     self.logger.debug(
-                        f"⚡ Event补卖(补齐): price={lvl.price:.2f}, qty={inc:.6f}"
+                        f"⚡ [Event] 使用邻位映射: S_{filled_support_level_id} → "
+                        f"L_{target_level_id}({target_level.price:.2f})"
                     )
-                    return [{
-                        "action": "place",
-                        "side": "sell",
-                        "price": lvl.price,
-                        "qty": inc,
-                        "level_id": lvl.level_id,
-                        "reason": "event_sell_increment",
-                    }]
-        # 找空水位
-        for lvl in self.state.resistance_levels_state:
-            if lvl.price <= current_price:
-                continue
-            if min_price and lvl.price < min_price:
-                continue
-            if current_price >= lvl.price * (1 - self.state.sell_price_buffer_pct):
-                continue
-            if lvl.status == LevelStatus.IDLE:
-                self.logger.debug(
-                    f"⚡ Event补卖(新水位): price={lvl.price:.2f}, qty={delta_sell:.6f}"
+        
+        if not target_level:
+            # 回退：查找最近成交支撑位的映射
+            recent_fill = None
+            for lvl in sorted(self.state.support_levels_state, key=lambda x: x.price, reverse=True):
+                if lvl.fill_counter > 0 and lvl.price < current_price:
+                    recent_fill = lvl
+                    break
+            
+            if recent_fill:
+                target_level_id = self.state.level_mapping.get(recent_fill.level_id)
+                if target_level_id:
+                    target_level = self._get_level_by_id(target_level_id)
+                    if target_level:
+                        self.logger.debug(
+                            f"⚡ [Event] 回退映射: S_{recent_fill.level_id}({recent_fill.price:.2f}) → "
+                            f"L_{target_level_id}({target_level.price:.2f})"
+                        )
+        
+        if not target_level:
+            # 再次回退：找当前价上方最近的水位
+            all_levels = self.state.support_levels_state + self.state.resistance_levels_state
+            candidates = [lvl for lvl in all_levels if lvl.price > current_price]
+            if candidates:
+                target_level = min(candidates, key=lambda x: x.price)
+                self.logger.warning(
+                    f"⚠️ [Event] 无映射可用，使用最近上方水位: {target_level.price:.2f}"
                 )
-                return [{
-                    "action": "place",
-                    "side": "sell",
-                    "price": lvl.price,
-                    "qty": delta_sell,
-                    "level_id": lvl.level_id,
-                    "reason": "event_sell_new_level",
-                }]
-        self.logger.warning(
-            "⚠️ 无可用卖单水位(Event): delta_sell=%.6f, current=%.2f, min_price=%.2f",
-            delta_sell,
-            current_price,
-            min_price,
+        
+        if not target_level:
+            self.logger.warning(
+                f"⚠️ 无可用卖单水位(Event): delta_sell={delta_sell:.6f}, current={current_price:.2f}"
+            )
+            return []
+        
+        # 2. 检查价格缓冲（避免在太近的价位挂单）
+        if current_price >= target_level.price * (1 - self.state.sell_price_buffer_pct):
+            self.logger.warning(
+                f"⚠️ 卖单水位太近: current={current_price:.2f}, "
+                f"target={target_level.price:.2f}, buffer={self.state.sell_price_buffer_pct}"
+            )
+            return []
+        
+        # 3. 生成卖单动作
+        self.logger.info(
+            f"⚡ [Event] 补卖单: price={target_level.price:.2f}, qty={delta_sell:.6f}, "
+            f"level_id={target_level.level_id}"
         )
-        return []
+        return [{
+            "action": "place",
+            "side": "sell",
+            "price": target_level.price,
+            "qty": delta_sell,
+            "level_id": target_level.level_id,
+            "reason": "event_sell_mapping",
+        }]
 
     def _find_support_level_for_price(self, price: float) -> Optional[GridLevelState]:
         if not self.state:
@@ -1290,91 +1724,101 @@ class GridPositionManager:
             return None
         return max(candidates, key=lambda x: x.price)
 
-    def increment_fill_counter_by_qty(self, buy_price: float, buy_qty: float) -> None:
-        if not self.state:
-            return
-        base_qty = float(self.state.base_amount_per_grid or 0)
-        if base_qty <= 0:
-            return
-        buy_qty = max(float(buy_qty or 0), 0.0)
-        count = int(buy_qty // base_qty)
-        if count <= 0:
-            count = 1
-        # 从最近的支撑位向下认领
-        supports = [
-            lvl for lvl in self.state.support_levels_state
-            if lvl.price <= buy_price
-        ]
-        supports_sorted = sorted(supports, key=lambda x: x.price, reverse=True)
-        applied = 0
-        for _ in range(count):
-            for lvl in supports_sorted:
-                if int(lvl.fill_counter or 0) < int(self.state.max_fill_per_level or 1):
-                    lvl.fill_counter = int(lvl.fill_counter or 0) + 1
-                    applied += 1
-                    break
-        if applied > 0:
-            self.logger.info(
-                "🧱 fill_counter +%d: price<=%.2f",
-                applied,
-                buy_price,
-            )
-            self._save_state()
-
-    def increment_fill_counter_by_order(self, order_id: str, buy_qty: float) -> bool:
+    def increment_fill_counter_by_order(self, order_id: str, buy_price: float, buy_qty: float) -> bool:
         if not self.state:
             return False
         order_id = str(order_id or "").strip()
         if not order_id:
             return False
-        base_qty = float(self.state.base_amount_per_grid or 0)
-        if base_qty <= 0:
-            return False
-        buy_qty = max(float(buy_qty or 0), 0.0)
-        count = int(buy_qty // base_qty)
-        if count <= 0:
-            count = 1
+        
+        # 1. 查找匹配的水位
+        matched_lvl = None
         for lvl in self.state.support_levels_state:
             if lvl.order_id == order_id or lvl.active_order_id == order_id:
-                max_fill = int(self.state.max_fill_per_level or 1)
-                new_value = min(int(lvl.fill_counter or 0) + count, max_fill)
-                delta = new_value - int(lvl.fill_counter or 0)
-                if delta > 0:
-                    lvl.fill_counter = new_value
-                    self.logger.info(
-                        "🧱 fill_counter +%d: order_id=%s price=%.2f",
-                        delta,
-                        order_id,
-                        lvl.price,
-                    )
-                    self._save_state()
-                return True
-        return False
+                matched_lvl = lvl
+                break
+        
+        # 如果订单ID没匹配上，按价格找最近的水位
+        if not matched_lvl:
+            matched_lvl = self._find_support_level_for_price(buy_price)
+            
+        if not matched_lvl:
+            self.logger.warning("无法为成交订单匹配到水位: id=%s, price=%.2f", order_id, buy_price)
+            return False
 
-    def release_fill_counter_by_qty(self, sell_qty: float) -> None:
+        # 2. 入库清单 (Active Inventory)
+        new_fill = ActiveFill(
+            order_id=order_id,
+            price=buy_price,
+            qty=buy_qty,
+            level_id=matched_lvl.level_id,
+            timestamp=int(time.time())
+        )
+        self.state.active_inventory.append(new_fill)
+        
+        # 3. 更新水位计数器 (View)
+        self._update_fill_counters_from_inventory()
+        
+        self.logger.info(
+            "🧱 [Inventory] 记录新持仓: level=%d, price=%.2f, qty=%.6f, order_id=%s",
+            matched_lvl.level_id, buy_price, buy_qty, order_id
+        )
+        self._save_state()
+        return True
+
+    def _update_fill_counters_from_inventory(self) -> None:
+        """从清单同步计数器视图"""
         if not self.state:
             return
+            
+        # 先清零
+        for lvl in self.state.support_levels_state:
+            lvl.fill_counter = 0
+            
+        # 重新统计
+        for fill in self.state.active_inventory:
+            for lvl in self.state.support_levels_state:
+                if lvl.level_id == fill.level_id:
+                    lvl.fill_counter += 1
+                    break
+
+    def release_fill_counter_by_qty(self, sell_qty: float) -> None:
+        if not self.state or not self.state.active_inventory:
+            return
+            
         base_qty = float(self.state.base_amount_per_grid or 0)
         if base_qty <= 0:
             return
+            
         sell_qty = max(float(sell_qty or 0), 0.0)
-        count = int(sell_qty // base_qty)
+        # 计算需要销账的次数 (通常是 1)
+        count = int(round(sell_qty / base_qty))
         if count <= 0:
             count = 1
-        released = 0
+            
+        # FIFO 销账：优先销掉最早的买入记录
+        # 也可以改为价格优先：销掉利润最高的那笔（最高价卖单销掉最低价买单）
+        # 这里采用网格物理逻辑：卖出意味着某个水位的买入被释放，由于止盈通常是针对特定的买入，
+        # 我们按 FIFO 释放，并重新计算计数器
+        
+        removed_count = 0
         for _ in range(count):
-            candidates = [
-                lvl for lvl in self.state.support_levels_state
-                if int(lvl.fill_counter or 0) > 0
-            ]
-            if not candidates:
-                break
-            # 释放最低（最远）支撑位
-            lvl = min(candidates, key=lambda x: x.price)
-            lvl.fill_counter = max(int(lvl.fill_counter or 0) - 1, 0)
-            released += 1
-        if released > 0:
-            self.logger.info("🧱 fill_counter -%d", released)
+            if self.state.active_inventory:
+                removed = self.state.active_inventory.pop(0) # FIFO
+                removed_count += 1
+                
+                # 记录到已平仓清单 (保留最近 10 条)
+                self.state.settled_inventory.insert(0, removed)
+                if len(self.state.settled_inventory) > 10:
+                    self.state.settled_inventory = self.state.settled_inventory[:10]
+                
+                self.logger.info(
+                    "🧱 [Inventory] 销账已平仓持仓: level=%d, buy_price=%.2f, order_id=%s",
+                    removed.level_id, removed.price, removed.order_id
+                )
+        
+        if removed_count > 0:
+            self._update_fill_counters_from_inventory()
             self._save_state()
     
     def check_stop_loss(self, current_price: float) -> bool:
@@ -1566,6 +2010,14 @@ class GridPositionManager:
                 resistance_levels_state=[
                     GridLevelState.from_dict(r) for r in grid_data.get("resistance_levels_state", [])
                 ],
+                active_inventory=[
+                    ActiveFill.from_dict(f) for f in grid_data.get("active_inventory", [])
+                ],
+                settled_inventory=[
+                    ActiveFill.from_dict(f) for f in grid_data.get("settled_inventory", [])
+                ],
+                # T1.3: 恢复邻位映射表（兼容旧版：默认空字典）
+                level_mapping=grid_data.get("level_mapping", {}),
                 # 恢复网格配置
                 per_grid_contracts=grid_data.get("per_grid_contracts", 0),
                 contract_size=grid_data.get("contract_size", 0.0001),
@@ -1636,6 +2088,10 @@ class GridPositionManager:
                     return False
             
             self.state = restored_state
+            
+            # T2.3: 规范化 level_id 并重建映射（兼容旧版状态文件）
+            self._normalize_level_ids_and_rebuild_mapping()
+            
             self._save_state()
             self.logger.info("已恢复网格状态和交易历史")
             return True

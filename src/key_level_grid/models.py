@@ -270,6 +270,9 @@ class KeyLevelGridState:
     volume_ma: Optional[float] = None    # 均量
     volume_ratio: Optional[float] = None # 量比
     
+    # 兼容旧版信号生成器（通道方向）
+    tunnel_direction: str = "flat"       # up | down | flat
+    
     def to_dict(self) -> dict:
         """转换为字典"""
         return {
@@ -288,6 +291,7 @@ class KeyLevelGridState:
             "adx": self.adx,
             "volume_ma": self.volume_ma,
             "volume_ratio": self.volume_ratio,
+            "tunnel_direction": self.tunnel_direction,
         }
 
 

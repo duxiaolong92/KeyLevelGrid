@@ -464,6 +464,8 @@ class GateExecutor(ExchangeExecutor):
                     if order.order_type == OrderType.IOC:
                         await self._handle_ioc_order(order)
                     
+                    await self._notify_order_sync(order, "新增")
+                    
                     return True
                 else:
                     # ✅ 检查是否为不可重试错误（余额不足、参数错误等）
@@ -545,6 +547,38 @@ class GateExecutor(ExchangeExecutor):
                 self._stats["orders_filled"] += 1
         
         return True
+
+    async def _notify_order_sync(self, order: Order, status: str) -> None:
+        notifier = getattr(self, "_notifier", None)
+        if not notifier:
+            return
+        try:
+            side = order.metadata.get("side") or order.side.value
+            order_type = order.metadata.get("order_type")
+            if not order_type:
+                order_type = "支撑位买单" if side == "buy" else "阻力位卖单"
+            reason = order.metadata.get("reason", "executor")
+            price = float(order.metadata.get("price", 0) or (order.price or 0))
+            qty_btc = float(order.metadata.get("qty_btc", 0) or 0)
+            if qty_btc <= 0:
+                contract_size = None
+                try:
+                    market = self._exchange.markets.get(order.symbol, {}) if self._exchange else {}
+                    contract_size = market.get("contractSize")
+                except Exception:
+                    contract_size = None
+                if contract_size:
+                    qty_btc = float(order.quantity or 0) * float(contract_size)
+            await notifier.notify_order_sync(
+                symbol=order.symbol,
+                order_type=order_type,
+                status=status,
+                price=price,
+                new_qty=qty_btc,
+                reason=reason,
+            )
+        except Exception as e:
+            self.logger.error(f"发送挂单同步提醒失败: {e}")
     
     async def _prepare_order_params(
         self,
@@ -1231,6 +1265,7 @@ class GateExecutor(ExchangeExecutor):
             await asyncio.sleep(0.05)
             order.status = OrderStatus.CANCELLED
             self._stats["orders_cancelled"] += 1
+            await self._notify_order_sync(order, "撤销")
             return True
         else:
             # ✅ 真实交易：调用 Gate.io API
@@ -1256,6 +1291,7 @@ class GateExecutor(ExchangeExecutor):
                         f"✅ 订单已取消: {order.exchange_order_id}",
                         extra={'response': response}
                     )
+                    await self._notify_order_sync(order, "撤销")
                     return True
                 else:
                     self.logger.error("取消订单返回空响应")
@@ -1467,31 +1503,39 @@ class GateExecutor(ExchangeExecutor):
         """
         设置杠杆倍数
         
+        Gate.io 期货杠杆设置:
+        - leverage=0: 全仓模式 (cross)
+        - leverage>0: 逐仓模式 (isolated) + 指定杠杆倍数
+        
         Args:
             symbol: 交易对
-            leverage: 杠杆倍数
+            leverage: 杠杆倍数 (0 表示全仓)
             
         Returns:
             True 如果成功
         """
         if self.paper_trading:
-            self.logger.info(f"[纸交易] 设置 {symbol} 杠杆为 {leverage}x")
+            mode_str = "全仓" if leverage == 0 else f"逐仓 {leverage}x"
+            self.logger.info(f"[纸交易] 设置 {symbol} 杠杆为 {mode_str}")
             return True
             
         try:
-            self.logger.info(f"设置 {symbol} 杠杆为 {leverage}x")
+            mode_str = "全仓" if leverage == 0 else f"逐仓 {leverage}x"
+            self.logger.info(f"🔧 设置 {symbol} 杠杆为 {mode_str}")
             
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 None,
                 lambda: self._exchange.set_leverage(leverage, symbol)
             )
+            self.logger.info(f"✅ 杠杆设置成功: {mode_str}")
             return True
             
         except Exception as e:
-            # 处理持仓锁定错误
-            if "POSITION_HOLDING" in str(e) or "can not switch" in str(e).lower():
-                self.logger.warning(f"⚠️ 无法切换杠杆（已有持仓），保持当前设置: {e}")
+            # 处理持仓/挂单锁定错误
+            err_str = str(e).lower()
+            if "position_holding" in err_str or "can not switch" in err_str or "order" in err_str:
+                self.logger.warning(f"⚠️ 无法切换杠杆（已有持仓或挂单）: {e}")
                 return True
                 
             self.logger.error(f"❌ 设置杠杆失败: {e}", exc_info=True)
@@ -1500,6 +1544,12 @@ class GateExecutor(ExchangeExecutor):
     async def set_margin_mode(self, symbol: str, margin_mode: str) -> bool:
         """
         设置保证金模式
+        
+        Gate.io 通过 leverage 值来控制保证金模式:
+        - cross (全仓): leverage = 0
+        - isolated (逐仓): leverage > 0
+        
+        注意: 有挂单或持仓时无法切换模式！
         
         Args:
             symbol: 交易对
@@ -1513,14 +1563,13 @@ class GateExecutor(ExchangeExecutor):
             return True
             
         try:
-            self.logger.info(f"设置 {symbol} 保证金模式为 {margin_mode}")
+            self.logger.info(f"🔧 设置 {symbol} 保证金模式为 {margin_mode}")
             
-            import ccxt
             loop = asyncio.get_event_loop()
             
             # Gate.io 逻辑：
             # margin_mode='cross' -> leverage=0
-            # margin_mode='isolated' -> set_leverage(value)
+            # margin_mode='isolated' -> 依赖后续 set_leverage 设置具体值
             
             if margin_mode == 'cross':
                 self.logger.info(f"Gate.io 全仓模式：设置杠杆为 0")
@@ -1528,16 +1577,18 @@ class GateExecutor(ExchangeExecutor):
                     None,
                     lambda: self._exchange.set_leverage(0, symbol)
                 )
+                self.logger.info(f"✅ 全仓模式设置成功 (leverage=0)")
             else:
-                # 逐仓模式，通常保持当前配置的杠杆值
-                self.logger.info(f"Gate.io 逐仓模式：依赖 set_leverage 设置具体倍数")
+                # 逐仓模式，依赖后续的 set_leverage 调用
+                self.logger.info(f"Gate.io 逐仓模式：等待 set_leverage 设置具体倍数")
                 
             return True
             
         except Exception as e:
-            # 处理持仓锁定错误
-            if "POSITION_HOLDING" in str(e) or "can not switch" in str(e).lower():
-                self.logger.warning(f"⚠️ 无法切换保证金模式（已有持仓），保持当前设置: {e}")
+            # 处理持仓/挂单锁定错误
+            err_str = str(e).lower()
+            if "position_holding" in err_str or "can not switch" in err_str or "order" in err_str:
+                self.logger.warning(f"⚠️ 无法切换保证金模式（已有持仓或挂单）: {e}")
                 return True
                 
             self.logger.error(f"❌ 设置保证金模式失败: {e}", exc_info=True)

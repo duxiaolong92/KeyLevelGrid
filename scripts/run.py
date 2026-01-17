@@ -303,6 +303,45 @@ def create_levels_panel(data: dict) -> Panel:
     return Panel(table, title="📍 关键价位", border_style="cyan")
 
 
+def create_trades_panel(data: dict) -> Panel:
+    """创建基于 Inventory 的混合成交面板"""
+    active = data.get("active_inventory", [])
+    settled = data.get("settled_inventory", [])
+    
+    table = Table(box=None, padding=(0, 1))
+    table.add_column("状态", style="dim", justify="left")
+    table.add_column("水位", justify="center")
+    table.add_column("成交价", justify="right")
+    table.add_column("BTC", justify="right")
+    table.add_column("类型", justify="center")
+    
+    # 1. 显示持仓中的买入 (Active) - 取最近 10 条，倒序
+    active_display = sorted(active, key=lambda x: x.get("timestamp", 0), reverse=True)[:10]
+    for fill in active_display:
+        table.add_row(
+            "[green]持仓中[/green]",
+            f"#{fill.get('level_id')}",
+            format_price(fill.get("price", 0)),
+            f"{fill.get('qty', 0):.6f}",
+            "买入"
+        )
+    
+    if active_display and settled:
+        table.add_row("──────", "───", "──────────", "────────", "──")
+
+    # 2. 显示最近已平仓的记录 (Settled) - 取最近 3 条
+    for fill in settled[:3]:
+        table.add_row(
+            "[dim]已平仓[/dim]",
+            f"#{fill.get('level_id')}",
+            format_price(fill.get("price", 0)),
+            f"{fill.get('qty', 0):.6f}",
+            "买/卖"
+        )
+        
+    return Panel(table, title="📜 仓位清单 (持仓买入 + 最近平仓)", border_style="magenta")
+
+
 def get_current_price(data: dict) -> float:
     """从 data 中获取当前价格（兼容多种格式）"""
     # 优先尝试直接的 current_price
@@ -353,11 +392,13 @@ def create_display(strategy: KeyLevelGridStrategy) -> Layout:
     layout["orders"].update(create_orders_panel(data))
     
     layout["middle"].split_column(
-        Layout(name="account"),
-        Layout(name="position"),
+        Layout(name="account", size=12),
+        Layout(name="position", size=10),
+        Layout(name="trades"),
     )
     layout["middle"]["account"].update(create_account_panel(data))
     layout["middle"]["position"].update(create_position_panel(data))
+    layout["middle"]["trades"].update(create_trades_panel(data))
     
     layout["levels"].update(create_levels_panel(data))
     

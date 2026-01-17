@@ -155,6 +155,10 @@ telegram:
     order_placed: false       # 挂单通知（较频繁，建议关闭）
     orders_summary: true      # 挂单汇总（启动时发送）
     quota_event: true         # 配额对齐/清空通知
+    position_flux: true       # 持仓变化通知
+    order_sync: true          # 挂单同步提醒
+    system_info: true         # 系统操作记录
+    system_alert: true        # 关键告警
     
     # 风险通知
     risk_warning: true        # 风险预警
@@ -167,3 +171,9 @@ telegram:
     # 心跳（可选）
     heartbeat: false          # 心跳通知
     heartbeat_interval_hours: 4
+    heartbeat_idle_sec: 3600  # 无成交心跳阈值（秒）
+
+    # 静默模式（防刷屏）
+    silent_mode: true         # 成交合并
+    merge_fill_window_sec: 5  # 成交合并窗口（秒）
+    min_notify_interval_sec: 5  # 同类通知最小间隔（秒）

@@ -5,6 +5,7 @@ Telegram 通知管理模块
 """
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Any
@@ -27,6 +28,10 @@ class NotifyConfig:
     grid_rebuild: bool = True         # 网格重建
     orders_summary: bool = True       # 挂单汇总（启动时发送）
     quota_event: bool = True          # 配额对齐/清空通知
+    position_flux: bool = True        # 持仓变化通知
+    order_sync: bool = True           # 挂单同步提醒
+    system_info: bool = True          # 系统操作记录
+    system_alert: bool = True         # 关键告警
     
     # 风险通知
     risk_warning: bool = True         # 风险预警
@@ -39,9 +44,12 @@ class NotifyConfig:
     # 心跳（可选）
     heartbeat: bool = False
     heartbeat_interval_hours: int = 4
+    heartbeat_idle_sec: int = 3600    # 无成交心跳阈值（秒）
     
     # 防刷屏
     min_notify_interval_sec: int = 5  # 同类通知最小间隔
+    silent_mode: bool = True          # 静默模式（成交合并）
+    merge_fill_window_sec: int = 5    # 成交合并窗口（秒）
 
 
 class NotificationManager:
@@ -94,6 +102,12 @@ class NotificationManager:
         
         # 风险预警状态
         self._risk_warning_sent = False
+        
+        # 持仓变更合并
+        self._position_flux_buffer: List[Dict[str, Any]] = []
+        self._position_flux_task: Optional[asyncio.Task] = None
+        self._last_trade_ts: float = 0
+        self._last_heartbeat_ts: float = 0
     
     async def _send_message(self, text: str) -> bool:
         """
@@ -145,6 +159,199 @@ class NotificationManager:
             return False
         self._last_notify_time[notify_type] = now
         return True
+
+    def _format_qty(self, qty: float) -> str:
+        if qty >= 1:
+            return f"{qty:.4f} BTC"
+        if qty >= 0.01:
+            return f"{qty:.6f} BTC"
+        return f"{qty:.8f} BTC"
+
+    async def _flush_position_flux(self) -> None:
+        if self.config.merge_fill_window_sec > 0:
+            await asyncio.sleep(self.config.merge_fill_window_sec)
+        if not self._position_flux_buffer:
+            return
+        events = self._position_flux_buffer[:]
+        self._position_flux_buffer = []
+        self._position_flux_task = None
+        text = self._format_position_flux(events)
+        await self._send_message(text)
+
+    def _format_position_flux(self, events: List[Dict[str, Any]]) -> str:
+        if not events:
+            return ""
+        last = events[-1]
+        if len(events) == 1:
+            return (
+                "🔄 <b>持仓变更通知</b>\n"
+                f"<b>动作</b>: {last['action']} | <b>价格</b>: {last['price']}\n"
+                f"<b>数量</b>: {last['qty']} | <b>当前总仓位</b>: {last['total_qty']}\n"
+                f"<b>最新均价</b>: {last['avg_price']} | <b>当前 uPNL</b>: {last['pnl']}\n\n"
+                "[📊 查看明细] [🛡 调整止损]"
+            )
+        lines = [
+            "🔄 <b>持仓变更通知</b>（合并）",
+        ]
+        for evt in events:
+            lines.append(
+                f"- {evt['action']} @ {evt['price']} | {evt['qty']}"
+            )
+        lines.append("")
+        lines.append(
+            f"<b>当前总仓位</b>: {last['total_qty']} | "
+            f"<b>最新均价</b>: {last['avg_price']} | <b>当前 uPNL</b>: {last['pnl']}"
+        )
+        lines.append("")
+        lines.append("[📊 查看明细] [🛡 调整止损]")
+        return "\n".join(lines)
+
+    async def notify_position_flux(
+        self,
+        *,
+        action: str,
+        price: float,
+        qty: float,
+        total_qty: float,
+        avg_price: float,
+        pnl: float,
+    ) -> None:
+        if not self.config.position_flux:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        event = {
+            "action": action,
+            "price": f"${price:,.2f}" if price > 0 else "N/A",
+            "qty": self._format_qty(qty),
+            "total_qty": self._format_qty(total_qty),
+            "avg_price": f"${avg_price:,.2f}" if avg_price > 0 else "N/A",
+            "pnl": f"{pnl:+,.2f} USDT",
+            "timestamp": now,
+        }
+        self._last_trade_ts = time.time()
+        if self.config.silent_mode and self.config.merge_fill_window_sec > 0:
+            self._position_flux_buffer.append(event)
+            if not self._position_flux_task:
+                self._position_flux_task = asyncio.create_task(
+                    self._flush_position_flux()
+                )
+            return
+        await self._send_message(self._format_position_flux([event]))
+
+    async def notify_order_sync(
+        self,
+        *,
+        symbol: str,
+        order_type: str,
+        status: str,
+        price: float,
+        new_qty: float,
+        reason: str,
+    ) -> None:
+        if not self.config.order_sync:
+            return
+        if not self._can_notify("order_sync"):
+            return
+        text = (
+            "📝 <b>挂单同步提醒</b>\n"
+            f"<b>类型</b>: {order_type}\n"
+            f"<b>状态</b>: {status}\n"
+            f"<b>价格</b>: ${price:,.2f} | <b>新数量</b>: {self._format_qty(new_qty)}\n"
+            f"<b>原因</b>: {reason}\n\n"
+            "[🔄 立即对账]"
+        )
+        await self._send_message(text)
+
+    async def notify_recon_summary(
+        self,
+        *,
+        symbol: str,
+        summary: str,
+    ) -> None:
+        if not self.config.order_sync:
+            return
+        if not self._can_notify("recon_summary"):
+            return
+        text = (
+            "📝 <b>挂单同步提醒</b>\n"
+            f"<b>标的</b>: {symbol}\n"
+            f"{summary}\n\n"
+            "[🔄 立即对账]"
+        )
+        await self._send_message(text)
+
+    async def notify_system_info(
+        self,
+        *,
+        event: str,
+        result: str,
+        duration_sec: Optional[float] = None,
+    ) -> None:
+        if not self.config.system_info:
+            return
+        if not self._can_notify("system_info"):
+            return
+        duration_text = f"{duration_sec:.1f}s" if duration_sec is not None else "N/A"
+        text = (
+            "ℹ️ <b>系统操作记录</b>\n"
+            f"<b>事件</b>: {event}\n"
+            f"<b>结果</b>: {result}\n"
+            f"<b>耗时</b>: {duration_text}"
+        )
+        await self._send_message(text)
+
+    async def notify_system_alert(
+        self,
+        *,
+        error_type: str,
+        error_code: str = "",
+        error_msg: str,
+        impact: str,
+        suggestion: str = "",
+        traceback_text: str = "",
+    ) -> None:
+        if not self.config.system_alert:
+            return
+        if not self._can_notify("system_alert"):
+            return
+        code_text = error_code or "N/A"
+        text = (
+            "🚨 <b>关键告警：系统异常</b>\n"
+            f"<b>类型</b>: {error_type}\n"
+            f"<b>错误码</b>: {code_text} | <b>信息</b>: {error_msg}\n"
+            f"<b>影响</b>: {impact}\n"
+        )
+        if traceback_text:
+            text += f"\n<code>{traceback_text}</code>\n"
+        if suggestion:
+            text += f"\n建议: {suggestion}"
+        text += "\n\n[🛠 强制对账] [🔌 停止机器人]"
+        await self._send_message(text.strip())
+
+    async def notify_idle_heartbeat(
+        self,
+        *,
+        symbol: str,
+        current_price: float,
+        position_value: float,
+        unrealized_pnl: float,
+        uptime_hours: float,
+    ) -> None:
+        if not self.config.heartbeat:
+            return
+        now_ts = time.time()
+        if self._last_trade_ts and now_ts - self._last_trade_ts < self.config.heartbeat_idle_sec:
+            return
+        if self._last_heartbeat_ts and now_ts - self._last_heartbeat_ts < self.config.heartbeat_idle_sec:
+            return
+        self._last_heartbeat_ts = now_ts
+        await self.notify_heartbeat(
+            symbol=symbol,
+            current_price=current_price,
+            position_value=position_value,
+            unrealized_pnl=unrealized_pnl,
+            uptime_hours=uptime_hours,
+        )
     
     def _format_source(self, source: str) -> str:
         """格式化来源（支持复合来源如 swing_5+volume_node）"""
@@ -210,96 +417,58 @@ class NotificationManager:
         
         resistance_levels = resistance_levels or []
         support_levels = support_levels or []
-        
-        # 账户信息
+
+        def get_progress_bar(percent: float) -> str:
+            percent = max(0.0, min(percent, 1.0))
+            length = 12
+            filled = int(length * percent)
+            bar = "▬" * filled + "●" + "▬" * (length - filled)
+            return f"[{bar}]"
+
         total_balance = account.get("total_balance", 0)
         available = account.get("available", 0)
-        
-        # 网格配置
-        max_position = grid_config.get("max_position", 0)
         leverage = grid_config.get("leverage", 0)
         num_grids = grid_config.get("num_grids", 0)
-        
-        text = f"""
-🚀 <b>策略已启动</b>
+        sl_pct = grid_config.get("sl_pct", 0)
+        grid_min = grid_config.get("grid_min", 0) or 0
+        grid_max = grid_config.get("grid_max", 0) or 0
+        grid_floor = grid_config.get("grid_floor", 0) or 0
 
-📊 <b>{symbol}</b> | {exchange.upper()}
-├ 当前价格: ${current_price:,.2f}
-├ 账户余额: {total_balance:,.2f} USDT
-├ 可用余额: {available:,.2f} USDT
-└ 杠杆: {leverage}x
-"""
-        
-        # 关键价位 - 阻力位（按价格降序）
-        if resistance_levels:
-            resistance_sorted = sorted(resistance_levels, key=lambda x: -x.get("price", 0))
-            text += f"\n🔴 <b>阻力位</b> ({len(resistance_sorted)}个)\n"
-            for i, r in enumerate(resistance_sorted, 1):
-                r_price = r.get("price", 0)
-                strength = r.get("strength", 0)
-                pct = ((r_price - current_price) / current_price * 100) if current_price > 0 else 0
-                source = self._format_source(r.get("source", ""))
-                tf = self._format_timeframe(r.get("timeframe", ""))
-                text += f"├ R{i}: ${r_price:,.2f} (+{pct:.1f}%) [{source}] {tf} 💪{strength:.0f}\n"
-        
-        # 关键价位 - 支撑位（按价格降序）
-        if support_levels:
-            support_sorted = sorted(support_levels, key=lambda x: -x.get("price", 0))
-            text += f"\n🟢 <b>支撑位</b> ({len(support_sorted)}个)\n"
-            for i, s in enumerate(support_sorted, 1):
-                s_price = s.get("price", 0)
-                strength = s.get("strength", 0)
-                pct = ((current_price - s_price) / current_price * 100) if current_price > 0 else 0
-                source = self._format_source(s.get("source", ""))
-                tf = self._format_timeframe(s.get("timeframe", ""))
-                text += f"├ S{i}: ${s_price:,.2f} (-{pct:.1f}%) [{source}] {tf} 💪{strength:.0f}\n"
-        
-        # 挂单信息
+        pos_value = position.get("value", 0)
+        avg_price = position.get("avg_price", 0)
+        unrealized_pnl = position.get("unrealized_pnl", 0)
+        pnl_pct = position.get("pnl_pct", 0) * 100 if position.get("pnl_pct", 0) else 0
+
         buy_orders = [o for o in pending_orders if o.get("side") == "buy"]
         sell_orders = [o for o in pending_orders if o.get("side") == "sell"]
-        
-        if buy_orders:
-            total_buy = sum(o.get("amount", 0) for o in buy_orders)
-            text += f"\n📋 <b>买单挂单</b> ({len(buy_orders)}个, 共 {total_buy:,.0f} USDT)\n"
-            # 按价格降序排列
-            buy_orders_sorted = sorted(buy_orders, key=lambda x: -x.get("price", 0))
-            for i, order in enumerate(buy_orders_sorted, 1):
-                price = order.get("price", 0)
-                amount = order.get("amount", 0)
-                pct = ((price - current_price) / current_price * 100) if current_price > 0 else 0
-                text += f"├ #{i}: ${price:,.2f} ({pct:+.1f}%) | {amount:,.0f} USDT\n"
-        
-        if sell_orders:
-            total_sell = sum(o.get("amount", 0) for o in sell_orders)
-            text += f"\n📋 <b>卖单挂单</b> ({len(sell_orders)}个, 共 {total_sell:,.0f} USDT)\n"
-            sell_orders_sorted = sorted(sell_orders, key=lambda x: x.get("price", 0))
-            for i, order in enumerate(sell_orders_sorted, 1):
-                price = order.get("price", 0)
-                amount = order.get("amount", 0)
-                pct = ((price - current_price) / current_price * 100) if current_price > 0 else 0
-                text += f"├ #{i}: ${price:,.2f} ({pct:+.1f}%) | {amount:,.0f} USDT\n"
-        
-        # 持仓信息
-        pos_value = position.get("value", 0)
-        if pos_value > 0:
-            avg_price = position.get("avg_price", 0)
-            unrealized_pnl = position.get("unrealized_pnl", 0)
-            pnl_pct = position.get("pnl_pct", 0)
-            
-            pnl_emoji = "📈" if unrealized_pnl >= 0 else "📉"
-            pnl_sign = "+" if unrealized_pnl >= 0 else ""
-            
-            text += f"""
-💼 <b>当前持仓</b>
-├ 持仓价值: {pos_value:,.2f} USDT
-├ 均价: ${avg_price:,.2f}
-└ 盈亏: {pnl_emoji} {pnl_sign}{unrealized_pnl:,.2f} USDT ({pnl_sign}{pnl_pct:.2%})
-"""
-        else:
-            text += "\n💼 当前无持仓\n"
-        
-        text += f"\n⚙️ 网格配置: {num_grids}档 | 最大仓位 {max_position:,.0f} USDT"
-        
+        buy_cnt = len(buy_orders)
+        sell_cnt = len(sell_orders)
+        buy_total = sum(o.get("amount", 0) for o in buy_orders)
+        sell_total = sum(o.get("amount", 0) for o in sell_orders)
+        next_buy = max((o.get("price", 0) for o in buy_orders), default=0)
+        next_sell = min((o.get("price", 0) for o in sell_orders), default=0)
+
+        pos_percent = 0.5
+        if grid_min > 0 and grid_max > grid_min and current_price > 0:
+            pos_percent = (current_price - grid_min) / (grid_max - grid_min)
+        pos_bar = get_progress_bar(pos_percent)
+
+        text = (
+            f"🚀 <b>策略启动: {symbol} ({exchange.upper()})</b>\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"💰 <b>资金</b>: <code>{total_balance:,.2f}</code> (可用: <code>{available:,.2f}</code>)\n"
+            f"⚙️ <b>配置</b>: <code>{leverage}x</code> | <code>{num_grids}档</code> | <code>{sl_pct:.1f}% 止损</code>\n"
+            f"🌐 <b>区间</b>: <code>{grid_min:,.2f}</code> - <code>{grid_max:,.2f}</code>\n"
+            f"📍 <b>位置</b>: <code>{pos_bar}</code>\n\n"
+            f"💼 <b>持仓</b>: <code>{pos_value:,.2f} USDT</code> (@ <code>{avg_price:,.2f}</code>)\n"
+            f"📈 <b>盈亏</b>: <code>{unrealized_pnl:+,.2f} ({pnl_pct:+.2f}%)</code>\n\n"
+            f"🔔 <b>网格状态</b>:\n"
+            f"🟢 买单: <code>{buy_cnt}个</code> (<code>{buy_total:,.0f} USDT</code>) | 最近: <code>${next_buy:,.2f}</code>\n"
+            f"🔴 卖单: <code>{sell_cnt}个</code> (<code>{sell_total:,.0f} USDT</code>) | 最近: <code>${next_sell:,.2f}</code>\n"
+            f"🛡 <b>核心防御</b>: <code>${grid_floor:,.2f}</code> (底线)\n"
+            f"━━━━━━━━━━━━━━"
+        )
+
         await self._send_message(text.strip())
     
     async def notify_shutdown(
