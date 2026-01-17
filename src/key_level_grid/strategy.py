@@ -30,6 +30,7 @@ from key_level_grid.position import (
     GridConfig, StopLossConfig, TakeProfitConfig, ResistanceConfig, ActiveFill,
     PositionConfig, KeyLevelPositionManager
 )
+from key_level_grid.strategy.display import DisplayDataGenerator
 
 
 @dataclass
@@ -135,6 +136,10 @@ class KeyLevelGridStrategy:
             exchange=config.exchange,
         )
         
+        # 🆕 V3.0: LevelCalculator (MTF 水位生成)
+        self._level_calculator = None
+        self._v3_config: Dict = {}  # 存储原始配置用于 V3.0
+        
         # Telegram 通知（先初始化，供执行器挂钩使用）
         self._notifier: Optional["NotificationManager"] = None
         self._tg_bot = None  # Telegram Bot 实例
@@ -201,6 +206,12 @@ class KeyLevelGridStrategy:
         trade_store_file = os.path.join(trade_store_dir, f"{config.symbol.lower()}_trades.jsonl")
         self.trade_store = TradeStore(trade_store_file)
         
+        # 初始化展示数据生成器
+        self._display_generator = DisplayDataGenerator(
+            position_manager=self.position_manager,
+            config=self.config,
+        )
+        
         # 初始化 Telegram 通知
         self._init_notifier()
     
@@ -246,6 +257,108 @@ class KeyLevelGridStrategy:
         
         if self._executor and self._notifier:
             self._executor.set_notifier(self._notifier)
+    
+    # ============================================
+    # 🆕 V3.0 LevelCalculator 集成
+    # ============================================
+    
+    def _is_v3_enabled(self) -> bool:
+        """检查是否启用 V3.0 水位生成"""
+        return self._v3_config.get("level_generation", {}).get("enabled", False)
+    
+    @property
+    def level_calculator(self):
+        """
+        V3.0: 延迟初始化 LevelCalculator
+        
+        Returns:
+            LevelCalculator 实例
+        """
+        if self._level_calculator is None and self._is_v3_enabled():
+            from key_level_grid.level_calculator import LevelCalculator
+            self._level_calculator = LevelCalculator(self._v3_config)
+            self.logger.info("🆕 [V3.0] LevelCalculator 已初始化")
+        return self._level_calculator
+    
+    def _calculate_levels_v3(
+        self,
+        klines_dict: Dict[str, List],
+        current_price: float,
+    ) -> tuple:
+        """
+        使用 V3.0 LevelCalculator 计算支撑/阻力位
+        
+        Args:
+            klines_dict: 多周期 K 线数据
+            current_price: 当前价格
+        
+        Returns:
+            (supports, resistances) 元组
+        """
+        from key_level_grid.analysis.resistance import PriceLevel
+        from key_level_grid.core.types import LevelType
+        
+        calculator = self.level_calculator
+        if calculator is None:
+            self.logger.warning("[V3.0] LevelCalculator 未初始化，回退到 V2.0")
+            return None, None
+        
+        # 转换 K 线格式
+        klines_by_tf = {}
+        for tf, klines in klines_dict.items():
+            klines_by_tf[tf] = [
+                {
+                    "timestamp": getattr(k, "timestamp", 0),
+                    "open": getattr(k, "open", 0),
+                    "high": getattr(k, "high", 0),
+                    "low": getattr(k, "low", 0),
+                    "close": getattr(k, "close", 0),
+                    "volume": getattr(k, "volume", 0),
+                }
+                for k in klines
+            ]
+        
+        # 生成支撑位
+        support_levels = calculator.generate_target_levels(
+            klines_by_tf=klines_by_tf,
+            current_price=current_price,
+            role="support",
+            max_levels=20,
+        )
+        
+        # 生成阻力位
+        resistance_levels = calculator.generate_target_levels(
+            klines_by_tf=klines_by_tf,
+            current_price=current_price,
+            role="resistance",
+            max_levels=20,
+        )
+        
+        # 转换为 PriceLevel 格式
+        supports = []
+        if support_levels:
+            for price, score in support_levels:
+                supports.append(PriceLevel(
+                    price=price,
+                    level_type=LevelType.SWING_LOW,  # 支撑位
+                    strength=score.final_score,
+                    source="+".join(score.source_timeframes) if score.source_timeframes else "v3",
+                    timeframe="multi" if len(score.source_timeframes) > 1 else (score.source_timeframes[0] if score.source_timeframes else "4h"),
+                ))
+        
+        resistances = []
+        if resistance_levels:
+            for price, score in resistance_levels:
+                resistances.append(PriceLevel(
+                    price=price,
+                    level_type=LevelType.SWING_HIGH,  # 阻力位
+                    strength=score.final_score,
+                    source="+".join(score.source_timeframes) if score.source_timeframes else "v3",
+                    timeframe="multi" if len(score.source_timeframes) > 1 else (score.source_timeframes[0] if score.source_timeframes else "4h"),
+                ))
+        
+        self.logger.info(f"[V3.0] 生成水位: {len(supports)} 支撑, {len(resistances)} 阻力")
+        return supports, resistances
     
     def _init_notifier(self) -> None:
         """初始化 Telegram 通知器"""
@@ -474,6 +587,28 @@ class KeyLevelGridStrategy:
         
         instance = cls(config)
         instance._config_path = config_path
+        
+        # 🆕 V3.0: 存储原始配置用于 LevelCalculator
+        level_gen_config = grid_raw.get("level_generation", {})
+        instance._v3_config = {
+            "level_generation": level_gen_config,
+            "resistance": resistance_raw,
+            "grid": grid_raw,
+        }
+        
+        # 检查是否启用 V3.0
+        v3_enabled = level_gen_config.get("enabled", False)
+        logger.info(f"[V3.0] level_generation 配置: enabled={v3_enabled}")
+        if v3_enabled:
+            logger.info("🆕 [V3.0] LevelCalculator 已启用")
+            # 打印关键配置
+            scoring = level_gen_config.get("scoring", {})
+            manual_boundary = level_gen_config.get("manual_boundary", {})
+            logger.info(f"[V3.0] min_score_threshold={scoring.get('min_score_threshold', 'N/A')}")
+            logger.info(f"[V3.0] manual_boundary: enabled={manual_boundary.get('enabled')}, upper={manual_boundary.get('upper_price')}, lower={manual_boundary.get('lower_price')}")
+        else:
+            logger.info("[V3.0] LevelCalculator 未启用，使用旧版 ResistanceCalculator")
+        
         return instance
     
     async def start(self) -> None:
@@ -760,14 +895,26 @@ class KeyLevelGridStrategy:
                 return False
 
             klines_dict = self._build_klines_by_timeframe(klines)
-            resistance_calc = self.position_manager.resistance_calc
-
-            resistances = resistance_calc.calculate_resistance_levels(
-                current_price, klines, "long", klines_by_timeframe=klines_dict
-            )
-            supports = resistance_calc.calculate_support_levels(
-                current_price, klines, klines_by_timeframe=klines_dict
-            )
+            
+            # 🆕 V3.0: 检查是否启用新版水位生成
+            if self._is_v3_enabled():
+                self.logger.info("🆕 [V3.0] 使用 LevelCalculator 生成水位")
+                supports, resistances = self._calculate_levels_v3(klines_dict, current_price)
+                if not supports:
+                    self.logger.warning("[V3.0] 未生成有效支撑位，回退到 V2.0")
+                    supports, resistances = None, None
+            else:
+                supports, resistances = None, None
+            
+            # V2.0 回退
+            if supports is None:
+                resistance_calc = self.position_manager.resistance_calc
+                resistances = resistance_calc.calculate_resistance_levels(
+                    current_price, klines, "long", klines_by_timeframe=klines_dict
+                )
+                supports = resistance_calc.calculate_support_levels(
+                    current_price, klines, klines_by_timeframe=klines_dict
+                )
 
             if not supports:
                 self.logger.warning("未找到有效支撑位，放弃重置")
@@ -1239,6 +1386,8 @@ class KeyLevelGridStrategy:
                 qty = float(trade.get("amount", 0) or 0)
                 price = float(trade.get("price", 0) or 0)
                 cost = float(trade.get("cost", 0) or 0)
+                order_id = str(trade.get("order", "") or trade.get("orderId", "") or "")
+                trade_id = str(trade.get("id", "") or "")
                 if cost <= 0 and qty > 0 and price > 0:
                     cost = qty * price
 
@@ -1277,7 +1426,7 @@ class KeyLevelGridStrategy:
                     self.trade_store.append_trade({
                         "timestamp": int(time.time()),
                         "order_id": order_id,
-                        "trade_id": trade.get("id"),
+                        "trade_id": trade_id,
                         "side": "buy",
                         "price": price,
                         "qty": qty,
@@ -1305,7 +1454,8 @@ class KeyLevelGridStrategy:
                     # 写入本地账本
                     self.trade_store.append_trade({
                         "timestamp": int(time.time()),
-                        "trade_id": trade.get("id"),
+                        "order_id": order_id,
+                        "trade_id": trade_id,
                         "side": "sell",
                         "price": price,
                         "qty": qty,
@@ -2140,14 +2290,26 @@ class KeyLevelGridStrategy:
         
         # 计算支撑位和阻力位（使用多周期融合）
         klines_dict = self._build_klines_by_timeframe(klines)
-        resistance_calc = self.position_manager.resistance_calc
         
-        resistances = resistance_calc.calculate_resistance_levels(
-            current_price, klines, "long", klines_by_timeframe=klines_dict
-        )
-        supports = resistance_calc.calculate_support_levels(
-            current_price, klines, klines_by_timeframe=klines_dict
-        )
+        # 🆕 V3.0: 检查是否启用新版水位生成
+        if self._is_v3_enabled():
+            self.logger.info("🆕 [V3.0] 使用 LevelCalculator 生成水位")
+            supports, resistances = self._calculate_levels_v3(klines_dict, current_price)
+            if not supports:
+                self.logger.warning("[V3.0] 未生成有效支撑位，回退到 V2.0")
+                supports, resistances = None, None
+        else:
+            supports, resistances = None, None
+        
+        # V2.0 回退
+        if supports is None:
+            resistance_calc = self.position_manager.resistance_calc
+            resistances = resistance_calc.calculate_resistance_levels(
+                current_price, klines, "long", klines_by_timeframe=klines_dict
+            )
+            supports = resistance_calc.calculate_support_levels(
+                current_price, klines, klines_by_timeframe=klines_dict
+            )
         
         if not supports:
             self.logger.warning("没有找到有效支撑位，暂不创建网格")
@@ -2568,521 +2730,31 @@ class KeyLevelGridStrategy:
     
     def get_status(self) -> Dict[str, Any]:
         """获取策略状态"""
-        position_summary = self.position_manager.get_position_summary(
-            self._current_state.close if self._current_state else 0
+        # 委托给 DisplayDataGenerator
+        return self._display_generator.get_status(
+            current_state=self._current_state,
+            running=self._running,
+            pending_signal=self._pending_signal,
+            kline_feed=self.kline_feed,
         )
-        
-        return {
-            "running": self._running,
-            "symbol": self.config.symbol,
-            "current_price": self._current_state.close if self._current_state else None,
-            "indicators": {
-                "macd": self._current_state.macd if self._current_state else None,
-                "rsi": self._current_state.rsi if self._current_state else None,
-                "atr": self._current_state.atr if self._current_state else None,
-                "adx": self._current_state.adx if self._current_state else None,
-            },
-            "position": position_summary,
-            "pending_signal": self._pending_signal.to_dict() if self._pending_signal else None,
-            "kline_stats": self.kline_feed.get_stats(),
-        }
     
     def get_display_data(self) -> Dict[str, Any]:
-        """获取显示面板数据"""
-        state = self._current_state
-        pos = self.position_manager.state
-        grid_config = self.position_manager.grid_config
-        resistance_config = self.position_manager.resistance_config
-        levels_from_grid = False
-        
-        # 周期信息
-        kline_config = self.config.kline_config
-        primary_tf = kline_config.primary_timeframe.value
-        aux_tfs = [tf.value for tf in kline_config.auxiliary_timeframes]
-        
-        data = {
-            "symbol": self.config.symbol,
-            "timestamp": state.timestamp if state else None,
-            "timeframe": {
-                "primary": primary_tf,
-                "auxiliary": aux_tfs,
-                "display": f"{primary_tf} + {' + '.join(aux_tfs)}" if aux_tfs else primary_tf,
-            },
-        }
-        
-        # 价格数据
-        if state:
-            data["price"] = {
-                "current": state.close,
-                "open": state.open,
-                "high": state.high,
-                "low": state.low,
-            }
-            
-            # 技术指标
-            data["indicators"] = {
-                "macd": state.macd,
-                "macd_signal": state.macd_signal,
-                "macd_histogram": state.macd_histogram,
-                "rsi": state.rsi,
-                "atr": state.atr,
-                "adx": state.adx,
-                "volume_ratio": state.volume_ratio,
-            }
-            
-            # 实时计算阻力位和支撑位 (多周期融合)
-            if not (pos and (pos.support_levels_state or pos.resistance_levels_state)):
-                klines = self.kline_feed.get_cached_klines(
-                    self.config.kline_config.primary_timeframe
-                )
-                
-                if len(klines) >= 50:
-                    # 构建多周期 K 线字典
-                    klines_dict = self._build_klines_by_timeframe(klines)
-                    resistance_calc = self.position_manager.resistance_calc
-                    
-                    # 阻力位始终是当前价格上方，支撑位始终是当前价格下方
-                    resistances = resistance_calc.calculate_resistance_levels(
-                        state.close, klines, "long", klines_by_timeframe=klines_dict
-                    )
-                    supports = resistance_calc.calculate_support_levels(
-                        state.close, klines, klines_by_timeframe=klines_dict
-                    )
-                    
-                    data["resistance_levels"] = [
-                        {
-                            "price": r.price, 
-                            "type": r.level_type.value, 
-                            "strength": r.strength, 
-                            "timeframe": getattr(r, 'timeframe', '4h'),
-                            "source": getattr(r, 'source', ''),
-                            "description": getattr(r, 'description', ''),
-                            "fill_counter": 0,
-                        }
-                        for r in resistances[:10]
-                    ]
-                    data["support_levels"] = [
-                        {
-                            "price": s.price, 
-                            "type": s.level_type.value, 
-                            "strength": s.strength, 
-                            "timeframe": getattr(s, 'timeframe', '4h'),
-                            "source": getattr(s, 'source', ''),
-                            "description": getattr(s, 'description', ''),
-                            "fill_counter": 0,
-                        }
-                        for s in supports[:10]
-                    ]
-        
-        # 仓位信息
-        if pos:
-            data["position"] = {
-                "direction": pos.direction,
-                "entry_price": pos.entry_price,
-                "size_usdt": pos.position_usdt,
-                "unrealized_pnl": pos.unrealized_pnl,
-            }
-            if pos.stop_loss:
-                data["stop_loss"] = {
-                    "price": pos.stop_loss.stop_price,
-                    "type": pos.stop_loss.stop_type.value,
-                }
-            if pos.take_profit_plan:
-                data["take_profit"] = [
-                    {"price": tp.price, "pct": tp.close_pct, "rr": tp.rr_multiple}
-                    for tp in pos.take_profit_plan.levels if tp.close_pct > 0
-                ]
-            
-            # 使用网格固定水位覆盖（确保与挂单一致）
-            support_meta = {
-                float(s.get("price", 0) if isinstance(s, dict) else s.price): s
-                for s in (pos.support_levels or [])
-            }
-            resistance_meta = {
-                float(r.get("price", 0) if isinstance(r, dict) else r.price): r
-                for r in (pos.resistance_levels or [])
-            }
-
-            if pos.support_levels_state or pos.resistance_levels_state:
-                levels_from_grid = True
-                data["support_levels"] = [
-                    {
-                        "price": lvl.price,
-                        "type": "support",
-                        "strength": support_meta.get(lvl.price, {}).get("strength", 0),
-                        "timeframe": support_meta.get(lvl.price, {}).get("timeframe", "4h"),
-                        "source": support_meta.get(lvl.price, {}).get("source", ""),
-                        "description": support_meta.get(lvl.price, {}).get("description", ""),
-                        "fill_counter": int(getattr(lvl, "fill_counter", 0) or 0),
-                    }
-                    for lvl in pos.support_levels_state
-                ]
-                data["resistance_levels"] = [
-                    {
-                        "price": lvl.price,
-                        "type": "resistance",
-                        "strength": resistance_meta.get(lvl.price, {}).get("strength", 0),
-                        "timeframe": resistance_meta.get(lvl.price, {}).get("timeframe", "4h"),
-                        "source": resistance_meta.get(lvl.price, {}).get("source", ""),
-                        "description": resistance_meta.get(lvl.price, {}).get("description", ""),
-                        "fill_counter": int(getattr(lvl, "fill_counter", 0) or 0),
-                    }
-                    for lvl in pos.resistance_levels_state
-                ]
-            else:
-                data["resistance_levels"] = [
-                    {
-                        "price": r.get("price", 0) if isinstance(r, dict) else r.price,
-                        "type": r.get("type", "resistance") if isinstance(r, dict) else getattr(r, 'level_type', 'resistance'),
-                        "strength": r.get("strength", 0) if isinstance(r, dict) else r.strength,
-                        "timeframe": r.get("timeframe", "4h") if isinstance(r, dict) else getattr(r, 'timeframe', '4h'),
-                        "source": r.get("source", "") if isinstance(r, dict) else getattr(r, 'source', ''),
-                        "description": r.get("description", "") if isinstance(r, dict) else getattr(r, 'description', ''),
-                        "fill_counter": r.get("fill_counter", 0) if isinstance(r, dict) else int(getattr(r, "fill_counter", 0) or 0),
-                    }
-                    for r in pos.resistance_levels[:10]
-                ]
-                data["support_levels"] = [
-                    {
-                        "price": s.get("price", 0) if isinstance(s, dict) else s.price,
-                        "type": s.get("type", "support") if isinstance(s, dict) else getattr(s, 'level_type', 'support'),
-                        "strength": s.get("strength", 0) if isinstance(s, dict) else s.strength,
-                        "timeframe": s.get("timeframe", "4h") if isinstance(s, dict) else getattr(s, 'timeframe', '4h'),
-                        "source": s.get("source", "") if isinstance(s, dict) else getattr(s, 'source', ''),
-                        "description": s.get("description", "") if isinstance(s, dict) else getattr(s, 'description', ''),
-                        "fill_counter": s.get("fill_counter", 0) if isinstance(s, dict) else int(getattr(s, "fill_counter", 0) or 0),
-                    }
-                    for s in pos.support_levels[:10]
-                ]
-
-        # 统一应用强度阈值与手动区间过滤
-        min_strength = getattr(resistance_config, "min_strength", 0) or 0
-        lower = grid_config.manual_lower if grid_config.range_mode == "manual" else 0
-        upper = grid_config.manual_upper if grid_config.range_mode == "manual" else 0
-        if lower <= 0 or upper <= 0:
-            lower, upper = 0, 0
-
-        def _filter_levels(levels: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-            filtered = []
-            for lvl in levels or []:
-                price = float(lvl.get("price", 0) or 0)
-                strength = float(lvl.get("strength", 0) or 0)
-                if min_strength and strength < min_strength:
-                    continue
-                if lower and price < lower:
-                    continue
-                if upper and price > upper:
-                    continue
-                filtered.append(lvl)
-            return filtered
-
-        if not levels_from_grid:
-            if "resistance_levels" in data:
-                data["resistance_levels"] = _filter_levels(data.get("resistance_levels", []))
-            if "support_levels" in data:
-                data["support_levels"] = _filter_levels(data.get("support_levels", []))
-        
-        # 交易历史 - 改为基于 Inventory 的混合模式
-        data["active_inventory"] = [f.to_dict() for f in pos.active_inventory] if pos else []
-        data["settled_inventory"] = [f.to_dict() for f in pos.settled_inventory] if pos else []
-        
-        # 账户信息 (V1.0: 模拟数据 / V1.1: 真实数据)
-        data["account"] = self._get_account_display_data()
-        
-        # 持仓信息 (整合到新的结构)
-        data["position"] = self._get_position_display_data(state)
-        
-        # 当前挂单 - 传入已计算的支撑/阻力位数据
-        data["pending_orders"] = self._get_pending_orders_display(
-            state, 
-            data.get("support_levels", []),
-            data.get("resistance_levels", [])
+        """获取显示面板数据 - 委托给 DisplayDataGenerator"""
+        # 更新展示数据生成器的上下文
+        self._display_generator.update_context(
+            account_balance=self._account_balance,
+            gate_position=self._gate_position,
+            gate_open_orders=self._gate_open_orders,
+            contract_size=self._contract_size,
         )
         
-        return data
-    
-    def _get_account_display_data(self) -> Dict[str, Any]:
-        """获取账户信息显示数据"""
-        pos_config = self.position_manager.position_config
-        grid_config = self.position_manager.grid_config
-        
-        # 从仓位管理器获取网格状态
-        grid_state = self.position_manager.state
-        total_invested = grid_state.position_usdt if grid_state else 0
-        
-        # 账户余额: 优先使用真实余额，否则使用配置
-        if self._account_balance.get("total", 0) > 0:
-            # 使用从交易所获取的真实余额
-            total_balance = self._account_balance["total"]
-            available = self._account_balance["free"]
-            frozen = self._account_balance["used"]
-        else:
-            # 回退到配置值
-            total_balance = pos_config.total_capital
-            available = pos_config.total_capital - total_invested
-            frozen = total_invested
-        
-        # 计算最大仓位 (基于真实余额计算)
-        max_position = total_balance * pos_config.max_leverage * pos_config.max_capital_usage
-        
-        # 计算网格底线和止损价格
-        grid_floor = 0
-        stop_loss_price = 0
-        avg_entry_price = 0
-        expected_avg_price = 0  # 预期/实际平均买入价格
-        
-        if grid_state and grid_state.grid_floor > 0:
-            grid_floor = grid_state.grid_floor
-            stop_loss_price = grid_floor
-            avg_entry_price = grid_state.avg_entry_price
-            
-            # 若已有持仓，优先使用实际均价
-            if grid_state.total_position_usdt > 0 and avg_entry_price > 0:
-                expected_avg_price = avg_entry_price
-            # 否则基于挂单价格估算均价
-            elif grid_state.buy_orders:
-                prices = [o.price for o in grid_state.buy_orders if o.price > 0]
-                expected_avg_price = sum(prices) / len(prices) if prices else 0
-        
-        # 预计最大亏损 = 最大仓位 × (预期均价 - 止损价) / 预期均价
-        max_loss = 0.0
-        max_loss_pct = 0.0
-        if expected_avg_price > 0 and stop_loss_price > 0:
-            max_loss_pct = ((expected_avg_price - stop_loss_price) / expected_avg_price) * 100
-            max_loss = max_position * (max_loss_pct / 100)
-        
-        return {
-            "total_balance": total_balance,
-            "available": available,
-            "frozen": frozen,
-            "grid_config": {
-                "max_position": max_position,
-                "max_leverage": pos_config.max_leverage,
-                "max_capital_usage": pos_config.max_capital_usage,
-                "grid_floor": grid_floor,
-                "stop_loss_price": stop_loss_price,
-                "expected_avg_price": expected_avg_price,  # 预期/实际均价
-                "max_loss": max_loss,
-                "max_loss_pct": max_loss_pct,
-                "floor_buffer": grid_config.floor_buffer,
-            },
-            "grid_status": {
-                "total_invested": total_invested,
-                "pending_orders": 0,
-                "filled_orders": 0,
-            }
-        }
-    
-    def _get_position_display_data(self, state: Optional[KeyLevelGridState]) -> Dict[str, Any]:
-        """获取持仓信息显示数据 - 优先使用 Gate 真实持仓"""
-        current_price = state.close if state else 0
-        
-        # 优先使用 Gate 真实持仓数据
-        if self._gate_position and self._gate_position.get("contracts", 0) > 0:
-            gate_pos = self._gate_position
-            notional = gate_pos.get("notional", 0)
-            entry_price = gate_pos.get("entry_price", 0)
-            contracts = gate_pos.get("contracts", 0)
-            unrealized_pnl = gate_pos.get("unrealized_pnl", 0)
-            
-            # 如果 notional 为 0，尝试从 contracts 和 entry_price 计算
-            if notional == 0 and entry_price > 0:
-                notional = contracts * entry_price
-            
-            # 网格底线 (从本地状态获取)
-            grid_floor = 0
-            pos = self.position_manager.state
-            if pos and pos.support_levels:
-                prices = [s.get('price', 0) if isinstance(s, dict) else s.price 
-                          for s in pos.support_levels if (s.get('price', 0) if isinstance(s, dict) else s.price) > 0]
-                if prices:
-                    min_support = min(prices)
-                    grid_floor = min_support * 0.995
-            
-            return {
-                "side": "long",
-                "qty": contracts,
-                "avg_entry_price": entry_price,
-                "value": notional,
-                "unrealized_pnl": unrealized_pnl,
-                "grid_floor": grid_floor,
-            }
-        
-        # 回退：使用本地状态
-        pos = self.position_manager.state
-        if not pos or pos.position_usdt <= 0:
-            return {}
-        
-        # 计算盈亏
-        if pos.entry_price > 0 and current_price > 0:
-            if pos.direction == "long":
-                pnl = (current_price - pos.entry_price) * (pos.position_usdt / pos.entry_price)
-            else:
-                pnl = (pos.entry_price - current_price) * (pos.position_usdt / pos.entry_price)
-        else:
-            pnl = 0
-        
-        # 网格底线 (最低支撑位 × 0.995)
-        grid_floor = 0
-        if pos.support_levels:
-            prices = [s.get('price', 0) if isinstance(s, dict) else s.price 
-                      for s in pos.support_levels if (s.get('price', 0) if isinstance(s, dict) else s.price) > 0]
-            if prices:
-                min_support = min(prices)
-                grid_floor = min_support * 0.995
-        
-        return {
-            "side": pos.direction,
-            "qty": pos.position_usdt / pos.entry_price if pos.entry_price > 0 else 0,
-            "avg_entry_price": pos.entry_price,
-            "value": pos.position_usdt,
-            "unrealized_pnl": pnl,
-            "grid_floor": grid_floor,
-        }
-    
-    def _get_pending_orders_display(
-        self, 
-        state: Optional[KeyLevelGridState],
-        support_levels: List[Dict] = None,
-        resistance_levels: List[Dict] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        获取当前挂单显示数据 (V2.3 简化版)
-        
-        优先使用 Gate 真实挂单；若无真实挂单，则使用网格状态/计划挂单
-        """
-        if not state:
-            return []
-        
-        # 1) 实盘模式且有同步到 Gate 挂单时，展示真实挂单
-        # Gate 挂单的 amount 已在 _update_gate_orders 中正确计算为 USDT 价值
-        if not self.config.dry_run and self._gate_open_orders:
-            orders = []
-            for o in self._gate_open_orders:
-                orders.append({
-                    "side": o.get("side", ""),
-                    "price": o.get("price", 0),
-                    "amount": o.get("amount", 0),  # 已计算为 USDT 价值
-                    "contracts": o.get("base_amount", 0),  # 真实币数量（用于展示）
-                    "status": o.get("status", "pending"),
-                    "source": "Gate",
-                    "strength": 0,
-                    "order_id": o.get("id", ""),
-                })
-            buy_orders = sorted([o for o in orders if o.get("side") == "buy"], key=lambda x: x["price"], reverse=True)
-            sell_orders = sorted([o for o in orders if o.get("side") == "sell"], key=lambda x: x["price"], reverse=True)
-            return sell_orders + buy_orders
-        
-        # 2) 回退：使用本地网格状态
-        orders = []
-        pos_state = self.position_manager.state
-        if pos_state:
-            # 优先使用新水位状态机展示
-            if pos_state.support_levels_state or pos_state.resistance_levels_state:
-                contract_size = float(getattr(pos_state, "contract_size", 0) or 0) or float(getattr(self, "_contract_size", 0) or 1.0)
-                base_btc = float(getattr(pos_state, "base_amount_per_grid", 0) or 0)
-                buy_orders = [
-                    {
-                        "side": "buy",
-                        "price": lvl.price,
-                        "amount": base_btc * lvl.price,
-                        "contracts": base_btc,
-                        "status": "pending",
-                        "source": "support",
-                        "strength": 0,
-                    }
-                    for lvl in sorted(pos_state.support_levels_state, key=lambda x: x.price, reverse=True)
-                ]
-                sell_orders = [
-                    {
-                        "side": "sell",
-                        "price": lvl.price,
-                        "amount": lvl.target_qty * lvl.price,
-                        "contracts": lvl.target_qty,
-                        "status": "pending",
-                        "source": "resistance",
-                        "strength": 0,
-                    }
-                    for lvl in sorted(pos_state.resistance_levels_state, key=lambda x: x.price, reverse=True)
-                    if lvl.target_qty > 0
-                ]
-                return buy_orders + sell_orders
-
-            # 兼容旧网格状态
-            buy_orders = [
-                {
-                    "side": "buy",
-                    "price": o.price,
-                    "amount": o.amount_usdt,
-                    "status": "filled" if o.is_filled else "pending",
-                    "source": o.source,
-                    "strength": o.strength,
-                }
-                for o in sorted(pos_state.buy_orders, key=lambda x: x.price, reverse=True)
-            ]
-            sell_orders = [
-                {
-                    "side": "sell",
-                    "price": o.price,
-                    "amount": o.amount_usdt,
-                    "status": "filled" if o.is_filled else "pending",
-                    "source": o.source,
-                    "strength": o.strength,
-                }
-                for o in sorted(pos_state.sell_orders, key=lambda x: x.price, reverse=True)
-            ]
-            return buy_orders + sell_orders
-
-        # 3) 若尚未建网格，则回退使用当前计算的支撑/阻力位生成初始挂单
-        config = self.position_manager.position_config
-        support_levels = support_levels or []
-        resistance_levels = resistance_levels or []
-        
-        min_strength = getattr(self.position_manager.resistance_config, 'min_strength', 80)
-        strong_supports = [
-            s for s in support_levels 
-            if s.get("strength", 0) >= min_strength and s.get("price", 0) < state.close
-        ]
-        strong_resistances = [
-            r for r in resistance_levels 
-            if r.get("strength", 0) >= min_strength and r.get("price", 0) > state.close
-        ]
-        
-        strong_supports.sort(key=lambda x: -x.get("price", 0))
-        strong_resistances.sort(key=lambda x: x.get("price", 0))
-        
-        max_grids = getattr(self.position_manager.grid_config, 'max_grids', 10)
-        strong_supports = strong_supports[:max_grids]
-        strong_resistances = strong_resistances[:max_grids]
-        
-        max_position = config.total_capital * config.max_leverage * config.max_capital_usage
-        if not strong_supports:
-            return []
-        
-        per_grid_usdt = max_position / len(strong_supports)
-        for support in strong_supports:
-            orders.append({
-                "side": "buy",
-                "price": support.get("price", 0),
-                "amount": per_grid_usdt,
-                "status": "pending",
-                "source": support.get("source", "support"),
-                "strength": support.get("strength", 0),
-            })
-        
-        if strong_resistances:
-            per_tp_usdt = max_position / len(strong_resistances)
-            for resistance in strong_resistances:
-                orders.append({
-                    "side": "sell",
-                    "price": resistance.get("price", 0),
-                    "amount": per_tp_usdt,
-                    "status": "pending",
-                    "source": resistance.get("source", "resistance"),
-                    "strength": resistance.get("strength", 0),
-                })
-        
-        return orders
+        # 委托给 DisplayDataGenerator
+        return self._display_generator.get_display_data(
+            current_state=self._current_state,
+            kline_feed=self.kline_feed,
+            build_klines_by_timeframe_func=self._build_klines_by_timeframe,
+            dry_run=self.config.dry_run,
+        )
     
     def _generate_trade_plan_display(self, state: Optional[KeyLevelGridState]) -> Dict[str, Any]:
         """生成交易执行计划显示数据"""

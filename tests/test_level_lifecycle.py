@@ -361,8 +361,8 @@ class TestBackwardCompatibility:
         assert data["inheritance_ts"] == 1234567890
     
     def test_state_version(self):
-        """验证 STATE_VERSION"""
-        assert STATE_VERSION == 2
+        """验证 STATE_VERSION (V3.0 升级到 3)"""
+        assert STATE_VERSION == 3
 
 
 # ============================================

@@ -12,8 +12,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# 添加 src 目录到路径
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# 添加 src 目录到路径 (scripts/run/single.py → 项目根目录/src)
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 from dotenv import load_dotenv
 from rich.console import Console, Group
@@ -405,18 +405,24 @@ def create_display(strategy: KeyLevelGridStrategy) -> Layout:
     return layout
 
 
-async def run_strategy(config_path: str, force_rebuild: bool = False):
+async def run_strategy(config_path: str, force_rebuild: bool = False, dry_run: bool = False):
     """运行策略"""
     load_dotenv()
     
+    mode_text = "[yellow]🔒 DRY RUN 模式[/yellow]" if dry_run else ""
     console.print(Panel.fit(
-        "[bold magenta]🎯 Key Level Grid Strategy[/bold magenta]\n"
-        f"配置文件: {config_path}",
+        f"[bold magenta]🎯 Key Level Grid Strategy[/bold magenta]\n"
+        f"配置文件: {config_path}\n"
+        f"{mode_text}",
         title="启动中"
     ))
     
     # 加载策略
     strategy = KeyLevelGridStrategy.from_yaml(config_path)
+    
+    # 命令行 --dry-run 参数覆盖配置文件
+    if dry_run:
+        strategy.config.dry_run = True
     
     # 显示配置信息（包括周期）
     kline_cfg = strategy.config.kline_config
@@ -426,7 +432,7 @@ async def run_strategy(config_path: str, force_rebuild: bool = False):
     console.print(Panel.fit(
         f"Symbol: {strategy.config.symbol}\n"
         f"Exchange: {strategy.config.exchange}\n"
-        f"Mode: {'Dry Run' if strategy.config.dry_run else 'Live'}\n"
+        f"Mode: {'[yellow]Dry Run (模拟)[/yellow]' if strategy.config.dry_run else '[green]Live (实盘)[/green]'}\n"
         f"主周期: {primary_tf}\n"
         f"辅助周期: {', '.join(aux_tfs)}",
         title="✅ 策略已加载"
@@ -482,6 +488,11 @@ def main():
         action="store_true",
         help="启动后立即强制重建当前网格"
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="模拟运行模式，不执行实际交易（仅显示策略输出）"
+    )
     args = parser.parse_args()
 
     log_file = setup_file_logging(log_file=args.log_file)
@@ -497,7 +508,7 @@ def main():
             console.print(f"[red]❌ 配置文件不存在: {args.config}[/red]")
             sys.exit(1)
     
-    asyncio.run(run_strategy(str(config_path), force_rebuild=args.force_rebuild))
+    asyncio.run(run_strategy(str(config_path), force_rebuild=args.force_rebuild, dry_run=args.dry_run))
 
 
 if __name__ == "__main__":

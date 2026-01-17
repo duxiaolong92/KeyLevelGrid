@@ -1,6 +1,6 @@
 # Key Level Grid 项目宪法 (Constitution)
 
-> **版本**: 1.2.0  
+> **版本**: 1.3.0  
 > **生效日期**: 2026-01-17  
 > **维护者**: KeyLevelGrid Core Team
 
@@ -273,6 +273,185 @@ class ActiveFill:
 
 ---
 
+## 🛡️ 状态管理准则 (State Management)
+
+> **目的**：防止 AI 或人工重构过程中破坏水位生命周期逻辑，确保持仓数据完整性。
+
+### S1. 严禁物理删除 (No Physical Deletion)
+
+> **准则**：任何 `fill_counter > 0` 的水位实例**严禁**从内存或持久化状态中移除。
+
+**约束条件**：
+
+| 约束项 | 要求 |
+|--------|------|
+| **删除前检查** | 必须验证 `fill_counter == 0` 且无关联挂单 |
+| **退役替代** | 不满足删除条件时，必须转为 `RETIRED` 状态 |
+| **审计追踪** | 任何状态变更必须记录到日志 |
+| **持久化保护** | `state.json` 保存时必须包含所有非 `DEAD` 水位 |
+
+**代码检查点**：
+```python
+# ✅ 正确：删除前必须检查
+def can_destroy_level(level: GridLevelState, inventory: List[ActiveFill]) -> bool:
+    if level.fill_counter > 0:
+        return False
+    if level.active_order_id:
+        return False
+    # 检查是否有关联的卖单
+    for fill in inventory:
+        if fill.target_sell_level_id == level.level_id:
+            return False
+    return True
+
+# ❌ 禁止：直接删除
+active_levels = [l for l in levels if l.price != target_price]  # 危险！
+```
+
+---
+
+### S2. 退役优先保护 (Retirement Protection)
+
+> **准则**：重构（Rebuild）逻辑必须能够处理"非连续索引"的退役水位。即使新生成的网格只有 10 格，而旧网格中有 3 个处于退役状态的持仓水位，系统必须同时管理这 **10 + 3** 个状态点。
+
+**约束条件**：
+
+| 约束项 | 要求 |
+|--------|------|
+| **双列表管理** | `active_levels` 存放活跃水位，`retired_levels` 存放退役水位 |
+| **独立生命周期** | 退役水位独立于网格重构，仅当 `fill_counter == 0` 且无挂单时转为 `DEAD` |
+| **卖单执行** | 退役水位仍可作为卖单映射目标（只卖不买） |
+| **统计分离** | 退役水位不计入"当前网格格数"，但计入"总管理水位数" |
+
+**状态流转**：
+```
+ACTIVE ──────┬──────────────────────────────────▶ RETIRED
+             │  (被挤出索引范围 或 评分 < 30)       │
+             │                                     │
+             │                                     ▼
+             │                              fill_counter == 0
+             │                              且无关联挂单？
+             │                                     │
+             │                    ┌────────────────┴────────────────┐
+             │                    │ 是                              │ 否
+             │                    ▼                                 │
+             │                  DEAD                                │
+             │               (物理删除)                        保持 RETIRED
+             │                                                      │
+             └──────────────────────────────────────────────────────┘
+```
+
+**数据结构**：
+```python
+@dataclass
+class GridState:
+    active_levels: List[GridLevelState]    # 活跃水位（参与买卖）
+    retired_levels: List[GridLevelState]   # 退役水位（只卖不买）
+    # ... 其他字段
+```
+
+---
+
+## ⚙️ 配置准则 (Configuration & Hard-coding)
+
+> **目的**：确保所有可调参数集中管理，便于策略调优和 AI 理解上下文。
+
+### C1. 参数解耦 (Parameter Decoupling)
+
+> **准则**：**禁止**在代码中直接使用魔数（Magic Numbers）。必须通过 `self.config` 访问所有策略参数。
+
+**核心参数清单**：
+
+| 参数名 | 默认值 | 说明（中文） |
+|--------|--------|--------------|
+| `ANCHOR_DRIFT_THRESHOLD` | `0.03` | 锚点偏移阈值：触发网格重构的价格变化百分比 |
+| `FIBONACCI_LOOKBACK` | `[8, 21, 55]` | 斐波那契回溯序列：定义短/中/长线周期 |
+| `MIN_SCORE_THRESHOLD_ACTIVE` | `50` | 活跃评分门槛：低于此分数的水位转为退役 |
+| `MIN_SCORE_THRESHOLD_ENTRY` | `30` | 入场评分门槛：低于此分数的新水位不开仓 |
+| `REBUILD_COOLDOWN_SEC` | `900` | 重构冷冻期：两次网格重构的最小间隔（秒） |
+
+**代码规范**：
+```python
+# ❌ 禁止：硬编码魔数
+if price_change > 0.03:  # 魔数！
+    trigger_rebuild()
+
+if score < 50:  # 魔数！
+    level.status = RETIRED
+
+# ✅ 正确：通过配置访问
+if price_change > self.config.anchor_drift_threshold:
+    trigger_rebuild()
+
+if score < self.config.min_score_threshold_active:
+    level.lifecycle_status = LevelLifecycleStatus.RETIRED
+```
+
+---
+
+### C2. 结构透明性 (Structural Transparency)
+
+> **准则**：所有评分修正系数（Volume, Psychology, Trend, MTF）必须在 `config.yaml` 中显式定义，且**必须配上中文说明**。
+
+**配置示例**：
+```yaml
+# ============================================================
+# 水位评分系数配置 (Level Scoring Coefficients)
+# ============================================================
+scoring:
+  # --- 成交量权重 (Volume Weight) ---
+  volume_weight_hvn: 1.3        # 高成交量节点（HVN/POC）：筹码密集区，支撑/阻力强
+  volume_weight_lvn: 0.6        # 低成交量节点（LVN）：真空区，易被突破
+
+  # --- 心理位吸附权重 (Psychology Weight) ---
+  psychology_weight_aligned: 1.2  # 与斐波那契回撤位或大整数位对齐时的加成
+
+  # --- 趋势系数 (Trend Coefficient) ---
+  trend_coef_bullish_support: 1.3   # 多头趋势下的支撑位加成
+  trend_coef_bullish_resistance: 0.8  # 多头趋势下的阻力位削弱
+  trend_coef_bearish_support: 0.8   # 空头趋势下的支撑位削弱
+  trend_coef_bearish_resistance: 1.3  # 空头趋势下的阻力位加成
+  trend_coef_neutral: 1.0           # 震荡趋势下不修正
+
+  # --- MTF 共振系数 (Multi-TimeFrame Resonance) ---
+  mtf_resonance_triple: 1.5   # 三周期共振（1d + 4h + 15m）：最高确定性
+  mtf_resonance_double: 1.2   # 双周期共振
+  mtf_resonance_single: 1.0   # 单周期：基准值
+
+# ============================================================
+# 触发器配置 (Trigger Configuration)
+# ============================================================
+triggers:
+  anchor_drift_threshold: 0.03    # 锚点偏移阈值（3%）：触发网格重构的必要条件
+  boundary_alert_levels: 1        # 覆盖告急：现价距离边界仅剩 N 个水位时触发
+  rebuild_cooldown_sec: 900       # 重构冷冻期（秒）：15 分钟内不重复重构
+
+# ============================================================
+# 斐波那契配置 (Fibonacci Configuration)
+# ============================================================
+fibonacci:
+  lookback_sequence: [8, 21, 55]  # 回溯序列：短线(8x) / 中线(21x) / 长线(55x)
+  base_scores:
+    fib_55: 80    # 长线(55x)基础分：战略级防线
+    fib_21: 50    # 中线(21x)基础分：核心震荡带
+    fib_8: 20     # 短线(8x)基础分：高灵敏低抗噪
+
+# ============================================================
+# 仓位缩放配置 (Position Scaling)
+# ============================================================
+position_scaling:
+  score_threshold_1_5x: 80    # 评分 >= 80：1.5 倍标准仓位
+  score_threshold_1_0x: 50    # 评分 >= 50：1.0 倍标准仓位（基准）
+  score_threshold_skip: 30    # 评分 < 30：不开新仓
+```
+
+**AI 可读性要求**：
+- 每个配置项必须有**英文键名**（供代码访问）
+- 每个配置项必须有**中文注释**（供 AI 和开发者理解）
+- 配置分组必须有**分隔线和组名**
+
+---
+
 ## 🚫 禁止事项 (Prohibitions)
 
 | 编号 | 禁止行为 | 原因 |
@@ -285,6 +464,9 @@ class ActiveFill:
 | P6 | 直接修改 `fill_counter` 而不更新 `active_inventory` | 违反 A3 |
 | P7 | 在策略层直接调用交易所 API（绕过 Executor） | 违反原则四 |
 | P8 | 使用价格相似度匹配代替 `order_id` 匹配 | 破坏对账精度 |
+| P9 | 物理删除 `fill_counter > 0` 的水位 | 违反 S1 |
+| P10 | 在代码中使用魔数替代配置参数 | 违反 C1 |
+| P11 | 配置项缺少中文说明 | 违反 C2 |
 
 ---
 
@@ -346,8 +528,17 @@ grid:
 | **Source of Truth** | 唯一真实来源，在本系统中指交易所实盘数据 |
 | **sell_quota_ratio** | 止盈比例，每次成交后用于止盈的仓位百分比（默认 0.7） |
 | **base_position_locked** | 用户手动锁定的长期底仓，不参与止盈计算 |
+| **ACTIVE** | 水位生命周期状态：活跃，可执行买入和卖出 |
+| **RETIRED** | 水位生命周期状态：退役，仅允许卖出清仓，禁止新买入 |
+| **DEAD** | 水位生命周期状态：已销毁，可从内存移除 |
+| **锚点偏移 (Anchor Drift)** | 市场结构关键点（如 55x 周期极点）的价格位移 |
+| **重构冷冻期 (Rebuild Cooldown)** | 两次网格重构之间的最小时间间隔 |
+| **MTF (Multi-TimeFrame)** | 多时间框架分析，综合 1d/4h/15m 周期数据 |
+| **HVN (High Volume Node)** | 高成交量节点，VPVR 中的筹码密集区 |
+| **LVN (Low Volume Node)** | 低成交量节点，VPVR 中的成交量真空区 |
+| **魔数 (Magic Number)** | 代码中直接写死的常量，应通过配置文件管理 |
 
 ---
 
-> **最后更新**: 2026-01-17  
+> **最后更新**: 2026-01-17 (v1.3.0 新增状态管理准则与配置准则)  
 > **下次审查**: 2026-04-17
