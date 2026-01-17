@@ -924,8 +924,10 @@ class KeyLevelGridStrategy:
                 self.logger.info(f"🔧 重新设置保证金模式: {margin_mode}, 杠杆: {leverage}x")
                 await self._executor.set_margin_mode(gate_symbol, margin_mode)
                 if margin_mode == "cross":
+                    # Gate.io 全仓模式: leverage=0 (杠杆由交易所自动管理)
                     await self._executor.set_leverage(gate_symbol, 0)
                 else:
+                    # 逐仓模式: 使用配置的杠杆值
                     await self._executor.set_leverage(gate_symbol, leverage)
                 self.logger.info(f"✅ 保证金模式设置完成")
             except Exception as e:

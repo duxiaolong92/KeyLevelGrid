@@ -452,6 +452,54 @@ position_scaling:
 
 ---
 
+### C3. 数量单位规范 (Quantity Unit Standard)
+
+> **准则**：系统内部所有数量相关的配置和计算**必须统一使用基础货币（如 BTC）作为单位**，严禁使用合约张数。
+
+**核心约束**：
+
+| 约束项 | 要求 |
+|--------|------|
+| **配置单位** | `base_amount_per_grid` 必须以 BTC 为单位（如 `0.001 BTC`） |
+| **内部计算** | 所有数量运算必须基于 BTC 单位 |
+| **边界转换** | 仅在提交订单到交易所的**最后一步**转换为合约张数 |
+| **日志显示** | 日志中必须同时显示 BTC 数量和对应的合约张数 |
+
+**正确示例**：
+```yaml
+# ✅ 正确：使用 BTC 单位
+grid:
+  base_amount_per_grid: 0.001   # 每格 0.001 BTC
+  min_trade_unit: 0.0001        # 最小交易单位 0.0001 BTC
+```
+
+**错误示例**：
+```yaml
+# ❌ 错误：使用合约张数
+grid:
+  base_amount_per_grid: 10      # 10 张合约 - 禁止！
+  per_grid_amount: 100          # 100 USDT - 歧义！
+```
+
+**代码规范**：
+```python
+# ❌ 禁止：直接使用张数
+order_qty = 10000  # 张数，危险！
+
+# ✅ 正确：使用 BTC 数量，提交时转换
+btc_qty = 0.001  # BTC
+contract_size = 0.0001  # 每张合约的 BTC 数量
+order_contracts = int(btc_qty / contract_size)  # 提交时转换
+```
+
+**转换公式**：
+```
+合约张数 = BTC 数量 / contract_size
+BTC 数量 = 合约张数 × contract_size
+```
+
+---
+
 ## 🚫 禁止事项 (Prohibitions)
 
 | 编号 | 禁止行为 | 原因 |
@@ -462,6 +510,7 @@ position_scaling:
 | P4 | 本地状态覆盖交易所数据 | 违反原则三 |
 | P5 | 在 Event Track 中执行全量对账 | 违反 A1 |
 | P6 | 直接修改 `fill_counter` 而不更新 `active_inventory` | 违反 A3 |
+| P7 | 配置或代码中使用合约张数作为数量单位 | 违反 C3，必须使用 BTC |
 | P7 | 在策略层直接调用交易所 API（绕过 Executor） | 违反原则四 |
 | P8 | 使用价格相似度匹配代替 `order_id` 匹配 | 破坏对账精度 |
 | P9 | 物理删除 `fill_counter > 0` 的水位 | 违反 S1 |

@@ -427,7 +427,7 @@ class GridPositionManager:
             f"网格止盈: #{order.grid_id} @ {fill_price:.2f}, "
             f"盈亏={pnl_usdt:.2f} USDT ({pnl_pct:.2%})"
         )
-        
+                
         trade_record = {
             "time": fill_time or int(time.time() * 1000),
             "side": "sell",
@@ -457,7 +457,7 @@ class GridPositionManager:
     # ============================================
     # 水位映射管理
     # ============================================
-    
+
     def update_position_snapshot(self, holdings_contracts: float, avg_entry_price: float) -> None:
         """更新持仓快照"""
         if not self.state:
@@ -500,7 +500,7 @@ class GridPositionManager:
         if missing_adjacent_levels:
             self.logger.warning(
                 f"⚠️ [Mapping] 以下支撑位无上方邻位: {missing_adjacent_levels}"
-            )
+        )
         
         return mapping
     
@@ -744,7 +744,7 @@ class GridPositionManager:
             
         if expected == current:
             return None
-        
+            
         # 补齐或移除清单记录
         if current < expected:
             diff = expected - current
@@ -795,13 +795,13 @@ class GridPositionManager:
                             added += 1
                         else:
                             break
-        
+            
         elif current > expected:
             diff = current - expected
             for _ in range(diff):
                 if self.state.active_inventory:
                     self.state.active_inventory.pop(0)
-        
+
         self._update_fill_counters_from_inventory()
         self._save_state()
         
@@ -852,7 +852,7 @@ class GridPositionManager:
             q_rem -= q
         if q_rem > 0 and targets:
             targets[-1] += q_rem
-        
+
         for i in range(len(targets) - 1, -1, -1):
             if targets[i] < min_order_qty:
                 if i > 0:
@@ -1175,14 +1175,14 @@ class GridPositionManager:
         count = int(round(sell_qty / base_qty))
         if count <= 0:
             count = 1
-        
+            
         for _ in range(count):
             if self.state.active_inventory:
                 removed = self.state.active_inventory.pop(0)
                 self.state.settled_inventory.insert(0, removed)
                 if len(self.state.settled_inventory) > 10:
                     self.state.settled_inventory = self.state.settled_inventory[:10]
-        
+                
         if count > 0:
             self._update_fill_counters_from_inventory()
             self._save_state()

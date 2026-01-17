@@ -73,7 +73,7 @@ grid:
   
   # 🆕 V3.0 水位生成配置
   level_generation:
-    enabled: true                    # 是否启用 V3.0 水位生成引擎 (false 则使用旧版 ResistanceCalculator)
+    enabled: false                    # 是否启用 V3.0 水位生成引擎 (false 则使用旧版 ResistanceCalculator)
     
     # ===== 多时间框架 (MTF) 配置 =====
     timeframes:                      # 时间框架列表 (按优先级降序)
@@ -102,7 +102,7 @@ grid:
         "4h": 1.0                    # 战略层权重 (基准)
         "15m": 0.6                   # 战术层权重
       
-      # 周期基础分 (影响 base_score)
+      # 周期基础分 (数字 key 与代码兼容)
       period_scores:
         89: 80
         55: 80                       # 长周期: 战略级
@@ -120,7 +120,7 @@ grid:
       # 心理位权重 (W_psychology)
       psychology_weight: 1.2         # 对齐斐波那契/整数位时的加成
       
-      # 趋势系数 (T_env)
+      # 趋势系数 (T_env) - 嵌套格式与代码兼容
       trend_coefficients:
         bullish:
           support: 1.1               # 多头市场做多支撑
@@ -138,6 +138,9 @@ grid:
         "1d,4h": 1.5                 # 趋势+战略
         "1d,15m": 1.3                # 趋势+战术
         "4h,15m": 1.2                # 战略+战术
+      
+      # 评分阈值
+      min_score_threshold: 30        # 水位最低评分阈值 (低于此分不生成水位)
     
     # ===== 重构触发配置 =====
     rebuild:
