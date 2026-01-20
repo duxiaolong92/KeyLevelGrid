@@ -43,56 +43,52 @@ class LevelMappingManager:
         """
         构建逐级邻位映射表
         
-        规则：每个支撑位映射到其物理价格上方的第一个水位（邻位）
+        规则：每个支撑位映射到其上方最近的**阻力位**
+        注意：只有阻力位才能作为卖出目标，支撑位不能作为卖出目标
         
         Args:
             state: 网格状态
             
         Returns:
-            {support_level_id: adjacent_level_id}
+            {support_level_id: resistance_level_id}
         """
         if not state:
             return {}
         
-        # 合并所有水位并按价格升序排列
-        all_levels: List[GridLevelState] = (
-            state.support_levels_state + state.resistance_levels_state
+        # 按价格排序的阻力位（用于卖出目标）
+        resistance_levels = sorted(
+            state.resistance_levels_state, 
+            key=lambda x: x.price
         )
-        sorted_levels = sorted(all_levels, key=lambda x: x.price)
         
         mapping: Dict[int, int] = {}
         min_profit_pct = float(state.min_profit_pct or 0)
         missing_adjacent_levels: List[float] = []
         
-        for i, level in enumerate(sorted_levels):
-            # 只为支撑位建立映射
-            if level.role != "support":
-                continue
-            
+        for support_lvl in state.support_levels_state:
             # 最小利润价格阈值
-            min_sell_price = level.price * (1 + min_profit_pct)
+            min_sell_price = support_lvl.price * (1 + min_profit_pct)
             
-            # 查找上方第一个有效水位（邻位）
+            # 在阻力位中找到第一个价格高于最小卖出价的水位
             target_level = None
-            for j in range(i + 1, len(sorted_levels)):
-                candidate = sorted_levels[j]
-                if candidate.price > min_sell_price:
-                    target_level = candidate
+            for resistance in resistance_levels:
+                if resistance.price > min_sell_price:
+                    target_level = resistance
                     break
             
             if target_level:
-                mapping[level.level_id] = target_level.level_id
+                mapping[support_lvl.level_id] = target_level.level_id
                 self.logger.debug(
-                    f"📍 映射: L_{level.level_id}({level.price:.2f}) → L_{target_level.level_id}({target_level.price:.2f})"
+                    f"📍 映射: L_{support_lvl.level_id}({support_lvl.price:.2f}) → L_{target_level.level_id}({target_level.price:.2f})"
                 )
             else:
-                # 边界情况：最高支撑位无上方邻位
-                missing_adjacent_levels.append(level.price)
+                # 边界情况：支撑位无上方阻力位
+                missing_adjacent_levels.append(support_lvl.price)
         
         # 边界告警
         if missing_adjacent_levels:
             self.logger.warning(
-                f"⚠️ [Mapping] 以下支撑位无上方邻位: {missing_adjacent_levels}"
+                f"⚠️ [Mapping] 以下支撑位无上方阻力位: {missing_adjacent_levels}"
             )
         
         self.logger.info(

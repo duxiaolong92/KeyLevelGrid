@@ -343,30 +343,39 @@ class TestSerialization:
         assert "level_mapping" in data
         assert data["level_mapping"] == {1: 2, 2: 3, 3: 1001}
     
-    def test_active_fill_with_sell_tracking(self):
-        """测试 ActiveFill 包含卖单追踪字段的序列化"""
+    def test_active_fill_with_level_index(self):
+        """
+        测试 ActiveFill 包含 level_index 字段的序列化 (SELL_MAPPING.md Section 7.2)
+        
+        新设计中：
+        - level_id → level_index（索引归属原则）
+        - 卖单追踪字段已废弃（不再持久化）
+        """
         fill = ActiveFill(
             order_id="fill_001",
-            level_id=1,
             price=94000,
             qty=0.001,
             timestamp=1700000000,
-            target_sell_level_id=2,
-            sell_order_id="sell_001",
-            sell_qty=0.0007,
+            level_index=1,  # 使用 level_index 而非 level_id
         )
         
         data = fill.to_dict()
         
-        assert data["target_sell_level_id"] == 2
-        assert data["sell_order_id"] == "sell_001"
-        assert data["sell_qty"] == 0.0007
+        assert data["level_index"] == 1
+        assert "level_id" not in data  # 已废弃
+        assert "target_sell_level_id" not in data  # 已废弃
+        assert "sell_order_id" not in data  # 已废弃
+        assert "sell_qty" not in data  # 已废弃
     
     def test_active_fill_from_dict_backward_compat(self):
-        """测试 ActiveFill 向后兼容（旧版无新字段）"""
+        """
+        测试 ActiveFill 向后兼容（旧版使用 level_id）
+        
+        旧版数据中的 level_id 会被转换为 level_index
+        """
         old_data = {
             "order_id": "fill_001",
-            "level_id": 1,
+            "level_id": 2,  # 旧版使用 level_id
             "price": 94000,
             "qty": 0.001,
             "timestamp": 1700000000,
@@ -374,9 +383,9 @@ class TestSerialization:
         
         fill = ActiveFill.from_dict(old_data)
         
-        assert fill.target_sell_level_id is None
-        assert fill.sell_order_id is None
-        assert fill.sell_qty == 0.0
+        # 旧版 level_id=2 → 新版 level_index=1（level_id 从 1 开始，index 从 0 开始）
+        assert fill.level_index == 1
+        assert not hasattr(fill, "target_sell_level_id")
 
 
 # ============================================

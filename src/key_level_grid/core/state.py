@@ -194,41 +194,49 @@ class GridOrder:
 
 @dataclass
 class ActiveFill:
-    """正在持仓中的买入成交记录"""
-    order_id: str
-    price: float
-    qty: float
-    level_id: int
-    timestamp: int
+    """
+    正在持仓中的买入成交记录 (SELL_MAPPING.md Section 7.2)
     
-    # 逐级邻位映射追踪字段
-    target_sell_level_id: Optional[int] = None  # 止盈应挂在哪个水位
-    sell_order_id: Optional[str] = None         # 已挂卖单的订单 ID
-    sell_qty: float = 0.0                        # 已挂卖单数量
+    设计原则：
+    - 只保留不可变的买入事实 + 水位索引归属
+    - 卖单状态不持久化，每次 Recon 动态计算
+    
+    V3.1 变更：
+    - level_id → level_index（索引归属原则）
+    - 移除 target_sell_level_id, sell_order_id, sell_qty（不持久化）
+    """
+    order_id: str       # 买入订单 ID（唯一标识，用于校验有效性）
+    price: float        # 实际成交价格（非水位价格，保留滑点信息）
+    qty: float          # 实际成交数量
+    timestamp: int      # 成交时间戳
+    level_index: int    # 归属的支撑位索引（0=支撑位1, 1=支撑位2...）
+                        # 📌 网格重建后索引不变，自动对应新水位
+                        # 📌 若索引越界，运行时兜底到最后一个水位
 
     def to_dict(self) -> dict:
         return {
             "order_id": self.order_id,
             "price": self.price,
             "qty": self.qty,
-            "level_id": self.level_id,
+            "level_index": self.level_index,
             "timestamp": self.timestamp,
-            "target_sell_level_id": self.target_sell_level_id,
-            "sell_order_id": self.sell_order_id,
-            "sell_qty": self.sell_qty,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "ActiveFill":
+        # 向后兼容：旧版 level_id → 新版 level_index
+        level_index = data.get("level_index")
+        if level_index is None:
+            # 旧格式：尝试从 level_id 推断索引（假设 level_id 从 1 开始）
+            old_level_id = data.get("level_id", 0)
+            level_index = max(0, old_level_id - 1) if old_level_id > 0 else 0
+        
         return cls(
             order_id=data.get("order_id", ""),
             price=float(data.get("price", 0)),
             qty=float(data.get("qty", 0)),
-            level_id=int(data.get("level_id", 0)),
             timestamp=int(data.get("timestamp", 0)),
-            target_sell_level_id=data.get("target_sell_level_id"),
-            sell_order_id=data.get("sell_order_id"),
-            sell_qty=float(data.get("sell_qty", 0)),
+            level_index=int(level_index),
         )
 
 

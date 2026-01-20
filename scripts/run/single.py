@@ -318,9 +318,14 @@ def create_trades_panel(data: dict) -> Panel:
     # 1. 显示持仓中的买入 (Active) - 取最近 10 条，倒序
     active_display = sorted(active, key=lambda x: x.get("timestamp", 0), reverse=True)[:10]
     for fill in active_display:
+        level_index = fill.get("level_index")
+        if level_index is not None:
+            level_display = f"#{int(level_index) + 1}"
+        else:
+            level_display = f"#{fill.get('level_id')}"
         table.add_row(
             "[green]持仓中[/green]",
-            f"#{fill.get('level_id')}",
+            level_display,
             format_price(fill.get("price", 0)),
             f"{fill.get('qty', 0):.6f}",
             "买入"
@@ -331,9 +336,14 @@ def create_trades_panel(data: dict) -> Panel:
 
     # 2. 显示最近已平仓的记录 (Settled) - 取最近 3 条
     for fill in settled[:3]:
+        level_index = fill.get("level_index")
+        if level_index is not None:
+            level_display = f"#{int(level_index) + 1}"
+        else:
+            level_display = f"#{fill.get('level_id')}"
         table.add_row(
             "[dim]已平仓[/dim]",
-            f"#{fill.get('level_id')}",
+            level_display,
             format_price(fill.get("price", 0)),
             f"{fill.get('qty', 0):.6f}",
             "买/卖"

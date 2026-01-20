@@ -1503,32 +1503,26 @@ class GateExecutor(ExchangeExecutor):
         """
         设置杠杆倍数
         
-        Gate.io 期货杠杆设置:
-        - leverage=0: 全仓模式 (cross)
-        - leverage>0: 逐仓模式 (isolated) + 指定杠杆倍数
-        
         Args:
             symbol: 交易对
-            leverage: 杠杆倍数 (0 表示全仓)
+            leverage: 杠杆倍数
             
         Returns:
             True 如果成功
         """
         if self.paper_trading:
-            mode_str = "全仓" if leverage == 0 else f"逐仓 {leverage}x"
-            self.logger.info(f"[纸交易] 设置 {symbol} 杠杆为 {mode_str}")
+            self.logger.info(f"[纸交易] 设置 {symbol} 杠杆为 {leverage}x")
             return True
             
         try:
-            mode_str = "全仓" if leverage == 0 else f"逐仓 {leverage}x"
-            self.logger.info(f"🔧 设置 {symbol} 杠杆为 {mode_str}")
+            self.logger.info(f"🔧 设置 {symbol} 杠杆为 {leverage}x")
             
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 None,
                 lambda: self._exchange.set_leverage(leverage, symbol)
             )
-            self.logger.info(f"✅ 杠杆设置成功: {mode_str}")
+            self.logger.info(f"✅ 杠杆设置成功: {leverage}x")
             return True
             
         except Exception as e:
@@ -1544,10 +1538,6 @@ class GateExecutor(ExchangeExecutor):
     async def set_margin_mode(self, symbol: str, margin_mode: str) -> bool:
         """
         设置保证金模式
-        
-        Gate.io 通过 leverage 值来控制保证金模式:
-        - cross (全仓): leverage = 0
-        - isolated (逐仓): leverage > 0
         
         注意: 有挂单或持仓时无法切换模式！
         
@@ -1567,20 +1557,10 @@ class GateExecutor(ExchangeExecutor):
             
             loop = asyncio.get_event_loop()
             
-            # Gate.io 逻辑：
-            # margin_mode='cross' -> leverage=0
-            # margin_mode='isolated' -> 依赖后续 set_leverage 设置具体值
-            
-            if margin_mode == 'cross':
-                self.logger.info(f"Gate.io 全仓模式：设置杠杆为 0")
-                await loop.run_in_executor(
-                    None,
-                    lambda: self._exchange.set_leverage(0, symbol)
-                )
-                self.logger.info(f"✅ 全仓模式设置成功 (leverage=0)")
-            else:
-                # 逐仓模式，依赖后续的 set_leverage 调用
-                self.logger.info(f"Gate.io 逐仓模式：等待 set_leverage 设置具体倍数")
+            # 仅设置保证金模式，杠杆由后续的 set_leverage 调用设置
+            # 注意：Gate.io 的保证金模式通过 set_leverage 隐式设置
+            # leverage > 0 时自动切换到对应模式
+            self.logger.info(f"Gate.io 保证金模式: {margin_mode} (杠杆将在 set_leverage 中设置)")
                 
             return True
             

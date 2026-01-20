@@ -1,16 +1,23 @@
 """
-MTF 水位评分计算器 (LEVEL_GENERATION.md v3.1.0)
+MTF 水位评分计算器 (LEVEL_GENERATION.md v3.2.5)
 
 评分公式: Final_Score = S_base × W_volume × W_psychology × T_env × M_mtf
 
 其中:
 - S_base: 基础分 = 时间框架权重 × 周期基础分
-- W_volume: 成交量权重 (HVN=1.3, Normal=1.0, LVN=0.6)
+- W_volume: 成交量权重 (POC=1.8, HVN=1.5, Normal=1.0, LVN=0.4)
 - W_psychology: 心理位权重 (对齐=1.2, 无=1.0)
 - T_env: 趋势系数 (顺势=1.1, 逆势=0.9)
-- M_mtf: MTF 共振系数 (三框架=2.0, 双框架=1.2~1.5, 单框架=1.0)
+- M_mtf: MTF 共振系数 (四框架=2.5, 三框架=2.0, 双框架=1.5, 单框架=1.0)
+
+V3.2.5 更新:
+- POC 权重: 1.8 (新增)
+- HVN 权重: 1.3 → 1.5
+- LVN 权重: 0.6 → 0.4
+- 支持四层级时间框架
 """
 
+import logging
 from typing import List, Dict, Optional, Tuple
 from key_level_grid.core.scoring import (
     LevelScore,
@@ -28,12 +35,20 @@ from key_level_grid.core.scoring import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
 class LevelScorer:
     """
-    MTF 水位评分器
+    MTF 水位评分器 (V3.2.5)
     
     基于多维度因素计算水位的综合评分，
     用于决定是否开仓以及开仓数量。
+    
+    V3.2.5 更新:
+    - 支持 POC 单独权重
+    - 更新 HVN/LVN 权重
+    - 支持四层级时间框架
     """
     
     def __init__(self, config: Optional[Dict] = None):
@@ -50,7 +65,7 @@ class LevelScorer:
         """从配置加载权重参数"""
         scoring_config = self.config.get("scoring", {})
         
-        # 时间框架权重
+        # 时间框架权重 (V3.2.5 四层级)
         self.tf_weights = scoring_config.get(
             "timeframe_weights", 
             DEFAULT_TIMEFRAME_WEIGHTS
@@ -64,12 +79,13 @@ class LevelScorer:
             ).items()
         }
         
-        # 成交量权重
+        # 成交量权重 (V3.2.5 更新)
         vol_weights = scoring_config.get("volume_weights", {})
         self.volume_weights = {
-            VolumeZone.HVN: float(vol_weights.get("hvn", 1.3)),
+            "POC": float(vol_weights.get("poc", 1.8)),       # V3.2.5: POC 单独权重
+            VolumeZone.HVN: float(vol_weights.get("hvn", 1.5)),  # V3.2.5: 1.3 → 1.5
             VolumeZone.NORMAL: float(vol_weights.get("normal", 1.0)),
-            VolumeZone.LVN: float(vol_weights.get("lvn", 0.6)),
+            VolumeZone.LVN: float(vol_weights.get("lvn", 0.4)),  # V3.2.5: 0.6 → 0.4
         }
         
         # 心理位权重
@@ -84,12 +100,17 @@ class LevelScorer:
                 "resistance": float(trend_config.get(trend, {}).get("resistance", 1.0)),
             }
         
-        # MTF 共振系数
+        # MTF 共振系数 (V3.2.5: 基于框架数量)
         mtf_config = scoring_config.get("mtf_resonance", {})
         self.mtf_resonance = {}
-        for tf_str, coef in mtf_config.items():
-            tf_set = frozenset(tf_str.split(","))
-            self.mtf_resonance[tf_set] = float(coef)
+        for count_str, coef in mtf_config.items():
+            try:
+                count = int(count_str)
+                self.mtf_resonance[count] = float(coef)
+            except (ValueError, TypeError):
+                # 向后兼容: 旧版基于时间框架组合的配置
+                tf_set = frozenset(count_str.split(","))
+                self.mtf_resonance[tf_set] = float(coef)
     
     def calculate_score(
         self,
@@ -125,13 +146,19 @@ class LevelScorer:
         if candidate.is_resonance:
             base_score = sum(base_scores)
         
-        # 2. 成交量权重
+        # 2. 成交量权重 (V3.2.5: POC 单独处理)
         volume_weight = 1.0
         volume_zone = VolumeZone.NORMAL
         
         if vpvr:
-            volume_zone = vpvr.get_zone_type(candidate.merged_price)
-            volume_weight = self.volume_weights.get(volume_zone, 1.0)
+            # 检查是否为 POC
+            poc_tolerance = candidate.merged_price * 0.003  # 0.3%
+            if abs(candidate.merged_price - vpvr.poc_price) < poc_tolerance:
+                volume_weight = self.volume_weights.get("POC", 1.8)
+                volume_zone = VolumeZone.HVN  # POC 归类为 HVN
+            else:
+                volume_zone = vpvr.get_zone_type(candidate.merged_price)
+                volume_weight = self.volume_weights.get(volume_zone, 1.0)
         
         # 3. 心理位权重
         psychology_weight = 1.0
@@ -142,7 +169,7 @@ class LevelScorer:
         trend_key = trend_state.value.lower()
         trend_coef = self.trend_coefficients.get(trend_key, {}).get(role, 1.0)
         
-        # 5. MTF 共振系数
+        # 5. MTF 共振系数 (V3.2.5: 基于框架数量)
         mtf_coef = self._calculate_mtf_coefficient(candidate.source_timeframes)
         
         # 6. 最终评分
@@ -174,20 +201,24 @@ class LevelScorer:
     
     def _calculate_mtf_coefficient(self, source_timeframes: List[str]) -> float:
         """
-        计算 MTF 共振系数
+        计算 MTF 共振系数 (V3.2.5)
         
         Args:
             source_timeframes: 水位来源时间框架列表
         
         Returns:
-            共振系数 (1.0 ~ 2.0)
+            共振系数 (1.0 ~ 2.5)
         """
-        if len(source_timeframes) <= 1:
+        n = len(source_timeframes)
+        if n <= 1:
             return 1.0
         
-        tf_set = frozenset(source_timeframes)
+        # V3.2.5: 优先使用基于数量的配置
+        if n in self.mtf_resonance:
+            return self.mtf_resonance[n]
         
-        # 先从配置查找
+        # 向后兼容: 尝试基于时间框架组合
+        tf_set = frozenset(source_timeframes)
         if tf_set in self.mtf_resonance:
             return self.mtf_resonance[tf_set]
         
@@ -223,6 +254,43 @@ class LevelScorer:
             return 1.0
         else:
             return 0.0
+    
+    def calculate_batch(
+        self,
+        candidates: List[MTFLevelCandidate],
+        vpvr: Optional[VPVRData],
+        trend_state: TrendState,
+        role: str,
+        psychology_anchors: Optional[Dict[float, float]] = None,
+    ) -> List[Tuple[MTFLevelCandidate, LevelScore]]:
+        """
+        批量计算评分 (V3.2.5)
+        
+        Args:
+            candidates: 候选水位列表
+            vpvr: VPVR 数据
+            trend_state: 趋势状态
+            role: "support" | "resistance"
+            psychology_anchors: 价格到心理位的映射 {price: anchor_price}
+        
+        Returns:
+            [(candidate, score), ...]
+        """
+        results = []
+        psychology_anchors = psychology_anchors or {}
+        
+        for candidate in candidates:
+            anchor = psychology_anchors.get(candidate.merged_price)
+            score = self.calculate_score(
+                candidate=candidate,
+                vpvr=vpvr,
+                trend_state=trend_state,
+                role=role,
+                psychology_anchor=anchor,
+            )
+            results.append((candidate, score))
+        
+        return results
 
 
 def determine_trend(

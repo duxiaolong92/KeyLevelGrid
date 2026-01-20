@@ -702,8 +702,357 @@ class GridPositionManager:
         return actions
 
     # ============================================
-    # 持仓清单管理
+    # 持仓清单管理 (SELL_MAPPING.md Section 7)
     # ============================================
+
+    def find_level_index_for_price(
+        self,
+        price: float,
+        levels: Optional[List[GridLevelState]] = None,
+        tolerance: float = 0.005  # 0.5% 容差
+    ) -> int:
+        """
+        根据成交价确定归属的水位索引 (SELL_MAPPING.md Section 7.4)
+        
+        Args:
+            price: 成交价格
+            levels: 支撑位列表（按价格降序）
+            tolerance: 价格匹配容差（默认 0.5%）
+        
+        Returns:
+            归属的水位索引（0=支撑位1, 1=支撑位2...）
+        """
+        if levels is None:
+            levels = self.state.support_levels_state if self.state else []
+        
+        if not levels:
+            return 0
+        
+        # 优先精确匹配（容差内）
+        for i, level in enumerate(levels):
+            if abs(price - level.price) / level.price < tolerance:
+                return i
+        
+        # 兜底：找最近的低于成交价的水位
+        candidates = [(i, lvl) for i, lvl in enumerate(levels) if lvl.price <= price]
+        if candidates:
+            # 取最近的（价格最高的）
+            return max(candidates, key=lambda x: x[1].price)[0]
+        
+        # 极端情况：成交价低于所有水位
+        return len(levels) - 1
+
+    def get_level_for_fill(
+        self,
+        fill: ActiveFill,
+        levels: Optional[List[GridLevelState]] = None
+    ) -> Optional[GridLevelState]:
+        """
+        根据索引获取归属水位，处理越界 (SELL_MAPPING.md Section 7.4)
+        
+        规则 3（索引越界兜底）：
+        - 若 level_index < len(levels): 返回对应水位
+        - 若越界: 返回最后一个水位
+        
+        Args:
+            fill: 持仓记录
+            levels: 支撑位列表
+        
+        Returns:
+            归属的水位，若无水位则返回 None
+        """
+        if levels is None:
+            levels = self.state.support_levels_state if self.state else []
+        
+        if not levels:
+            return None
+        
+        # 索引越界兜底
+        idx = min(fill.level_index, len(levels) - 1)
+        
+        if fill.level_index >= len(levels):
+            self.logger.debug(
+                f"📦 [Inventory] level_index={fill.level_index} 越界, "
+                f"兜底到 index={idx}"
+            )
+        
+        return levels[idx]
+
+    def get_effective_index(
+        self,
+        fill: ActiveFill,
+        levels: Optional[List[GridLevelState]] = None
+    ) -> int:
+        """
+        获取有效索引（考虑越界兜底）
+        
+        Args:
+            fill: 持仓记录
+            levels: 支撑位列表
+        
+        Returns:
+            有效的水位索引
+        """
+        if levels is None:
+            levels = self.state.support_levels_state if self.state else []
+        
+        if not levels:
+            return 0
+        
+        return min(fill.level_index, len(levels) - 1)
+
+    def get_level_index_by_level_id(
+        self,
+        level_id: int,
+        levels: Optional[List[GridLevelState]] = None
+    ) -> Optional[int]:
+        """
+        根据 level_id 获取当前水位索引
+        
+        仅用于运行时从水位列表推导索引（不持久化）。
+        """
+        if levels is None:
+            levels = self.state.support_levels_state if self.state else []
+        
+        for i, level in enumerate(levels):
+            if level.level_id == level_id:
+                return i
+        
+        return None
+
+    def verify_inventory_consistency(
+        self,
+        levels: Optional[List[GridLevelState]] = None
+    ) -> bool:
+        """
+        校验 fill_counter 与 inventory 一致性 (SELL_MAPPING.md 规则 7)
+        
+        若不一致，以 inventory 为准修正 fill_counter
+        
+        Returns:
+            True 如果一致，False 如果进行了修正
+        """
+        if not self.state:
+            return True
+        
+        if levels is None:
+            levels = self.state.support_levels_state
+        
+        is_consistent = True
+        
+        for i, level in enumerate(levels):
+            # 计算 inventory 中归属到此索引的记录数
+            actual_count = sum(
+                1 for f in self.state.active_inventory 
+                if self.get_effective_index(f, levels) == i
+            )
+            
+            if actual_count != level.fill_counter:
+                self.logger.warning(
+                    f"⚠️ [Consistency] index={i} 不一致: "
+                    f"inventory={actual_count}, fill_counter={level.fill_counter}, "
+                    f"以 inventory 为准修正"
+                )
+                level.fill_counter = actual_count
+                is_consistent = False
+        
+        if not is_consistent:
+            self._save_state()
+        
+        return is_consistent
+
+    def validate_and_rebuild_inventory(
+        self,
+        recent_trades: List[Dict],
+        local_trades: List[Dict],
+        expected_count: int,
+        base_qty: float
+    ) -> tuple:
+        """
+        校验并重建持仓清单 (SELL_MAPPING.md Section 7.4)
+        
+        规则 1：订单有效性校验
+        规则 2：索引归属原则
+        
+        Args:
+            recent_trades: 交易所成交历史（buy 方向）
+            local_trades: 本地成交账本（trades.jsonl）
+            expected_count: 期望的持仓记录数（基于持仓量计算）
+            base_qty: 每格基础数量
+        
+        Returns:
+            (重建后的 active_inventory, 是否发生了重建)
+        """
+        if not self.state:
+            return [], False
+        
+        levels = self.state.support_levels_state
+        
+        # Step 1: 合并成交记录
+        all_trades = self._merge_trades(recent_trades, local_trades)
+        valid_order_ids = {
+            str(t.get("order_id") or t.get("id", "")) 
+            for t in all_trades 
+            if t.get("side") == "buy"
+        }
+        
+        # Step 2: 校验现有记录的订单有效性
+        current_inventory = self.state.active_inventory
+        invalid_records = [
+            fill for fill in current_inventory 
+            if fill.order_id and fill.order_id not in valid_order_ids
+        ]
+        
+        # Step 3: 若全部有效且数量匹配，无需重建
+        if not invalid_records and len(current_inventory) == expected_count:
+            return current_inventory, False
+        
+        # Step 4: 触发完全重建
+        self.logger.warning(
+            f"⚠️ [Inventory] 检测到 {len(invalid_records)} 条无效记录，"
+            f"触发完全重建 (expected={expected_count})"
+        )
+        
+        # Step 5: 从成交记录重建
+        new_inventory = []
+        buy_trades = sorted(
+            [t for t in all_trades if t.get("side") == "buy"],
+            key=lambda x: x.get("timestamp", 0),
+            reverse=True  # 最新在前
+        )
+        
+        for trade in buy_trades:
+            if len(new_inventory) >= expected_count:
+                break
+            
+            order_id = str(trade.get("order_id") or trade.get("id", ""))
+            price = float(trade.get("price", 0))
+            qty = float(trade.get("amount") or trade.get("qty", base_qty))
+            timestamp = int(trade.get("timestamp", 0))
+            
+            # 优先使用 trade 中的 level_index（不依赖旧数据）
+            trade_level_index = trade.get("level_index")
+            if trade_level_index is not None:
+                level_index = max(0, int(trade_level_index))
+                self.logger.debug(
+                    f"📌 [Inventory] 使用原始 level_index={trade_level_index}"
+                )
+            else:
+                # 无 level_index，才用价格计算
+                level_index = self.find_level_index_for_price(price, levels)
+                self.logger.debug(
+                    f"📐 [Inventory] 根据价格计算 price={price} → level_index={level_index}"
+                )
+            
+            new_fill = ActiveFill(
+                order_id=order_id,
+                price=price,
+                qty=qty,
+                timestamp=timestamp // 1000 if timestamp > 1e12 else timestamp,
+                level_index=level_index
+            )
+            new_inventory.append(new_fill)
+            
+            self.logger.info(
+                f"➕ [Inventory] 新增持仓: order_id={order_id}, "
+                f"price={price}, level_index={level_index}"
+            )
+        
+        # Step 6: 若仍不足，兜底按水位填充
+        if len(new_inventory) < expected_count:
+            self.logger.warning(
+                f"⚠️ [Inventory] 成交记录不足，兜底填充 "
+                f"({len(new_inventory)} < {expected_count})"
+            )
+            new_inventory = self._fallback_fill_by_levels(
+                new_inventory, 
+                expected_count, 
+                base_qty
+            )
+        
+        self.logger.info(
+            f"🔄 [Inventory] 重建完成: {len(new_inventory)} 条记录"
+        )
+        
+        return new_inventory, True
+
+    def _merge_trades(
+        self,
+        recent_trades: List[Dict],
+        local_trades: List[Dict]
+    ) -> List[Dict]:
+        """
+        合并交易所和本地成交记录
+        
+        合并规则：
+        - 相同 order_id 的记录合并
+        - 交易所数据优先（price, amount 等）
+        - 但保留本地记录的 level_id（用于索引继承）
+        """
+        merged = {}
+        
+        # 先加载本地记录（包含 level_id）
+        local_level_ids = {}
+        for t in local_trades:
+            order_id = str(t.get("order_id") or t.get("id", ""))
+            if order_id:
+                merged[order_id] = t
+                # 保存本地记录的 level_id
+                if t.get("level_id") is not None:
+                    local_level_ids[order_id] = t.get("level_id")
+        
+        # 交易所记录覆盖本地，但保留 level_id
+        for t in recent_trades:
+            order_id = str(t.get("order_id") or t.get("id", ""))
+            if order_id:
+                # 如果本地有 level_id，保留它
+                if order_id in local_level_ids and t.get("level_id") is None:
+                    t = dict(t)  # 复制以避免修改原始数据
+                    t["level_id"] = local_level_ids[order_id]
+                merged[order_id] = t
+        
+        return list(merged.values())
+
+    def _fallback_fill_by_levels(
+        self,
+        current_inventory: List[ActiveFill],
+        expected_count: int,
+        base_qty: float
+    ) -> List[ActiveFill]:
+        """兜底按水位填充"""
+        if not self.state:
+            return current_inventory
+        
+        levels = self.state.support_levels_state
+        new_inventory = list(current_inventory)
+        added = 0
+        
+        for i, level in enumerate(levels):
+            while len(new_inventory) < expected_count:
+                # 检查该索引是否已达到 max_fill_per_level
+                level_count = sum(
+                    1 for f in new_inventory 
+                    if self.get_effective_index(f, levels) == i
+                )
+                if level_count >= int(self.state.max_fill_per_level or 1):
+                    break
+                
+                new_fill = ActiveFill(
+                    order_id=f"recon_{int(time.time())}_{added}",
+                    price=level.price,
+                    qty=base_qty,
+                    timestamp=int(time.time()),
+                    level_index=i
+                )
+                new_inventory.append(new_fill)
+                added += 1
+                
+                self.logger.warning(
+                    f"⚠️ [Inventory] 兜底填充: level_index={i}, "
+                    f"price={level.price}, order_id={new_fill.order_id}"
+                )
+        
+        return new_inventory
 
     def clear_fill_counters(self, reason: str = "manual") -> None:
         """清空持仓清单"""
@@ -721,8 +1070,25 @@ class GridPositionManager:
         current_price: float,
         holdings_btc: float,
         recent_trades: Optional[List[Dict]] = None,
+        local_trades: Optional[List[Dict]] = None,
     ) -> Optional[Dict[str, str]]:
-        """对账持仓清单与实际持仓"""
+        """
+        对账持仓清单与实际持仓 (SELL_MAPPING.md Section 7)
+        
+        核心逻辑：
+        1. 校验订单有效性（规则 1）
+        2. 使用索引归属原则（规则 2）
+        3. 校验 fill_counter 一致性（规则 7）
+        
+        Args:
+            current_price: 当前价格
+            holdings_btc: 实际持仓量（BTC）
+            recent_trades: 交易所成交历史
+            local_trades: 本地成交账本（trades.jsonl）
+        
+        Returns:
+            对账结果描述
+        """
         if not self.state:
             return None
         base_qty = float(self.state.base_amount_per_grid or 0)
@@ -736,79 +1102,102 @@ class GridPositionManager:
         expected = int(round(grid_holdings / base_qty))
         current = len(self.state.active_inventory)
         
+        # 持仓为 0 时清空
         if holdings_btc == 0:
             if current > 0:
                 self.clear_fill_counters("auto_clear_zero_position")
                 return {"action": "auto_clear", "detail": "持仓为 0，已清空清单"}
             return None
+        
+        # 使用新的校验和重建逻辑
+        new_inventory, was_rebuilt = self.validate_and_rebuild_inventory(
+            recent_trades=recent_trades or [],
+            local_trades=local_trades or [],
+            expected_count=expected,
+            base_qty=base_qty
+        )
+        
+        if was_rebuilt:
+            self.state.active_inventory = new_inventory
+            self._update_fill_counters_from_inventory()
+            self._save_state()
             
-        if expected == current:
-            return None
+            # 校验一致性（规则 7）
+            self.verify_inventory_consistency()
             
-        # 补齐或移除清单记录
-        if current < expected:
-            diff = expected - current
-            added = 0
-            
-            if recent_trades:
-                existing_ids = {f.order_id for f in self.state.active_inventory if f.order_id}
-                for t in recent_trades:
-                    if added >= diff:
-                        break
-                    order_id = str(t.get("order_id") or t.get("id", ""))
-                    if order_id in existing_ids:
-                        continue
-                    price = float(t.get("price", 0) or 0)
-                    lvl = self._find_support_level_for_price(price)
-                    if lvl:
-                        lvl_count = sum(1 for f in self.state.active_inventory if f.level_id == lvl.level_id)
+            return {
+                "action": "rebuild",
+                "detail": f"重建完成, final_count={len(new_inventory)}, expected={expected}",
+            }
+        
+        # 数量不匹配时的补齐/移除
+        if current != expected:
+            if current < expected:
+                # 补齐
+                diff = expected - current
+                added = 0
+                levels = self.state.support_levels_state
+                
+                # 优先从成交记录补齐
+                if recent_trades:
+                    existing_ids = {f.order_id for f in self.state.active_inventory if f.order_id}
+                    for t in recent_trades:
+                        if added >= diff:
+                            break
+                        if t.get("side") != "buy":
+                            continue
+                        order_id = str(t.get("order_id") or t.get("id", ""))
+                        if order_id in existing_ids:
+                            continue
+                        price = float(t.get("price", 0) or 0)
+                        level_index = self.find_level_index_for_price(price, levels)
+                        
+                        # 检查该索引是否已达到 max_fill_per_level
+                        lvl_count = sum(
+                            1 for f in self.state.active_inventory 
+                            if self.get_effective_index(f, levels) == level_index
+                        )
                         if lvl_count < int(self.state.max_fill_per_level or 1):
                             new_fill = ActiveFill(
                                 order_id=order_id,
                                 price=price,
                                 qty=float(t.get("amount", base_qty)),
-                                level_id=lvl.level_id,
-                                timestamp=int(t.get("timestamp", time.time()*1000) / 1000)
+                                timestamp=int(t.get("timestamp", time.time()*1000) / 1000),
+                                level_index=level_index
                             )
                             self.state.active_inventory.append(new_fill)
                             existing_ids.add(order_id)
                             added += 1
+                
+                # 兜底按水位填充
+                if added < diff:
+                    self.state.active_inventory = self._fallback_fill_by_levels(
+                        self.state.active_inventory,
+                        expected,
+                        base_qty
+                    )
+                
+            elif current > expected:
+                # FIFO 移除
+                diff = current - expected
+                for _ in range(diff):
+                    if self.state.active_inventory:
+                        self.state.active_inventory.pop(0)
             
-            if added < diff:
-                price_ceiling = max(float(current_price or 0), float(self.state.avg_entry_price or 0))
-                supports = sorted(
-                    [lvl for lvl in self.state.support_levels_state if lvl.price <= price_ceiling * 1.01],
-                    key=lambda x: x.price, reverse=True
-                )
-                for lvl in supports:
-                    while added < diff:
-                        lvl_count = sum(1 for f in self.state.active_inventory if f.level_id == lvl.level_id)
-                        if lvl_count < int(self.state.max_fill_per_level or 1):
-                            new_fill = ActiveFill(
-                                order_id=f"recon_{int(time.time())}_{added}",
-                                price=lvl.price,
-                                qty=base_qty,
-                                level_id=lvl.level_id,
-                                timestamp=int(time.time())
-                            )
-                            self.state.active_inventory.append(new_fill)
-                            added += 1
-                        else:
-                            break
+            self._update_fill_counters_from_inventory()
+            self._save_state()
             
-        elif current > expected:
-            diff = current - expected
-            for _ in range(diff):
-                if self.state.active_inventory:
-                    self.state.active_inventory.pop(0)
-
-        self._update_fill_counters_from_inventory()
-        self._save_state()
+            # 校验一致性（规则 7）
+            self.verify_inventory_consistency()
+            
+            return {
+                "action": "reconcile",
+                "detail": f"synced_inventory, final_count={len(self.state.active_inventory)}, expected={expected}",
+            }
         
-        return {
-            "action": "reconcile",
-            "detail": f"synced_inventory, final_count={len(self.state.active_inventory)}, expected={expected}",
-        }
+        # 数量匹配，校验一致性
+        self.verify_inventory_consistency()
+        return None
 
     def _btc_to_contracts(self, btc_qty: float, exchange_min_qty: float = 0.0) -> float:
         """BTC 转合约张数"""
@@ -1138,12 +1527,17 @@ class GridPositionManager:
         if not matched_lvl:
             return False
 
+        # 计算 level_index（索引归属原则）
+        level_index = self.get_level_index_by_level_id(matched_lvl.level_id)
+        if level_index is None:
+            level_index = self.find_level_index_for_price(buy_price, self.state.support_levels_state)
+
         new_fill = ActiveFill(
             order_id=order_id,
             price=buy_price,
             qty=buy_qty,
-            level_id=matched_lvl.level_id,
-            timestamp=int(time.time())
+            timestamp=int(time.time()),
+            level_index=level_index
         )
         self.state.active_inventory.append(new_fill)
         self._update_fill_counters_from_inventory()
@@ -1151,16 +1545,25 @@ class GridPositionManager:
         return True
 
     def _update_fill_counters_from_inventory(self) -> None:
-        """从清单同步计数器"""
+        """
+        从清单同步计数器 (SELL_MAPPING.md 规则 7)
+        
+        使用 level_index 而非 level_id 进行归属计算
+        """
         if not self.state:
             return
-        for lvl in self.state.support_levels_state:
+        
+        levels = self.state.support_levels_state
+        
+        # 重置所有计数器
+        for lvl in levels:
             lvl.fill_counter = 0
+        
+        # 根据 level_index 计算归属（考虑越界兜底）
         for fill in self.state.active_inventory:
-            for lvl in self.state.support_levels_state:
-                if lvl.level_id == fill.level_id:
-                    lvl.fill_counter += 1
-                    break
+            effective_idx = self.get_effective_index(fill, levels)
+            if effective_idx < len(levels):
+                levels[effective_idx].fill_counter += 1
 
     def release_fill_counter_by_qty(self, sell_qty: float) -> None:
         """卖出后释放持仓记录"""
@@ -1357,7 +1760,10 @@ class GridPositionManager:
                 settled_inventory=[
                     ActiveFill.from_dict(f) for f in grid_data.get("settled_inventory", [])
                 ],
-                level_mapping=grid_data.get("level_mapping", {}),
+                # JSON 的键总是字符串，需要转换为整数
+                level_mapping={
+                    int(k): v for k, v in grid_data.get("level_mapping", {}).items()
+                },
                 per_grid_contracts=grid_data.get("per_grid_contracts", 0),
                 contract_size=grid_data.get("contract_size", 0.0001),
                 num_grids=grid_data.get("num_grids", 0),

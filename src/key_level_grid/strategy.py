@@ -878,11 +878,9 @@ class KeyLevelGridStrategy:
                 leverage = self.config.leverage
                 self.logger.info(f"🔧 重新设置保证金模式: {margin_mode}, 杠杆: {leverage}x")
                 await self._executor.set_margin_mode(gate_symbol, margin_mode)
-                if margin_mode == "cross":
-                    await self._executor.set_leverage(gate_symbol, 0)
-                else:
-                    await self._executor.set_leverage(gate_symbol, leverage)
-                self.logger.info(f"✅ 保证金模式设置完成")
+                # 全仓/逐仓模式都使用配置的杠杆值
+                await self._executor.set_leverage(gate_symbol, leverage)
+                self.logger.info(f"✅ 保证金模式设置完成: {margin_mode}, {leverage}x")
             except Exception as e:
                 self.logger.warning(f"⚠️ 设置保证金模式失败: {e}")
 
@@ -1421,8 +1419,13 @@ class KeyLevelGridStrategy:
                     # Inventory 模式：统一由 increment_fill_counter_by_order 处理
                     self.position_manager.increment_fill_counter_by_order(order_id, price, qty)
                     
-                    # 写入本地账本（复用已查找的 lvl）
+                    # 写入本地账本（包含 level_index）
                     lvl = filled_support_lvl
+                    level_index = self.position_manager.get_level_index_by_level_id(
+                        lvl.level_id if lvl else 0
+                    )
+                    if level_index is None:
+                        level_index = self.position_manager.find_level_index_for_price(price)
                     self.trade_store.append_trade({
                         "timestamp": int(time.time()),
                         "order_id": order_id,
@@ -1431,7 +1434,7 @@ class KeyLevelGridStrategy:
                         "price": price,
                         "qty": qty,
                         "cost": cost,
-                        "level_id": lvl.level_id if lvl else None
+                        "level_index": level_index
                     })
                     
                     self._mark_level_idle("buy", price)
@@ -2385,18 +2388,12 @@ class KeyLevelGridStrategy:
             
             self.logger.info(f"🔧 配置保证金模式: {margin_mode}, 杠杆: {leverage}x")
 
-            # 按 ArbStream 的方式设置：先设置保证金模式，再设置杠杆
-            # Gate.io 的逻辑：leverage=0 表示全仓，leverage>0 表示逐仓
+            # 先设置保证金模式，再设置杠杆
             await self._executor.set_margin_mode(gate_symbol, margin_mode)
             
-            if margin_mode == "cross":
-                # 全仓模式：leverage=0
-                await self._executor.set_leverage(gate_symbol, 0)
-                self.logger.info("✅ 全仓模式设置完成 (leverage=0)")
-            else:
-                # 逐仓模式：设置指定杠杆
-                await self._executor.set_leverage(gate_symbol, leverage)
-                self.logger.info(f"✅ 逐仓模式设置完成: {leverage}x")
+            # 全仓/逐仓模式都使用配置的杠杆值
+            await self._executor.set_leverage(gate_symbol, leverage)
+            self.logger.info(f"✅ 保证金模式设置完成: {margin_mode}, {leverage}x")
             
         except Exception as e:
             self.logger.warning(f"⚠️ 设置杠杆/保证金模式失败 (可能已有持仓): {e}")
@@ -3114,12 +3111,10 @@ class KeyLevelGridStrategy:
             self.config.leverage = int(leverage)
             if self._executor:
                 gate_symbol = self._convert_to_gate_symbol(self.config.symbol)
-                # 按 ArbStream 的方式设置：先保证金模式，再杠杆
+                # 先保证金模式，再杠杆
                 await self._executor.set_margin_mode(gate_symbol, margin_mode)
-                if margin_mode == "cross":
-                    await self._executor.set_leverage(gate_symbol, 0)
-                else:
-                    await self._executor.set_leverage(gate_symbol, int(leverage))
+                # 全仓/逐仓模式都使用配置的杠杆值
+                await self._executor.set_leverage(gate_symbol, int(leverage))
         return True
 
     async def tg_deep_recon(self) -> bool:

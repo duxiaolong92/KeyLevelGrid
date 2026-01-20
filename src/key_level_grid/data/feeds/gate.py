@@ -35,6 +35,8 @@ class GateKlineFeed:
     WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
     
     # 周期映射: Timeframe -> Gate API interval
+    # Gate.io API 使用 "7d" 表示周线，"1d" 表示日线
+    # 注意: Gate.io 不直接支持 3d，需要用 3 根日线聚合
     TIMEFRAME_MAP = {
         Timeframe.M1: "1m",
         Timeframe.M5: "5m",
@@ -43,6 +45,7 @@ class GateKlineFeed:
         Timeframe.H1: "1h",
         Timeframe.H4: "4h",
         Timeframe.D1: "1d",
+        Timeframe.D3: "1d",  # V3.2.5: 用日线聚合，实际取最近 3 天数据
         Timeframe.W1: "7d",
     }
     

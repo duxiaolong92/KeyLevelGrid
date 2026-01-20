@@ -402,7 +402,31 @@ class KeyLevelGridStrategy:
                     timeframe="multi" if len(score.source_timeframes) > 1 else (score.source_timeframes[0] if score.source_timeframes else "4h"),
                 ))
         
-        self.logger.info(f"[V3.0] 生成水位: {len(supports)} 支撑, {len(resistances)} 阻力")
+        self.logger.info(f"[V3.2.5] 生成水位: {len(supports)} 支撑, {len(resistances)} 阻力")
+        
+        # 输出详细水位表
+        if supports:
+            self.logger.info("=" * 60)
+            self.logger.info("📉 支撑位列表:")
+            self.logger.info(f"{'价格':>12} | {'评分':>6} | {'来源':>15} | 距当前")
+            self.logger.info("-" * 60)
+            for lvl in supports[:10]:  # 只显示前10个
+                dist_pct = (lvl.price - current_price) / current_price * 100
+                self.logger.info(f"{lvl.price:>12.2f} | {lvl.strength:>6.1f} | {lvl.source:>15} | {dist_pct:>+.2f}%")
+        
+        if resistances:
+            self.logger.info("=" * 60)
+            self.logger.info("📈 阻力位列表:")
+            self.logger.info(f"{'价格':>12} | {'评分':>6} | {'来源':>15} | 距当前")
+            self.logger.info("-" * 60)
+            for lvl in resistances[:10]:  # 只显示前10个
+                dist_pct = (lvl.price - current_price) / current_price * 100
+                self.logger.info(f"{lvl.price:>12.2f} | {lvl.strength:>6.1f} | {lvl.source:>15} | {dist_pct:>+.2f}%")
+        else:
+            self.logger.warning("⚠️ 阻力位为空!")
+        
+        self.logger.info("=" * 60)
+        
         return supports, resistances
     
     def _init_notifier(self) -> None:
@@ -926,13 +950,9 @@ class KeyLevelGridStrategy:
                 leverage = self.config.leverage
                 self.logger.info(f"🔧 重新设置保证金模式: {margin_mode}, 杠杆: {leverage}x")
                 await self._executor.set_margin_mode(gate_symbol, margin_mode)
-                if margin_mode == "cross":
-                    # Gate.io 全仓模式: leverage=0 (杠杆由交易所自动管理)
-                    await self._executor.set_leverage(gate_symbol, 0)
-                else:
-                    # 逐仓模式: 使用配置的杠杆值
-                    await self._executor.set_leverage(gate_symbol, leverage)
-                self.logger.info(f"✅ 保证金模式设置完成")
+                # 全仓/逐仓模式都使用配置的杠杆值
+                await self._executor.set_leverage(gate_symbol, leverage)
+                self.logger.info(f"✅ 保证金模式设置完成: {margin_mode}, {leverage}x")
             except Exception as e:
                 self.logger.warning(f"⚠️ 设置保证金模式失败: {e}")
 
@@ -1654,18 +1674,12 @@ class KeyLevelGridStrategy:
             
             self.logger.info(f"🔧 配置保证金模式: {margin_mode}, 杠杆: {leverage}x")
 
-            # 按 ArbStream 的方式设置：先设置保证金模式，再设置杠杆
-            # Gate.io 的逻辑：leverage=0 表示全仓，leverage>0 表示逐仓
+            # 先设置保证金模式，再设置杠杆
             await self._executor.set_margin_mode(gate_symbol, margin_mode)
             
-            if margin_mode == "cross":
-                # 全仓模式：leverage=0
-                await self._executor.set_leverage(gate_symbol, 0)
-                self.logger.info("✅ 全仓模式设置完成 (leverage=0)")
-            else:
-                # 逐仓模式：设置指定杠杆
-                await self._executor.set_leverage(gate_symbol, leverage)
-                self.logger.info(f"✅ 逐仓模式设置完成: {leverage}x")
+            # 全仓/逐仓模式都使用配置的杠杆值
+            await self._executor.set_leverage(gate_symbol, leverage)
+            self.logger.info(f"✅ 保证金模式设置完成: {margin_mode}, {leverage}x")
             
         except Exception as e:
             self.logger.warning(f"⚠️ 设置杠杆/保证金模式失败 (可能已有持仓): {e}")
@@ -2141,12 +2155,10 @@ class KeyLevelGridStrategy:
             self.config.leverage = int(leverage)
             if self._executor:
                 gate_symbol = self._convert_to_gate_symbol(self.config.symbol)
-                # 按 ArbStream 的方式设置：先保证金模式，再杠杆
+                # 先保证金模式，再杠杆
                 await self._executor.set_margin_mode(gate_symbol, margin_mode)
-                if margin_mode == "cross":
-                    await self._executor.set_leverage(gate_symbol, 0)
-                else:
-                    await self._executor.set_leverage(gate_symbol, int(leverage))
+                # 全仓/逐仓模式都使用配置的杠杆值
+                await self._executor.set_leverage(gate_symbol, int(leverage))
         return True
 
     async def tg_deep_recon(self) -> bool:

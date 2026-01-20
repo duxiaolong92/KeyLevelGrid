@@ -557,7 +557,10 @@ class TestLevelCalculator:
         config = {
             "level_generation": {
                 "fibonacci_lookback": [8, 21, 55],
-                "timeframes": ["1d", "4h"],
+                "timeframes": {
+                    "l2_skeleton": {"interval": "1d"},
+                    "l3_relay": {"interval": "4h"},
+                },
             },
             "resistance": {
                 "merge_tolerance": 0.01,
@@ -661,12 +664,13 @@ class TestMTFCoefficient:
         assert calculate_mtf_coefficient(["4h"]) == 1.0
     
     def test_double_tf(self):
-        """双时间框架"""
+        """双时间框架 (V3.2.5: 基于数量)"""
+        # V3.2.5: 双框架共振系数统一为 1.5
         assert calculate_mtf_coefficient(["1d", "4h"]) == 1.5
-        assert calculate_mtf_coefficient(["4h", "15m"]) == 1.2
+        assert calculate_mtf_coefficient(["4h", "15m"]) == 1.5
     
     def test_triple_tf(self):
-        """三时间框架"""
+        """三时间框架 (V3.2.5: 基于数量)"""
         assert calculate_mtf_coefficient(["1d", "4h", "15m"]) == 2.0
 
 

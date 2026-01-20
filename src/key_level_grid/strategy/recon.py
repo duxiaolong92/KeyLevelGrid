@@ -318,7 +318,10 @@ class ReconEventManager:
         # 更新持仓清单
         self.position_manager.increment_fill_counter_by_order(order_id, price, qty)
         
-        # 写入本地账本
+        # 写入本地账本（包含 level_index）
+        level_index = self.position_manager.get_level_index_by_level_id(filled_support_level_id)
+        if level_index is None:
+            level_index = self.position_manager.find_level_index_for_price(price)
         self.trade_store.append_trade({
             "timestamp": int(time.time()),
             "order_id": order_id,
@@ -327,7 +330,7 @@ class ReconEventManager:
             "price": price,
             "qty": qty,
             "cost": cost,
-            "level_id": filled_support_level_id
+            "level_index": level_index
         })
         
         if self._mark_level_idle_callback:

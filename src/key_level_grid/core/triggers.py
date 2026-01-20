@@ -1,5 +1,5 @@
 """
-触发器与日志数据结构 (LEVEL_GENERATION.md v3.1.0)
+触发器与日志数据结构 (LEVEL_GENERATION.md v3.2.5)
 
 包含:
 - RebuildTrigger: 重构触发原因枚举
@@ -8,6 +8,8 @@
 - ManualBoundary: 手动边界设置
 - PendingMigration: 原子性重构事务日志
 - KlineSyncStatus: K 线同步状态
+- ATRConfig: ATR 空间硬约束配置 (V3.2.5)
+- TimeframeConfig: 时间框架层级配置 (V3.2.5)
 """
 
 import time
@@ -329,6 +331,8 @@ DEFAULT_SCORE_REFRESH_COOLDOWN = {
 
 # K 线同步最大延迟 (秒)
 DEFAULT_MAX_KLINE_LAG = {
+    "1w":  600,   # 周线允许 10 分钟延迟
+    "3d":  600,   # 3日线允许 10 分钟延迟
     "1d":  300,   # 日线允许 5 分钟延迟
     "4h":  60,    # 4h 允许 1 分钟延迟
     "15m": 30,    # 15m 允许 30 秒延迟
@@ -336,10 +340,206 @@ DEFAULT_MAX_KLINE_LAG = {
 
 # K 线步长 (毫秒)
 KLINE_INTERVAL_MS = {
+    "1w":  7 * 24 * 60 * 60 * 1000,
+    "3d":  3 * 24 * 60 * 60 * 1000,
     "1d":  24 * 60 * 60 * 1000,
     "4h":  4 * 60 * 60 * 1000,
     "15m": 15 * 60 * 1000,
 }
+
+
+# ============================================
+# V3.2.5 新增数据结构
+# ============================================
+
+@dataclass
+class TimeframeLayerConfig:
+    """
+    单层时间框架配置 (V3.2.5)
+    
+    用于配置四层级系统中的每一层:
+    - L1 战略层 (1w/3d)
+    - L2 骨架层 (1d)
+    - L3 中继层 (4h)
+    - L4 战术层 (15m)
+    """
+    layer: str                            # 层级标识: "l1", "l2", "l3", "l4"
+    interval: str                         # 时间框架: "1w", "3d", "1d", "4h", "15m"
+    enabled: bool = True                  # 是否启用
+    fib_lookback: List[int] = field(default_factory=lambda: [8, 21, 55])  # 斐波那契回溯
+    triggers_rebuild: bool = True         # 是否触发重构
+    use_fallback: bool = False            # 是否启用降级 (L1 专用)
+    fallback_interval: Optional[str] = None  # 降级时间框架 (如 "3d")
+    
+    def to_dict(self) -> dict:
+        return {
+            "layer": self.layer,
+            "interval": self.interval,
+            "enabled": self.enabled,
+            "fib_lookback": self.fib_lookback,
+            "triggers_rebuild": self.triggers_rebuild,
+            "use_fallback": self.use_fallback,
+            "fallback_interval": self.fallback_interval,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict, layer: str) -> "TimeframeLayerConfig":
+        return cls(
+            layer=layer,
+            interval=data.get("interval", "4h"),
+            enabled=data.get("enabled", True),
+            fib_lookback=data.get("fib_lookback", [8, 21, 55]),
+            triggers_rebuild=data.get("triggers_rebuild", True),
+            use_fallback=data.get("use_3d_fallback", False),
+            fallback_interval="3d" if data.get("use_3d_fallback", False) else None,
+        )
+
+
+@dataclass
+class ATRConfig:
+    """
+    ATR 空间硬约束配置 (V3.2.5 核心)
+    
+    系统的最高物理准则，所有生成的候选水位必须通过此审计器。
+    
+    密度审计门槛:
+    - gap_min_atr_ratio: 最小间距约束 (默认 0.5×ATR)
+      - 若相邻水位距离 < 0.5×ATR，触发能量优先裁剪
+      - 裁剪准则: 比较 W_vol，保留 POC/HVN，剔除 LVN
+    
+    - gap_max_atr_ratio: 最大间距约束 (默认 3.0×ATR)
+      - 若相邻水位距离 > 3.0×ATR，触发递归补全
+    
+    补全优先级:
+    1. 战术种子召回 (L4 分形池)
+    2. VPVR 能量锚点 (POC/HVN)
+    3. 斐波那契数学兜底 (0.618)
+    """
+    enabled: bool = True                  # 是否启用 ATR 约束
+    atr_period: int = 14                  # ATR 计算周期
+    atr_timeframe: str = "4h"             # ATR 计算时间框架
+    
+    # 间距约束 (以 ATR 倍数为单位)
+    gap_min_atr_ratio: float = 0.5        # 最小间距 = 0.5 × ATR
+    gap_max_atr_ratio: float = 3.0        # 最大间距 = 3.0 × ATR
+    
+    # 补全优先级
+    fill_priority: List[str] = field(default_factory=lambda: ["tactical", "vpvr", "fibonacci"])
+    
+    # 斐波那契兜底配置
+    fibonacci_fill_ratio: float = 0.618   # 兜底插入位置比例
+    fibonacci_fill_score: int = 35        # 兜底水位的强制评分
+    fibonacci_enabled: bool = True        # 是否启用斐波那契兜底
+    
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "atr_period": self.atr_period,
+            "atr_timeframe": self.atr_timeframe,
+            "gap_min_atr_ratio": self.gap_min_atr_ratio,
+            "gap_max_atr_ratio": self.gap_max_atr_ratio,
+            "fill_priority": self.fill_priority,
+            "fibonacci_fill_ratio": self.fibonacci_fill_ratio,
+            "fibonacci_fill_score": self.fibonacci_fill_score,
+            "fibonacci_enabled": self.fibonacci_enabled,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> "ATRConfig":
+        return cls(
+            enabled=data.get("enabled", True),
+            atr_period=int(data.get("atr_period", 14)),
+            atr_timeframe=data.get("atr_timeframe", "4h"),
+            gap_min_atr_ratio=float(data.get("gap_min_atr_ratio", 0.5)),
+            gap_max_atr_ratio=float(data.get("gap_max_atr_ratio", 3.0)),
+            fill_priority=data.get("fill_priority", ["tactical", "vpvr", "fibonacci"]),
+            fibonacci_fill_ratio=float(data.get("fibonacci_fill_ratio", 0.618)),
+            fibonacci_fill_score=int(data.get("fibonacci_fill_score", 35)),
+            fibonacci_enabled=data.get("fibonacci_enabled", True),
+        )
+    
+    def is_too_dense(self, gap: float, atr: float) -> bool:
+        """
+        检查间距是否过密
+        
+        Args:
+            gap: 两个水位之间的价格差距 (绝对值)
+            atr: 当前 ATR 值
+        
+        Returns:
+            True if gap < gap_min_atr_ratio × ATR
+        """
+        if not self.enabled or atr <= 0:
+            return False
+        return gap < (self.gap_min_atr_ratio * atr)
+    
+    def is_too_sparse(self, gap: float, atr: float) -> bool:
+        """
+        检查间距是否过稀
+        
+        Args:
+            gap: 两个水位之间的价格差距 (绝对值)
+            atr: 当前 ATR 值
+        
+        Returns:
+            True if gap > gap_max_atr_ratio × ATR
+        """
+        if not self.enabled or atr <= 0:
+            return False
+        return gap > (self.gap_max_atr_ratio * atr)
+    
+    def get_fibonacci_fill_price(self, upper: float, lower: float) -> float:
+        """
+        计算斐波那契兜底插入价格
+        
+        Args:
+            upper: 区间上界
+            lower: 区间下界
+        
+        Returns:
+            插入价格 (上界 - (上界 - 下界) × ratio)
+        """
+        return upper - (upper - lower) * self.fibonacci_fill_ratio
+
+
+@dataclass
+class FilledLevel:
+    """
+    补全水位数据结构 (V3.2.5)
+    
+    标记由 ATR 稀疏补全机制插入的水位，
+    便于回测分析和诊断。
+    """
+    price: float                          # 插入价格
+    fill_type: str                        # 补全类型: "tactical" | "vpvr" | "fibonacci"
+    score: int                            # 分配的评分
+    source_layer: Optional[str] = None    # 来源层级 (tactical 类型)
+    vpvr_zone: Optional[str] = None       # VPVR 区域类型 (vpvr 类型)
+    gap_upper: Optional[float] = None     # 空隙上界
+    gap_lower: Optional[float] = None     # 空隙下界
+    
+    def to_dict(self) -> dict:
+        return {
+            "price": self.price,
+            "fill_type": self.fill_type,
+            "score": self.score,
+            "source_layer": self.source_layer,
+            "vpvr_zone": self.vpvr_zone,
+            "gap_upper": self.gap_upper,
+            "gap_lower": self.gap_lower,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> "FilledLevel":
+        return cls(
+            price=float(data.get("price", 0)),
+            fill_type=data.get("fill_type", "fibonacci"),
+            score=int(data.get("score", 35)),
+            source_layer=data.get("source_layer"),
+            vpvr_zone=data.get("vpvr_zone"),
+            gap_upper=data.get("gap_upper"),
+            gap_lower=data.get("gap_lower"),
+        )
 
 
 def should_rebuild_grid(

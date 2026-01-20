@@ -1,181 +1,184 @@
 # ============================================
-# KeyLevelGrid V3.0 渐进式上线配置
-# ============================================
-# 用途: 模拟环境测试 V3.0 新功能
-# 说明: 此配置在正式上线前用于验证 V3.0 功能
+# KeyLevelGrid V3.2.5 配置
 # ============================================
 
-# ============================================
 # 运行模式
-# ============================================
-dry_run: false                     # true = 模拟模式, false = 实盘模式
+dry_run: false
 
 # ============================================
-# 交易配置
+# 交易配置 (必须)
 # ============================================
 trading:
   symbol: "BNBUSDT"
   exchange: "gate"
   market_type: "futures"
-  # ⚠️ Gate.io 限制: 全仓(cross)模式无法指定杠杆，杠杆由交易所自动管理
-  # 如需固定杠杆，必须使用逐仓(isolated)模式
-  margin_mode: "isolated"         # 逐仓模式 (可指定杠杆)
-  leverage: 3                     # 杠杆倍数 (3x)
+  margin_mode: "isolated"
+  leverage: 3
   timeframe: "4h"
   aux_timeframes: ["1d"]
-  default_contract_size: 0.01     # BNB 合约大小 (每张 0.01 BNB)
+  default_contract_size: 0.01
 
-# ============================================
-# API 配置 (从环境变量读取)
-# ============================================
+# API 配置
 api:
   key_env: "GATE_KLG_API_KEY"
   secret_env: "GATE_KLG_API_SECRET"
 
-# ============================================
 # 仓位配置
-# ============================================
 position:
-  max_leverage: 3                 # 与 trading.leverage 保持一致
+  max_leverage: 3
   max_capital_usage: 0.8
 
 # ============================================
-# 🆕 V3.0 功能开关
+# V3.2.5 功能开关
 # ============================================
 v3_features:
-  # 主开关: 是否启用 V3.0 水位生成
-  level_generation_enabled: false
-  
-  # MTF 数据同步检查
+  level_generation_enabled: true
   kline_sync_enabled: true
-  
-  # 原子性重构执行器
   atomic_rebuild_enabled: true
-  
-  # 仅评分刷新模式 (不重构订单)
   score_refresh_only: false
-  
-  # 日志详细程度: DEBUG, INFO, WARNING
   log_level: "DEBUG"
 
 # ============================================
 # 网格配置
 # ============================================
 grid:
-  # 基础参数
-  max_levels: 10                   # 最大水位数 (当 use_all_qualified = true 时忽略)
-  use_all_qualified: true          # 🆕 是否使用所有满足条件的水位
-                                   # true: 边界内所有满足评分的水位都作为网格 (忽略 max_levels)
-                                   # false: 按评分排序，只取前 max_levels 个
-  min_profit_pct: 0.003            # 最小利润 0.3%
-  base_amount_per_grid: 0.1      # 每格数量 (BNB) - 遵循 CONSTITUTION C3 单位规范
+  max_levels: 10
+  use_all_qualified: true
+  min_profit_pct: 0.001
+  base_amount_per_grid: 0.1  # BNB
   
-  # 🆕 V3.0 精度配置 (消除硬编码)
   precision:
-    price_tolerance: 0.0001       # 价格匹配容差 (0.01%)
-    qty_tolerance: 0.05           # 数量匹配容差 (5%)
-    merge_tolerance: 0.002        # 水位合并容差 (0.2%)
-    snap_tolerance: 0.005          # 心理位吸附容差 (0.5%)
+    price_tolerance: 0.0001
+    qty_tolerance: 0.05
+    merge_tolerance: 0.002
+    snap_tolerance: 0.005
   
-  # 🆕 V3.0 水位生成配置
+  # ===== V3.2.5 水位生成核心配置 =====
   level_generation:
-    enabled: true                 # 是否启用 V3.0 动态水位生成
+    enabled: true
     
-    # MTF 时间框架配置
-    main_interval: "4h"           # 主时间框架 (战略位)
-    aux_intervals: ["1d", "1h"]  # 辅助时间框架
+    # 四层级时间框架
+    timeframes:
+      l1_strategy:
+        enabled: true
+        interval: "1w"
+        use_3d_fallback: true
+        fib_lookback: [8, 21, 55]           # 简化: 单一周期
+      l2_skeleton:
+        interval: "1d"
+        fib_lookback: [13, 34, 55, 89, 144]
+        enabled: true
+      l3_relay:
+        interval: "4h"
+        fib_lookback: [8, 21, 55, 89, 144, 233, 377, 610]
+        enabled: true
+      l4_tactical:
+        enabled: true
+        interval: "15m"
+        fib_lookback: [34, 55, 144]
+        triggers_rebuild: false
     
-    # 斐波那契回溯周期 (数值越小，识别的分形点越多)
-    fibonacci_lookback: [5, 13, 34]  # 短线/中线/长线 (调整为更密集)
+    # ATR 空间硬约束 (V3.2.5 核心)
+    atr_constraint:
+      enabled: true
+      atr_period: 14
+      atr_timeframe: "4h"
+      gap_min_atr_ratio: 0.3
+      gap_max_atr_ratio: 3.0
+      fill_priority: ["tactical", "vpvr", "fibonacci"]
+      fibonacci_fill_ratio: 0.618
+      fibonacci_fill_score: 35
+      fibonacci_enabled: true
     
-    # 评分权重配置
+    # 评分矩阵 (V3.2.5)
     scoring:
-      base_scores:                # 基础分，根据分形点来源周期
-        "55x": 80                 # 长线 (战略级防线)
-        "21x": 50                 # 中线 (核心震荡带)
-        "8x": 20                  # 短线 (灵敏度高)
-      
-      volume_weights:             # 成交量权重
-        hvn: 1.3                  # 高成交量节点
-        lvn: 0.6                  # 低成交量节点 (真空区)
-        normal: 1.0               # 普通区域
-      
-      psychology_weight: 1.2      # 心理位吸附权重
-      
-      trend_coefficients:         # 趋势系数 (基于 EMA 隧道)
-        bull_support: 1.2         # 多头趋势下支撑位加成
-        bull_resistance: 0.8      # 多头趋势下阻力位减成
-        bear_support: 0.8         # 空头趋势下支撑位减成
-        bear_resistance: 1.2      # 空头趋势下阻力位加成
-      
-      mtf_resonance_coefficient: 1.5  # 多周期共振加成系数
-      min_score_threshold: 30     # 水位最低评分阈值 (低于此分不生成水位)
-      display_score_threshold: 20 # 🆕 显示过滤阈值 (低于此分不在界面显示，但仍参与计算)
-      max_score: 100              # 🆕 百分制封顶 (评分上限，超过此值的封顶为此值)
+      timeframe_weights:
+        "1w": 2.0
+        "3d": 1.8
+        "1d": 1.5
+        "4h": 1.0
+        "15m": 0.6
+      period_scores:
+        144: 100
+        89: 80
+        55: 60
+        34: 45
+        21: 35
+        13: 25
+        8: 15
+      volume_weights:
+        poc: 1.8
+        hvn: 1.5
+        normal: 1.0
+        lvn: 0.4
+      mtf_resonance:
+        4: 2.5
+        3: 2.0
+        2: 1.5
+        1: 1.0
+      trend_coefficients:
+        bullish:
+          support: 1.1
+          resistance: 0.9
+        bearish:
+          support: 0.9
+          resistance: 1.1
+        neutral:
+          support: 1.0
+          resistance: 1.0
+      min_score_threshold: 30
+      display_score_threshold: 20
     
-    # 重构触发配置
+    # 重构触发 (仅 L2 1d 55x 锚点)
     rebuild_triggers:
-      anchor_drift_threshold: 0.03  # 锚点价格偏移阈值 (3%)
-      cooldown_sec: 900             # 重构冷却时间 (15 分钟)
-      coverage_alert_levels: 1      # 剩余 1 格触发覆盖告急
-      daily_refresh_time: "00:00"   # 每日定时刷新时间
+      anchor_timeframe: "1d"
+      anchor_period: 55
+      anchor_drift_threshold: 0.03
+      cooldown_sec: 900
+      coverage_alert_levels: 1
     
-    # K 线同步配置
+    # 静默刷新 (4h/15m 只更新评分，不改挂单)
+    silent_refresh:
+      enabled: true
+      timeframes: ["4h", "15m"]
+      allow_score_update: true
+      allow_qty_update: true
+      forbid_price_change: true
+    
+    # K 线同步
     kline_sync:
-      enabled: true               # 是否启用 K 线同步检查
-      max_desync_tolerance_sec: 60  # 最大允许 K 线不同步时间 (秒)
-    
-    # 🆕 手动网格边界配置
-    # 用途: 当自动分形提取的网格范围太窄时，手动指定上下边界
-    # 注意: 启用后会覆盖自动计算的边界，但不影响水位评分
+      enabled: true
+      max_desync_tolerance_sec: 60
+      max_lag:
+        "1w": 600
+        "3d": 600
+        "1d": 300
+        "4h": 60
+        "15m": 30
+
+    # 手动边界 (默认关闭)
     manual_boundary:
-      enabled: false               # 是否启用手动边界
-      upper_price: 100000.0       # 手动上边界 (阻力区上限)
-      lower_price: 85000.0        # 手动下边界 (支撑区下限)
-      # 边界模式:
-      #   "strict"  - 严格模式，超出边界的水位直接丢弃
-      #   "filter"  - 过滤模式，超出边界的水位降低评分但保留
-      #   "expand"  - 扩展模式，自动边界与手动边界取并集
+      enabled: false
+      upper_price: 100000.0
+      lower_price: 85000.0
       mode: "strict"
-      # 边界缓冲: 在边界外增加缓冲区 (百分比)
-      buffer_pct: 0.01            # 1% 缓冲区
+      buffer_pct: 0.01
 
 # ============================================
-# 渐进式上线检查清单
-# ============================================
-# 
-# 阶段 1: 模拟环境测试 (本配置)
-# □ 验证 LevelCalculator 输出
-# □ 验证 MTFKlineFeed 同步
-# □ 验证 AtomicRebuildExecutor 事务性
-# □ 监控日志无 ALARM 告警
-# 
-# 阶段 2: 小仓位实盘测试
-# □ 将 per_grid_amount 设为最小值
-# □ 将 max_levels 设为 3-5
-# □ 运行 24-48 小时观察
-# 
-# 阶段 3: 正式上线
-# □ 恢复正常仓位大小
-# □ 开启所有 V3.0 功能
-# □ 持续监控 rebuild_logs
+# 可选配置 (按需启用)
 # ============================================
 
-# ============================================
-# 告警配置
-# ============================================
-alerts:
-  telegram_enabled: true
-  alarm_on_rebuild_fail: true
-  alarm_on_sync_fail: true
-  daily_summary_enabled: true
+# # 告警配置
+# alerts:
+#   telegram_enabled: true
+#   alarm_on_rebuild_fail: true
+#   alarm_on_sync_fail: true
+#   daily_summary_enabled: true
 
-# ============================================
-# 日志配置
-# ============================================
-logging:
-  level: "DEBUG"
-  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-  file: "logs/v3_staging.log"
-  max_bytes: 10485760  # 10MB
-  backup_count: 5
+# # 日志配置
+# logging:
+#   level: "DEBUG"
+#   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+#   file: "logs/v3_staging.log"
+#   max_bytes: 10485760
+#   backup_count: 5

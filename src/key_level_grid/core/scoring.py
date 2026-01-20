@@ -30,17 +30,23 @@ class TrendState(str, Enum):
 @dataclass
 class FractalPoint:
     """
-    分形点 (MTF 增强版)
+    分形点 (V3.2.5 四层级增强版)
     
     分形点是基于斐波那契周期的物理极值点，
     用于识别市场结构中的关键支撑/阻力位。
+    
+    V3.2.5 新增:
+    - layer: 所属层级 (l1/l2/l3/l4)
+    - is_anchor: 是否为锚点 (L2 55x)
     """
-    price: float                # 分形价格
-    timestamp: int              # 时间戳 (ms)
-    type: str                   # "HIGH" | "LOW"
-    timeframe: str              # 时间框架 "1d" | "4h" | "15m"
-    period: int                 # 回溯周期 8/13/21/34/55/89
-    kline_index: int            # K 线索引 (从最新向前计数)
+    price: float                          # 分形价格
+    timestamp: int                        # 时间戳 (ms)
+    type: str                             # "HIGH" | "LOW"
+    timeframe: str                        # 时间框架 "1w" | "3d" | "1d" | "4h" | "15m"
+    period: int                           # 回溯周期 8/13/21/34/55/89/144
+    kline_index: int                      # K 线索引 (从最新向前计数)
+    layer: Optional[str] = None           # V3.2.5: 层级 "l1" | "l2" | "l3" | "l4"
+    is_anchor: bool = False               # V3.2.5: 是否为锚点
     
     def to_dict(self) -> dict:
         return {
@@ -50,6 +56,8 @@ class FractalPoint:
             "timeframe": self.timeframe,
             "period": self.period,
             "kline_index": self.kline_index,
+            "layer": self.layer,
+            "is_anchor": self.is_anchor,
         }
     
     @classmethod
@@ -61,6 +69,8 @@ class FractalPoint:
             timeframe=data.get("timeframe", "4h"),
             period=int(data.get("period", 21)),
             kline_index=int(data.get("kline_index", 0)),
+            layer=data.get("layer"),
+            is_anchor=data.get("is_anchor", False),
         )
 
 
@@ -248,31 +258,35 @@ class MTFLevelCandidate:
 
 
 # ============================================
-# 评分配置常量 (可被 config.yaml 覆盖)
+# 评分配置常量 (V3.2.5 更新，可被 config.yaml 覆盖)
 # ============================================
 
-# 时间框架权重
+# 时间框架权重 (V3.2.5 四层级)
 DEFAULT_TIMEFRAME_WEIGHTS = {
-    "1d":  1.5,   # 趋势层
-    "4h":  1.0,   # 战略层
-    "15m": 0.6,   # 战术层
+    "1w":  2.0,   # L1 战略层 - 最高
+    "3d":  1.8,   # L1 替代: 3日线
+    "1d":  1.5,   # L2 骨架层 - 高
+    "4h":  1.0,   # L3 中继层 - 基准
+    "15m": 0.6,   # L4 战术层 - 辅助
 }
 
-# 周期基础分
+# 周期基础分 (V3.2.5 扩展)
 DEFAULT_PERIOD_SCORES = {
-    89: 80,  # 长周期
-    55: 80,
-    34: 50,  # 中周期
-    21: 50,
-    13: 20,  # 短周期
-    8: 20,
+    144: 100,  # 超长周期 (15m 专用)
+    89: 80,    # 长周期
+    55: 60,
+    34: 45,    # 中周期
+    21: 35,
+    13: 25,    # 短周期
+    8: 15,
 }
 
-# 成交量权重
+# 成交量权重 (V3.2.5 更新: POC/HVN/LVN 区分)
 DEFAULT_VOLUME_WEIGHTS = {
-    VolumeZone.HVN: 1.3,
+    "POC": 1.8,             # 控制点，绝对保留
+    VolumeZone.HVN: 1.5,    # 高能量节点 (V3.2.5: 1.3 → 1.5)
     VolumeZone.NORMAL: 1.0,
-    VolumeZone.LVN: 0.6,
+    VolumeZone.LVN: 0.4,    # 真空区，优先裁剪 (V3.2.5: 0.6 → 0.4)
 }
 
 # 心理位权重
@@ -285,30 +299,45 @@ DEFAULT_TREND_COEFFICIENTS = {
     TrendState.NEUTRAL: {"support": 1.0, "resistance": 1.0},
 }
 
-# MTF 共振系数
+# MTF 共振系数 (V3.2.5 四层级)
 DEFAULT_MTF_RESONANCE = {
-    frozenset(["1d", "4h", "15m"]): 2.0,  # 三框架共振
-    frozenset(["1d", "4h"]):        1.5,  # 趋势+战略
-    frozenset(["1d", "15m"]):       1.3,  # 趋势+战术
-    frozenset(["4h", "15m"]):       1.2,  # 战略+战术
+    # 四框架共振 (极稀有)
+    4: 2.5,
+    # 三框架共振
+    3: 2.0,
+    # 双框架共振
+    2: 1.5,
+    # 单框架
+    1: 1.0,
+}
+
+# 向后兼容: 旧版基于时间框架组合的共振系数
+DEFAULT_MTF_RESONANCE_LEGACY = {
+    frozenset(["1w", "1d", "4h", "15m"]): 2.5,  # 四框架共振
+    frozenset(["1d", "4h", "15m"]): 2.0,        # 三框架共振
+    frozenset(["1d", "4h"]):        1.5,        # 骨架+中继
+    frozenset(["1d", "15m"]):       1.3,        # 骨架+战术
+    frozenset(["4h", "15m"]):       1.2,        # 中继+战术
+    frozenset(["1w", "1d"]):        1.8,        # 战略+骨架
 }
 
 
 def calculate_mtf_coefficient(source_timeframes: List[str]) -> float:
     """
-    计算 MTF 共振系数
+    计算 MTF 共振系数 (V3.2.5)
     
     Args:
         source_timeframes: 该水位被哪些时间框架识别
     
     Returns:
-        共振系数 (1.0 ~ 2.0)
+        共振系数 (1.0 ~ 2.5)
     """
-    if len(source_timeframes) <= 1:
+    n = len(source_timeframes)
+    if n <= 1:
         return 1.0
     
-    tf_set = frozenset(source_timeframes)
-    return DEFAULT_MTF_RESONANCE.get(tf_set, 1.0)
+    # V3.2.5: 基于框架数量的简化计算
+    return DEFAULT_MTF_RESONANCE.get(n, 1.0 + (n - 1) * 0.5)
 
 
 def calculate_base_score(timeframe: str, period: int) -> float:

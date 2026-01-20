@@ -139,7 +139,6 @@ class TestAtomicRebuildSuccess:
                 retired_levels=[],
                 orders_to_cancel=[],
                 orders_to_place=[],
-                inventory_updates=[],
             )
             
             result = await rebuilder.execute(inheritance, "BTCUSDT")
@@ -168,7 +167,6 @@ class TestAtomicRebuildSuccess:
                     OrderRequest(price=95000.0, qty=100, side="buy", level_id=1),
                     OrderRequest(price=94000.0, qty=100, side="buy", level_id=2),
                 ],
-                inventory_updates=[],
             )
             
             result = await rebuilder.execute(inheritance, "BTCUSDT")
@@ -208,7 +206,6 @@ class TestAtomicRebuildCancelFail:
                 orders_to_place=[
                     OrderRequest(price=95000.0, qty=100, side="buy", level_id=1),
                 ],
-                inventory_updates=[],
             )
             
             result = await rebuilder.execute(inheritance, "BTCUSDT")
@@ -250,7 +247,6 @@ class TestAtomicRebuildPlaceFail:
                 orders_to_place=[
                     OrderRequest(price=95000.0, qty=100, side="buy", level_id=1),  # 会失败
                 ],
-                inventory_updates=[],
             )
             
             result = await rebuilder.execute(inheritance, "BTCUSDT")
@@ -294,7 +290,6 @@ class TestAtomicRebuildAlarm:
                 retired_levels=[],
                 orders_to_cancel=["fail_order"],
                 orders_to_place=[],
-                inventory_updates=[],
             )
             
             result = await rebuilder.execute(inheritance, "BTCUSDT")
@@ -329,7 +324,6 @@ class TestAtomicRebuildPersistence:
                 retired_levels=[],
                 orders_to_cancel=["fail_order"],
                 orders_to_place=[],
-                inventory_updates=[],
             )
             
             await rebuilder.execute(inheritance, "BTCUSDT")
@@ -361,7 +355,6 @@ class TestAtomicRebuildPersistence:
                 retired_levels=[],
                 orders_to_cancel=[],
                 orders_to_place=[],
-                inventory_updates=[],
             )
             
             await rebuilder.execute(inheritance, "BTCUSDT")

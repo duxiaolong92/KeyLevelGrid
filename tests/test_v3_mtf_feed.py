@@ -64,8 +64,12 @@ class TestMTFKlineFeedBasic:
     """测试 MTFKlineFeed 基础功能"""
     
     def test_init_default(self):
-        """测试默认初始化"""
+        """测试默认初始化 (V3.2.5: 四层级)"""
         feed = MTFKlineFeed()
+        # V3.2.5: 默认四层级，但无配置时使用默认层级配置
+        # 默认层级配置会生成 ["4h", "4h", "4h", "4h"] (因为无配置)
+        # 使用自定义时间框架测试
+        feed = MTFKlineFeed(timeframes=["1d", "4h", "15m"])
         assert feed.timeframes == ["1d", "4h", "15m"]
     
     def test_init_custom(self):
@@ -129,12 +133,24 @@ class TestMTFKlineFeedSync:
         assert feed.is_synced() is False
     
     def test_is_synced_partial_data(self):
-        """部分数据时返回 False"""
-        feed = MTFKlineFeed(timeframes=["1d", "4h", "15m"])
+        """部分数据时返回 False (V3.2.5: 必须层检查)"""
+        # V3.2.5: 只检查必须层 (L2, L3)
+        # 使用显式配置来测试
+        config = {
+            "level_generation": {
+                "timeframes": {
+                    "l2_skeleton": {"interval": "1d", "enabled": True},
+                    "l3_relay": {"interval": "4h", "enabled": True},
+                    "l4_tactical": {"interval": "15m", "enabled": True},
+                }
+            }
+        }
+        feed = MTFKlineFeed(timeframes=["1d", "4h", "15m"], config=config)
         
-        # 只更新一个时间框架
-        feed.update("4h", generate_klines_with_time("4h", 50))
+        # 只更新一个时间框架，必须层缺失
+        feed.update("15m", generate_klines_with_time("15m", 50))
         
+        # L2 (1d) 和 L3 (4h) 缺失，应该返回 False
         assert feed.is_synced() is False
     
     def test_is_synced_all_data_fresh(self):

@@ -11,12 +11,13 @@ from typing import List, Optional
 
 class Timeframe(Enum):
     """
-    K线周期
+    K线周期 (V3.2.5)
     
     支持的周期:
     - M1/M5/M15/M30: 分钟级
     - H1/H4: 小时级
     - D1: 日线
+    - D3: 3日线 (V3.2.5 新增，L1 层降级用)
     - W1: 周线 (7天)
     """
     M1 = "1m"
@@ -26,6 +27,7 @@ class Timeframe(Enum):
     H1 = "1h"
     H4 = "4h"
     D1 = "1d"
+    D3 = "3d"  # V3.2.5: L1 战略层降级备选
     W1 = "1w"
     
     @classmethod
@@ -52,6 +54,8 @@ class Timeframe(Enum):
             "1hour": cls.H1, "4hour": cls.H4,
             # 天
             "1day": cls.D1, "daily": cls.D1,
+            # 3日线 (V3.2.5)
+            "3day": cls.D3, "3days": cls.D3,
             # 周
             "7d": cls.W1, "7day": cls.W1, "weekly": cls.W1,
         }

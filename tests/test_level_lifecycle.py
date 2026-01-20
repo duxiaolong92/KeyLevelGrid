@@ -169,22 +169,27 @@ class TestInheritByIndex:
         assert result.orders_to_place[0].qty == 100
     
     def test_inherit_updates_inventory(self):
-        """继承时更新持仓记录"""
+        """
+        继承时持仓记录保持不变 (SELL_MAPPING.md 规则 2)
+        
+        根据索引归属原则，持仓的 level_index 在网格重建后不变，
+        自动对应新水位，不再需要 inventory_updates。
+        """
         old_levels = [
             GridLevelState(level_id=100, price=96000, side="buy", fill_counter=1),
         ]
         inventory = [
-            ActiveFill(order_id="fill_001", price=95800, qty=0.001, level_id=100, timestamp=1234567890),
+            # 使用 level_index=0 表示归属第一个水位
+            ActiveFill(order_id="fill_001", price=95800, qty=0.001, timestamp=1234567890, level_index=0),
         ]
         new_prices = [96500]
         
         result = inherit_levels_by_index(new_prices, old_levels, inventory)
         
-        assert len(result.inventory_updates) == 1
-        fill_id, old_id, new_id = result.inventory_updates[0]
-        assert fill_id == "fill_001"
-        assert old_id == 100
-        assert new_id == result.active_levels[0].level_id
+        # 新设计中不再有 inventory_updates
+        # 持仓的 level_index 保持为 0，自动对应新的第一个水位
+        assert len(result.active_levels) == 1
+        assert result.active_levels[0].fill_counter == 1
     
     def test_empty_old_levels(self):
         """旧水位为空"""
@@ -402,10 +407,16 @@ class TestApplyInheritance:
     """测试状态应用函数"""
     
     def test_apply_to_state(self):
-        """应用继承结果到状态"""
+        """
+        应用继承结果到状态 (SELL_MAPPING.md 规则 2)
+        
+        根据索引归属原则，持仓的 level_index 在网格重建后不变，
+        自动对应新水位，不再需要更新 inventory。
+        """
         state = GridState(symbol="BTCUSDT")
         state.active_inventory = [
-            ActiveFill(order_id="fill_001", price=95800, qty=0.001, level_id=100, timestamp=1234567890),
+            # 使用 level_index=0 表示归属第一个水位
+            ActiveFill(order_id="fill_001", price=95800, qty=0.001, timestamp=1234567890, level_index=0),
         ]
         
         result = InheritanceResult(
@@ -415,7 +426,7 @@ class TestApplyInheritance:
             retired_levels=[
                 GridLevelState(level_id=100, price=96000, side="buy", fill_counter=0, lifecycle_status=LevelLifecycleStatus.RETIRED),
             ],
-            inventory_updates=[("fill_001", 100, 200)],
+            # 不再有 inventory_updates
         )
         
         apply_inheritance_to_state(state, result, role="support")
@@ -423,7 +434,8 @@ class TestApplyInheritance:
         assert len(state.support_levels_state) == 1
         assert state.support_levels_state[0].level_id == 200
         assert len(state.retired_levels) == 1
-        assert state.active_inventory[0].level_id == 200  # 已更新
+        # level_index 保持为 0，自动对应新的第一个水位
+        assert state.active_inventory[0].level_index == 0
 
 
 # ============================================

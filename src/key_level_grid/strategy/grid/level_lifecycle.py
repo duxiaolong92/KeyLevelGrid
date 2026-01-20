@@ -39,15 +39,18 @@ class OrderRequest:
 @dataclass
 class InheritanceResult:
     """
-    继承结果
+    继承结果 (SELL_MAPPING.md Section 7)
     
     包含继承后的活跃水位、退役水位、需要执行的订单操作
+    
+    注意：根据规则 2（索引归属原则），持仓的 level_index 在网格重建后不变，
+    自动对应新水位，因此不再需要 inventory_updates 字段。
     """
     active_levels: List[GridLevelState] = field(default_factory=list)
     retired_levels: List[GridLevelState] = field(default_factory=list)
     orders_to_cancel: List[str] = field(default_factory=list)
     orders_to_place: List[OrderRequest] = field(default_factory=list)
-    inventory_updates: List[Tuple[str, int, int]] = field(default_factory=list)
+    # inventory_updates 已废弃 - 持仓使用 level_index，网格重建后不变
     
     def summary(self) -> str:
         """返回结果摘要"""
@@ -55,8 +58,7 @@ class InheritanceResult:
             f"活跃={len(self.active_levels)}, "
             f"退役={len(self.retired_levels)}, "
             f"撤单={len(self.orders_to_cancel)}, "
-            f"挂单={len(self.orders_to_place)}, "
-            f"更新持仓={len(self.inventory_updates)}"
+            f"挂单={len(self.orders_to_place)}"
         )
 
 
@@ -160,11 +162,9 @@ def inherit_levels_by_index(
                     level_id=new_level_id,
                 ))
         
-        for fill in active_inventory:
-            if fill.level_id == old_lvl.level_id:
-                result.inventory_updates.append(
-                    (fill.order_id, old_lvl.level_id, new_level_id)
-                )
+        # 根据 SELL_MAPPING.md 规则 2（索引归属原则），
+        # 持仓的 level_index 在网格重建后不变，自动对应新水位，
+        # 不再需要更新 inventory
     
     # Step 2: 处理多余的新水位 (m > n)
     for i in range(n, m):
@@ -285,12 +285,9 @@ def apply_inheritance_to_state(
         if retired_lvl.level_id not in existing_retired_ids:
             state.retired_levels.append(retired_lvl)
     
-    for fill_id, old_id, new_id in result.inventory_updates:
-        for fill in state.active_inventory:
-            if fill.order_id == fill_id and fill.level_id == old_id:
-                fill.level_id = new_id
-                logger.debug(f"📦 更新持仓 {fill_id}: level_id {old_id} → {new_id}")
-                break
+    # 根据 SELL_MAPPING.md 规则 2（索引归属原则），
+    # 持仓的 level_index 在网格重建后不变，自动对应新水位，
+    # 不再需要更新 inventory
 
 
 def rebuild_level_mapping(state: GridState) -> Dict[int, int]:

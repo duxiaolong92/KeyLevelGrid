@@ -753,7 +753,371 @@ def validate_order_qty(
 
 ---
 
-## 7. 代码检查点
+## 7. 持仓清单管理规格 (Active Inventory Management)
+
+### 7.1 设计背景
+
+**宪法原则三（对账第一真理）** 规定：
+> 交易所数据是系统的**唯一真实来源**。`state.json` 是**快照缓存，随时可重建**。
+
+**宪法原则（降序索引继承）** 规定：
+> 新数组第 i 个成员继承旧数组第 i 个成员的状态。
+
+基于以上原则，`active_inventory` 的设计采用 **索引归属 + 无状态卖单** 模式。
+
+### 7.2 数据结构定义
+
+```python
+@dataclass
+class ActiveFill:
+    """
+    单笔持仓记录
+    
+    设计原则：
+    - 只保留不可变的买入事实 + 水位索引归属
+    - 卖单状态不持久化，每次 Recon 动态计算
+    """
+    
+    # === 不可变的买入事实（来自交易所成交记录）===
+    order_id: str      # 买入订单 ID（唯一标识，用于校验有效性）
+    price: float       # 实际成交价格（非水位价格，保留滑点信息）
+    qty: float         # 实际成交数量
+    timestamp: int     # 成交时间戳
+    
+    # === 水位索引归属 ===
+    level_index: int   # 归属的支撑位索引（0=支撑位1, 1=支撑位2...）
+                       # 📌 网格重建后索引不变，自动对应新水位
+                       # 📌 若索引越界，运行时兜底到最后一个水位
+    
+    # === 以下字段已废弃（不再持久化）===
+    # level_id: int                         ❌ 改用 level_index
+    # target_sell_level_id: Optional[int]   ❌ 每次 Recon 动态计算
+    # sell_order_id: Optional[str]          ❌ 每次 Recon 从交易所匹配
+    # sell_qty: float                       ❌ 每次 Recon 从交易所匹配
+```
+
+### 7.3 核心规则
+
+**规则 1：订单有效性校验（Order Validity Check）**
+
+```
+active_inventory 中的每条记录必须满足以下条件之一：
+  ✅ order_id 存在于 recent_trades（交易所成交历史）
+  ✅ order_id 存在于 trades.jsonl（本地成交账本）
+  ❌ 否则视为"过期记录"，必须移除并重建
+```
+
+**规则 2：索引归属原则（Index-Based Attribution）**
+
+```
+持仓归属的是"水位索引"，而非"价格"或"level_id"
+
+网格重建前后：
+  fill.level_index = 1 → 永远归属 index=1
+  
+  旧网格 index=1 价格 94500
+  新网格 index=1 价格 94700
+  
+  fill 自动对应新的 index=1（94700）
+```
+
+**规则 3：索引越界兜底（Index Overflow Fallback）**
+
+```
+当网格收缩导致索引越界时：
+  fill.level_index = 2，但新网格只有 index=[0, 1]
+  
+  处理方式：运行时兜底到最后一个水位
+  get_level_for_fill(fill, levels) → levels[1]  # 最后一个
+  
+  原始 level_index 保留不变，便于审计和未来恢复
+```
+
+**规则 4：卖单状态不持久化（Stateless Sell Tracking）**
+
+```
+以下信息每次 Recon 动态计算，不写入 state.json：
+  - target_level：根据 level_index 和映射规则计算
+  - sell_order：从交易所挂单中匹配
+  - sell_qty：从交易所挂单中获取
+
+运行时计算流程：
+  for fill in active_inventory:
+      level = get_level_for_fill(fill, support_levels)
+      target = find_target_resistance(level)
+      sell_order = match_open_sell_order(target.price)
+```
+
+**规则 5：盈亏计算基于实际成交价（PnL Based on Fill Price）**
+
+```
+盈亏计算必须使用 fill.price（实际成交价），而非水位价格
+
+示例：
+  fill.price = 94835（实际成交价，含滑点）
+  level[0].price = 95000（水位价格）
+  sell_price = 95609（卖出价格）
+  
+  正确: PnL = (95609 - 94835) / 94835 = 0.82%  ✅
+  错误: PnL = (95609 - 95000) / 95000 = 0.64%  ❌
+
+原因：
+  - fill.price 是真实的资金成本
+  - level.price 是逻辑归属，与资金无关
+```
+
+**规则 6：卖单跟随新网格（Sell Order Follows New Grid）**
+
+```
+网格重建后，卖单位置更新到新阻力位
+
+示例：
+  旧网格: 持仓归属 index=0 → 卖单挂在 旧阻力位1 (95500)
+  新网格: 持仓归属 index=0 → 卖单挂在 新阻力位1 (95700)
+  
+  Recon 执行：
+    1. 检测到 95500 的卖单与新配额不符（surplus）
+    2. 撤销 95500 的卖单
+    3. 在 95700 挂新卖单
+    
+注意：
+  - 这会产生撤单/挂单的手续费
+  - 由 |Δ| > 3% 锚点阈值 + 冷却期 控制重建频率
+  - 冷却期固定为 30 分钟（仅约束自动化重建）
+  - 自动化重建后 30 分钟内不迁移卖单；手动重建不受该限制
+```
+
+**规则 7：fill_counter 与 inventory 一致性（Counter-Inventory Consistency）**
+
+```
+水位的 fill_counter 必须与 inventory 中该索引的记录数一致
+
+一致性校验：
+  for i, level in enumerate(levels):
+      actual = count(fill for fill in inventory if effective_index(fill) == i)
+      assert actual == level.fill_counter
+      
+effective_index 计算：
+  - 若 fill.level_index < len(levels): 返回 fill.level_index
+  - 若越界: 返回 len(levels) - 1（兜底）
+
+触发时机：
+  - 每次 Recon 开始时
+  - 网格重建完成后
+  - 若不一致，以 inventory 为准修正 fill_counter
+```
+
+### 7.4 校验与重建算法
+
+```python
+def validate_and_rebuild_inventory(
+    state: GridState,
+    recent_trades: List[Dict],
+    local_trades: List[Dict],
+    expected_count: int,
+    support_levels: List[GridLevel],
+    base_qty: float
+) -> Tuple[List[ActiveFill], bool]:
+    """
+    校验并重建持仓清单
+    
+    Returns:
+        (重建后的 active_inventory, 是否发生了重建)
+    """
+    # Step 1: 合并成交记录
+    all_trades = merge_trades(recent_trades, local_trades)
+    valid_order_ids = {
+        str(t.get("order_id") or t.get("id", "")) 
+        for t in all_trades 
+        if t.get("side") == "buy"
+    }
+    
+    # Step 2: 校验现有记录的订单有效性
+    current_inventory = state.active_inventory
+    invalid_records = [
+        fill for fill in current_inventory 
+        if fill.order_id and fill.order_id not in valid_order_ids
+    ]
+    
+    # Step 3: 若全部有效且数量匹配，无需重建
+    if not invalid_records and len(current_inventory) == expected_count:
+        return current_inventory, False
+    
+    # Step 4: 触发完全重建
+    logger.warning(
+        f"⚠️ [Inventory] 检测到 {len(invalid_records)} 条无效记录，"
+        f"触发完全重建 (expected={expected_count})"
+    )
+    
+    # Step 5: 从成交记录重建
+    new_inventory = []
+    buy_trades = sorted(
+        [t for t in all_trades if t.get("side") == "buy"],
+        key=lambda x: x.get("timestamp", 0),
+        reverse=True  # 最新在前
+    )
+    
+    for trade in buy_trades:
+        if len(new_inventory) >= expected_count:
+            break
+        
+        order_id = str(trade.get("order_id") or trade.get("id", ""))
+        price = float(trade.get("price", 0))
+        qty = float(trade.get("amount") or trade.get("qty", base_qty))
+        timestamp = int(trade.get("timestamp", 0))
+        
+        # 根据成交价确定归属的水位索引
+        level_index = find_level_index_for_price(price, support_levels)
+        
+        new_fill = ActiveFill(
+            order_id=order_id,
+            price=price,
+            qty=qty,
+            timestamp=timestamp // 1000 if timestamp > 1e12 else timestamp,
+            level_index=level_index
+        )
+        new_inventory.append(new_fill)
+    
+    return new_inventory, True
+
+
+def find_level_index_for_price(
+    price: float, 
+    levels: List[GridLevel],
+    tolerance: float = 0.005  # 0.5% 容差
+) -> int:
+    """根据成交价确定归属的水位索引"""
+    # 优先精确匹配（容差内）
+    for i, level in enumerate(levels):
+        if abs(price - level.price) / level.price < tolerance:
+            return i
+    
+    # 兜底：找最近的低于成交价的水位
+    candidates = [(i, l) for i, l in enumerate(levels) if l.price <= price]
+    if candidates:
+        return max(candidates, key=lambda x: x[1].price)[0]
+    
+    # 极端情况：成交价低于所有水位
+    return len(levels) - 1
+
+
+def get_level_for_fill(
+    fill: ActiveFill, 
+    levels: List[GridLevel]
+) -> Optional[GridLevel]:
+    """根据索引获取归属水位，处理越界"""
+    if not levels:
+        return None
+    
+    # 索引越界兜底
+    idx = min(fill.level_index, len(levels) - 1)
+    return levels[idx]
+```
+
+### 7.5 触发时机
+
+| 时机 | 动作 |
+|------|------|
+| **启动时** | 完全校验，发现无效订单即重建 |
+| **每次 Recon** | 快速校验（数量 + 订单有效性） |
+| **买入成交时** | 添加新记录，根据成交价计算 level_index |
+| **卖出成交时** | 移除对应记录（FIFO） |
+| **网格重建时** | level_index 不变，自动对应新水位 |
+| **卖单迁移冷却** | 重建后 30 分钟内不迁移卖单 |
+
+### 7.6 示例场景
+
+**场景 1：订单有效性校验失败**
+
+```
+state.json (旧数据):
+  fill_1: order_id=xxx, price=94500.0, level_index=0  ← 无效！
+  fill_2: order_id=yyy, price=94000.0, level_index=1  ← 无效！
+
+trades.jsonl (真实数据):
+  order_id=aaa: price=94835.0  ✓
+  order_id=bbb: price=94234.0  ✓
+
+执行校验：
+  1. 检测到 2 条无效记录（order_id 不在成交历史）
+  2. 触发完全重建
+  3. 从 trades.jsonl 重建
+
+重建后:
+  fill_1: order_id=aaa, price=94835.0, level_index=0  ✓
+  fill_2: order_id=bbb, price=94234.0, level_index=1  ✓
+```
+
+**场景 2：网格重建 + 索引继承**
+
+```
+重建前网格:
+  支撑位: [95000, 94500, 94000]  index: [0, 1, 2]
+  
+  active_inventory:
+    fill_1: price=94835.0, level_index=0
+    fill_2: price=94234.0, level_index=1
+
+重建后网格（价格变化）:
+  支撑位: [95200, 94700, 94200]  index: [0, 1, 2]
+
+active_inventory 不变:
+  fill_1: price=94835.0, level_index=0 → 对应新水位 95200
+  fill_2: price=94234.0, level_index=1 → 对应新水位 94700
+
+卖单映射（Recon 时计算）:
+  fill_1 → level[0](95200) → target=阻力位1
+  fill_2 → level[1](94700) → target=阻力位2 或 level[0]
+```
+
+**场景 3：网格收缩 + 索引越界**
+
+```
+重建前网格:
+  支撑位: [95000, 94500, 94000]  index: [0, 1, 2]
+  
+  active_inventory:
+    fill_1: level_index=2 (归属 94000)
+
+重建后网格（收缩）:
+  支撑位: [95200, 94700]  index: [0, 1]
+
+运行时获取:
+  fill_1.level_index=2 → 越界 → 兜底到 index=1 (94700)
+  
+  原始 level_index=2 保留，便于审计
+```
+
+### 7.7 日志输出规范
+
+```python
+# 检测到无效记录
+logger.warning(
+    f"⚠️ [Inventory] 无效订单: order_id={fill.order_id}, "
+    f"price={fill.price}, 不在成交历史中"
+)
+
+# 触发重建
+logger.info(
+    f"🔄 [Inventory] 重建完成: {len(new_inventory)} 条记录"
+)
+
+# 索引越界兜底
+logger.info(
+    f"📦 [Inventory] level_index={fill.level_index} 越界, "
+    f"兜底到 index={actual_index}"
+)
+
+# 新增持仓
+logger.info(
+    f"➕ [Inventory] 新增持仓: order_id={order_id}, "
+    f"price={price}, level_index={level_index}"
+)
+```
+
+---
+
+## 8. 代码检查点
 
 | 文件 | 函数 | 对应章节 |
 |------|------|----------|
@@ -762,10 +1126,13 @@ def validate_order_qty(
 | `position.py` | `build_recon_actions()` | Section 3.3 |
 | `position.py` | `_match_orders()` | Section 3.3 Step 1 |
 | `position.py` | `apply_precision()` | Section 5.1 |
+| `position.py` | `validate_and_rebuild_inventory()` | Section 7.4 |
+| `position.py` | `find_level_index_for_price()` | Section 7.4 |
+| `position.py` | `get_level_for_fill()` | Section 7.4 |
 | `strategy.py` | `_run_recon_track()` | Section 6 |
 | `strategy.py` | `_execute_recon_actions()` | Section 6 Step 6 |
 
 ---
 
-> **最后更新**: 2026-01-17  
+> **最后更新**: 2026-01-19  
 > **审核状态**: Pending Review
