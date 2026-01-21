@@ -1,7 +1,7 @@
 # Key Level Grid 项目宪法 (Constitution)
 
-> **版本**: 1.4.0  
-> **生效日期**: 2026-01-18  
+> **版本**: 1.5.0  
+> **生效日期**: 2026-01-21  
 > **维护者**: KeyLevelGrid Core Team
 
 ---
@@ -73,12 +73,48 @@ for support in supports_with_fills:
 
 ### 原则二：动态仓位保留协议 (Dynamic Position Residual Protocol)
 
-> **定义**：系统必须支持"止盈/保留"比例分配，确保部分仓位作为长期底仓保留。
+> **定义**：系统必须支持"止盈/保留"比例分配，确保部分仓位作为长期底仓保留。**保留仓位优先集中在低价买入的支撑位**（高价优先卖出原则）。
 
 **核心公式**：
 ```
-卖单数量 = 成交数量 × sell_quota_ratio
-保留数量 = 成交数量 × (1 - sell_quota_ratio)
+可卖总量 = (总持仓 - base_position_locked) × sell_quota_ratio
+保留数量 = 总持仓 - 可卖总量
+```
+
+**高价优先卖出原则** (v1.5.0 新增)：
+
+> **定义**：当存在多个支撑位买入时，**优先卖出价格最高的支撑位对应的仓位**，低价买入的仓位优先保留。
+
+**核心规则**：
+
+| 规则 | 说明 |
+|------|------|
+| **总量控制** | 可卖总量基于总持仓计算，而非单个水位独立计算 |
+| **高价优先** | 按买入价格从高到低分配可卖额度 |
+| **低价保留** | 当可卖额度用尽时，低价买入的仓位自动保留 |
+| **释放顺序** | 卖出成交后，按价格从高到低移除 inventory 记录 |
+
+**分配示例**：
+```
+配置：sell_quota_ratio = 0.7, base_amount_per_grid = 0.001 BTC
+
+买入情况（3个支撑位各成交1次）：
+  支撑位 A (100) → 持仓 0.001 BTC
+  支撑位 B (95)  → 持仓 0.001 BTC
+  支撑位 C (90)  → 持仓 0.001 BTC
+  总持仓 = 0.003 BTC
+
+可卖总量 = 0.003 × 0.7 = 0.0021 BTC
+
+分配结果（高价优先）：
+  支撑位 A (100) → 卖出 0.001 BTC（全部）→ 阻力位 A'
+  支撑位 B (95)  → 卖出 0.001 BTC（全部）→ 阻力位 B'
+  支撑位 C (90)  → 卖出 0.0001 BTC（部分）→ 阻力位 C'
+  
+保留仓位 = 0.0009 BTC（集中在支撑位 C）
+
+✅ 正确：低价买入的仓位优先保留（成本更低，利润空间更大）
+❌ 错误：每个水位独立计算 70%（导致保留分散，且可能被 round 误清）
 ```
 
 **约束条件**：
@@ -89,19 +125,26 @@ for support in supports_with_fills:
 | **灵活性** | 必须支持设置为 `1.0`（即全量止盈，不保留） |
 | **精度处理** | 当卖出量低于交易所最小交易单位时，必须有明确的取整策略 |
 | **底仓锁定** | `base_position_locked` 由用户手动设置，系统**不得**自动修改 |
+| **释放取整** | 释放 inventory 时使用 `floor`（只移除完整单位），**禁止使用 `round`** |
 
 **精度处理规则**：
 ```python
-# 计算卖出数量
-sell_qty = fill_qty * sell_quota_ratio
+# 计算可卖总量
+total_holdings = sum(fill.qty for fill in active_inventory)
+sellable_total = max(total_holdings - base_position_locked, 0) * sell_quota_ratio
 
-# 精度处理：向下取整到交易所最小单位
-min_qty = exchange_min_trade_unit  # 如 BTC = 0.0001
-sell_qty = math.floor(sell_qty / min_qty) * min_qty
+# 按高价优先分配
+filled_supports.sort(key=lambda x: x.price, reverse=True)  # 高价优先
+remaining = sellable_total
+for support in filled_supports:
+    level_holdings = support.fill_counter * base_qty
+    allocated = min(level_holdings, remaining)
+    remaining -= allocated
+    # allocated 即为该支撑位应挂的卖单量
 
-# 防止无效小额订单
-if sell_qty < min_qty:
-    sell_qty = 0  # 跳过本次止盈，全部保留
+# 释放 inventory 时使用 floor（禁止 round）
+count = int(sell_qty / base_qty)  # ✅ floor
+# count = int(round(sell_qty / base_qty))  # ❌ 禁止，会导致提前清空
 ```
 
 **配置示例**：
@@ -112,9 +155,29 @@ grid:
   base_position_locked: 0.0    # 用户手动设置的额外锁定底仓
 ```
 
-**总可售数量计算**：
+**代码检查点**：
 ```
-可售数量 = (总持仓 - base_position_locked) × sell_quota_ratio
+position.py::sync_mapping()                 - 卖单量计算必须基于总持仓、高价优先
+position.py::release_fill_counter_by_qty()  - 必须使用 floor，按高价优先移除
+position.py::build_event_sell_increment()   - 仅最高价支撑位立即挂卖单
+```
+
+**禁止的代码模式**：
+```python
+# ❌ 禁止：每个水位独立计算 70%
+for support in supports:
+    sell_qty = support.fill_counter * base_qty * sell_quota_ratio  # 错误！
+    place_sell(sell_qty)
+
+# ❌ 禁止：使用 round 释放 inventory
+count = int(round(sell_qty / base_qty))  # round(0.7) = 1，会提前清空！
+
+# ✅ 正确：基于总量、高价优先
+sellable_total = (total_holdings - locked) * sell_quota_ratio
+for support in sorted(supports, key=lambda x: x.price, reverse=True):
+    allocated = min(level_holdings, remaining)
+    remaining -= allocated
+    place_sell(allocated)
 ```
 
 ---
@@ -663,6 +726,8 @@ AI:
 | P13 | 未更新规格文档直接修改核心算法 | 违反 D2 |
 | P14 | 重构前不进行上下文对齐检查 | 违反 D3 |
 | P15 | 代码实现与规格文档存在未解决的偏离 | 违反 D1 |
+| P16 | 每个水位独立计算 `sell_quota_ratio`（应基于总持仓） | 违反原则二高价优先规则 |
+| P17 | 使用 `round()` 计算 inventory 释放数量（应使用 `floor`） | 违反原则二，会导致保留仓位被误清 |
 
 ---
 
@@ -736,8 +801,10 @@ grid:
 | **规格文档 (Spec)** | `spec/` 目录下的规格说明书，是系统逻辑的最高准则 |
 | **上下文对齐 (Context Alignment)** | 确保 `src/` 代码与 `spec/` 规格保持一致的检查流程 |
 | **同步修改义务** | 修改核心算法前必须先更新对应规格文档的要求 |
+| **高价优先卖出** | 卖出时优先处理买入价格最高的支撑位，低价仓位优先保留 |
+| **floor 取整** | 向下取整，`int(0.7) = 0`；与 `round` 不同（`round(0.7) = 1`） |
 
 ---
 
-> **最后更新**: 2026-01-18 (v1.4.0 新增文档驱动与元数据一致性准则 D1/D2/D3)  
-> **下次审查**: 2026-04-18
+> **最后更新**: 2026-01-21 (v1.5.0 新增原则二"高价优先卖出"规则，禁止事项 P16/P17)  
+> **下次审查**: 2026-04-21
