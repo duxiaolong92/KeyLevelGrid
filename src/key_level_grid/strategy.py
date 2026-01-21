@@ -653,6 +653,12 @@ class KeyLevelGridStrategy:
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                # 检查是否由 CancelledError 引起（通常是正常停止导致的网络请求中断）
+                is_cancelled = isinstance(e.__cause__, asyncio.CancelledError)
+                if is_cancelled:
+                    self.logger.info(f"⏹️ 网络请求被取消（可能是正常停止）: {type(e).__name__}")
+                    break
+                
                 self.logger.error(f"策略更新异常: {e}", exc_info=True)
                 # 发送错误通知
                 await self._notify_error("StrategyError", str(e), "主循环更新")
@@ -2881,6 +2887,7 @@ class KeyLevelGridStrategy:
                 "grid_min": self.position_manager.grid_config.manual_lower if self.position_manager.grid_config.range_mode == "manual" else 0,
                 "grid_max": self.position_manager.grid_config.manual_upper if self.position_manager.grid_config.range_mode == "manual" else 0,
                 "grid_floor": grid_cfg.get("grid_floor", 0),
+                "sell_quota_ratio": self.position_manager.grid_config.sell_quota_ratio,
             }
             sl_cfg = getattr(self.position_manager, "stop_loss_config", None)
             if sl_cfg:

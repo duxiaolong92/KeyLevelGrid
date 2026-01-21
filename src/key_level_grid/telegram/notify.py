@@ -252,13 +252,16 @@ class NotificationManager:
             return
         if not self._can_notify("order_sync"):
             return
+        
+        # 计算 USDT 价值
+        usdt_value = price * new_qty
+        
+        # 简化格式
+        status_emoji = "🟢" if "buy" in order_type.lower() else "🔴"
         text = (
-            "📝 <b>挂单同步提醒</b>\n"
-            f"<b>类型</b>: {order_type}\n"
-            f"<b>状态</b>: {status}\n"
-            f"<b>价格</b>: ${price:,.2f} | <b>新数量</b>: {self._format_qty(new_qty)}\n"
-            f"<b>原因</b>: {reason}\n\n"
-            "[🔄 立即对账]"
+            f"{status_emoji} <b>{status}挂单</b>\n"
+            f"价格: ${price:,.2f}\n"
+            f"数量: {self._format_qty(new_qty)} (≈ ${usdt_value:,.0f} USDT)"
         )
         await self._send_message(text)
 
@@ -273,10 +276,8 @@ class NotificationManager:
         if not self._can_notify("recon_summary"):
             return
         text = (
-            "📝 <b>挂单同步提醒</b>\n"
-            f"<b>标的</b>: {symbol}\n"
-            f"{summary}\n\n"
-            "[🔄 立即对账]"
+            "📝 <b>挂单同步</b>\n"
+            f"{summary}"
         )
         await self._send_message(text)
 
@@ -433,6 +434,10 @@ class NotificationManager:
         grid_min = grid_config.get("grid_min", 0) or 0
         grid_max = grid_config.get("grid_max", 0) or 0
         grid_floor = grid_config.get("grid_floor", 0) or 0
+        sell_quota_ratio = grid_config.get("sell_quota_ratio", 1.0)
+        
+        # 计算保留底仓比例（保留比例 = 1 - 卖出比例）
+        retain_ratio = 1.0 - sell_quota_ratio
 
         pos_value = position.get("value", 0)
         avg_price = position.get("avg_price", 0)
@@ -453,11 +458,18 @@ class NotificationManager:
             pos_percent = (current_price - grid_min) / (grid_max - grid_min)
         pos_bar = get_progress_bar(pos_percent)
 
+        # 配置行：根据是否有保留底仓动态显示
+        if retain_ratio > 0:
+            retain_pct = int(retain_ratio * 100)
+            config_line = f"⚙️ <b>配置</b>: <code>{leverage}x</code> | <code>保留{retain_pct}%底仓</code>"
+        else:
+            config_line = f"⚙️ <b>配置</b>: <code>{leverage}x</code> | <code>{num_grids}档</code>"
+
         text = (
             f"🚀 <b>策略启动: {symbol} ({exchange.upper()})</b>\n"
             f"━━━━━━━━━━━━━━\n"
             f"💰 <b>资金</b>: <code>{total_balance:,.2f}</code> (可用: <code>{available:,.2f}</code>)\n"
-            f"⚙️ <b>配置</b>: <code>{leverage}x</code> | <code>{num_grids}档</code> | <code>{sl_pct:.1f}% 止损</code>\n"
+            f"{config_line}\n"
             f"🌐 <b>区间</b>: <code>{grid_min:,.2f}</code> - <code>{grid_max:,.2f}</code>\n"
             f"📍 <b>位置</b>: <code>{pos_bar}</code>\n\n"
             f"💼 <b>持仓</b>: <code>{pos_value:,.2f} USDT</code> (@ <code>{avg_price:,.2f}</code>)\n"
@@ -707,24 +719,26 @@ class NotificationManager:
         action: str,
         detail: str,
     ) -> None:
-        """配额对齐/清空通知"""
-        if not self.config.quota_event:
-            return
-        if not self._can_notify("quota_event"):
-            return
-        action_text = {
-            "reconcile": "🧩 配额对齐",
-            "auto_clear": "🧹 配额清零",
-            "manual_reset": "🧹 手动清空配额",
-        }.get(action, "🧩 配额事件")
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        text = (
-            f"{action_text}\n\n"
-            f"📊 <b>{symbol}</b>\n"
-            f"{detail}\n"
-            f"\n🕐 {timestamp}"
-        )
-        await self._send_message(text.strip())
+        """配额对齐/清空通知 - 暂时屏蔽"""
+        # 暂时屏蔽配额事件推送
+        return
+        # if not self.config.quota_event:
+        #     return
+        # if not self._can_notify("quota_event"):
+        #     return
+        # action_text = {
+        #     "reconcile": "🧩 配额对齐",
+        #     "auto_clear": "🧹 配额清零",
+        #     "manual_reset": "🧹 手动清空配额",
+        # }.get(action, "🧩 配额事件")
+        # timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # text = (
+        #     f"{action_text}\n\n"
+        #     f"📊 <b>{symbol}</b>\n"
+        #     f"{detail}\n"
+        #     f"\n🕐 {timestamp}"
+        # )
+        # await self._send_message(text.strip())
     
     async def notify_error(
         self,

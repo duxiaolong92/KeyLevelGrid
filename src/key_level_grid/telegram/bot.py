@@ -157,8 +157,7 @@ class KeyLevelTelegramBot:
     def _get_main_menu(self) -> ReplyKeyboardMarkup:
         """获取主菜单键盘"""
         keyboard = [
-            [KeyboardButton("📊 实时监控"), KeyboardButton("⚙️ 策略设置")],
-            [KeyboardButton("🛠 系统运维"), KeyboardButton("🚨 紧急全平")],
+            [KeyboardButton("📊 实时监控"), KeyboardButton("🚨 紧急全平")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -166,10 +165,6 @@ class KeyLevelTelegramBot:
         keyboard = [
             [
                 InlineKeyboardButton("📊 实时监控", callback_data="menu_monitor"),
-                InlineKeyboardButton("⚙️ 策略设置", callback_data="menu_settings"),
-            ],
-            [
-                InlineKeyboardButton("🛠 系统运维", callback_data="menu_ops"),
                 InlineKeyboardButton("🚨 紧急全平", callback_data="menu_emergency"),
             ],
         ]
@@ -436,12 +431,13 @@ class KeyLevelTelegramBot:
         if data == "menu_monitor":
             await self._send_monitoring(update)
             return
-        if data == "menu_settings":
-            await self._send_settings(update)
-            return
-        if data == "menu_ops":
-            await self._send_ops(update)
-            return
+        # 暂时屏蔽策略设置和系统运维
+        # if data == "menu_settings":
+        #     await self._send_settings(update)
+        #     return
+        # if data == "menu_ops":
+        #     await self._send_ops(update)
+        #     return
         if data == "menu_emergency":
             await query.edit_message_text(
                 "🚨 <b>紧急全平</b>\n\n确认将立即平仓所有头寸并撤销所有挂单？",
@@ -722,71 +718,112 @@ class KeyLevelTelegramBot:
     def _format_monitor_text(self) -> str:
         if not self.strategy:
             return "❌ 策略未连接"
+        
         data = self.strategy.get_display_data()
         price_obj = data.get("price", {})
         current_price = price_obj.get("current", 0) if isinstance(price_obj, dict) else 0
+        position = data.get("position", {})
         pending = data.get("pending_orders", [])
-        supports = data.get("support_levels", [])
-        resistances = data.get("resistance_levels", [])
-        grid_cfg = self.strategy.position_manager.grid_config
-
-        def _find_fill_counter(side: str, price: float) -> str:
-            state = self.strategy.position_manager.state
-            if not state:
-                return "-"
-            levels = state.support_levels_state if side == "buy" else state.resistance_levels_state
-            for lvl in levels:
-                if abs(lvl.price - price) <= lvl.price * 0.001:
-                    return f"{int(lvl.fill_counter or 0)}/{int(state.max_fill_per_level or 1)}"
-            return "-"
-
+        account = data.get("account", {})
+        
+        # 获取杠杆和合约大小
+        leverage = getattr(self.strategy.config, "leverage", 5)
+        contract_size = getattr(self.strategy, "_contract_size", 0.0001)
+        
+        # 获取止损订单信息
+        stop_loss_price = 0
+        stop_loss_contracts = 0
+        if hasattr(self.strategy, "_stop_loss_order_id") and self.strategy._stop_loss_order_id:
+            stop_loss_contracts = getattr(self.strategy, "_stop_loss_contracts", 0)
+            grid_state = self.strategy.position_manager.state
+            if grid_state:
+                stop_loss_price = grid_state.grid_floor
+        
+        lines = []
+        
+        # ========== 标题 ==========
+        symbol = self.strategy.config.symbol
+        lines.append(f"📊 <b>实时监控</b> | {symbol}")
+        lines.append(f"当前价格: <b>${current_price:,.2f}</b>")
+        lines.append("")
+        
+        # ========== 持仓信息 ==========
+        lines.append("💰 <b>当前持仓 (Position)</b>")
+        
+        qty_btc = float(position.get("qty", 0) or 0) * contract_size
+        value_usdt = float(position.get("value", 0) or 0)
+        avg_price = float(position.get("avg_entry_price", 0) or 0)
+        unrealized_pnl = float(position.get("unrealized_pnl", 0) or 0)
+        side = position.get("side", "long")
+        
+        if qty_btc > 0 or value_usdt > 0:
+            # 方向
+            dir_emoji = "🟢 LONG" if side == "long" else "🔴 SHORT"
+            lines.append(f"方向: {dir_emoji}")
+            
+            # 持仓量
+            if value_usdt <= 0 and avg_price > 0:
+                value_usdt = qty_btc * avg_price
+            lines.append(f"持仓量: {qty_btc:.4f} BTC (≈ ${value_usdt:,.2f} USDT)")
+            
+            # 均本和盈亏
+            pnl_pct = (unrealized_pnl / value_usdt * 100) if value_usdt > 0 else 0
+            pnl_sign = "+" if unrealized_pnl >= 0 else ""
+            lines.append(f"均本: ${avg_price:,.2f} | 盈亏: {pnl_sign}${unrealized_pnl:,.2f} ({pnl_sign}{pnl_pct:.2f}%)")
+            
+            # 保证金
+            margin = value_usdt / leverage if leverage > 0 else value_usdt
+            lines.append(f"保证金: ${margin:,.2f} USDT ({leverage}x)")
+        else:
+            lines.append("📭 无持仓")
+        
+        lines.append("")
+        
+        # ========== 挂单列表 ==========
+        lines.append("📝 <b>全部活跃挂单 (Open Orders)</b>")
+        
         buy_orders = [o for o in pending if o.get("side") == "buy"]
         sell_orders = [o for o in pending if o.get("side") == "sell"]
-        lines = [
-            "📊 <b>实时监控</b>",
-            f"当前价格: ${current_price:,.2f}",
-            "",
-            "🔴 <b>阻力位卖单</b>",
-        ]
-        for o in sorted(sell_orders, key=lambda x: -x.get("price", 0)):
-            price = o.get("price", 0)
-            qty = o.get("base_amount", 0) or 0
-            counter = _find_fill_counter("sell", price)
-            lines.append(f"- ${price:,.2f} | {qty:.6f} BTC | 配额 {counter}")
-        if not sell_orders:
-            lines.append("- 无")
+        
+        # 卖单/止盈
         lines.append("")
-        lines.append("🟢 <b>支撑位买单</b>")
-        for o in sorted(buy_orders, key=lambda x: -x.get("price", 0)):
-            price = o.get("price", 0)
-            qty = o.get("base_amount", 0) or 0
-            counter = _find_fill_counter("buy", price)
-            lines.append(f"- ${price:,.2f} | {qty:.6f} BTC | 配额 {counter}")
-        if not buy_orders:
+        lines.append("🔴 <b>卖单 / 止盈 (Sell / Take Profit)</b>")
+        if sell_orders:
+            for o in sorted(sell_orders, key=lambda x: x.get("price", 0)):
+                price = float(o.get("price", 0) or 0)
+                # 获取数量（优先使用 contracts，否则用 base_amount）
+                qty_contracts = float(o.get("contracts", 0) or o.get("base_amount", 0) or 0)
+                qty_btc = qty_contracts * contract_size if qty_contracts > 10 else qty_contracts  # 判断是张数还是BTC
+                qty_usdt = qty_btc * price
+                pct = ((price - current_price) / current_price * 100) if current_price > 0 else 0
+                lines.append(f"${price:,.2f} | {pct:+.2f}% | {qty_btc:.4f} BTC (≈ ${qty_usdt:,.0f} USDT)")
+        else:
             lines.append("- 无")
+        
+        # 买单/加仓
         lines.append("")
-        lines.append("🧭 <b>支撑和阻力列表</b>")
-        lines.append("价格 | 涨跌幅 | 周期 | 评分")
-        for lvl in sorted(resistances, key=lambda x: -x.get("price", 0)):
-            price = float(lvl.get("price", 0) or 0)
-            if grid_cfg.range_mode == "manual":
-                if price < grid_cfg.manual_lower or price > grid_cfg.manual_upper:
-                    continue
-            pct = ((price - current_price) / current_price * 100) if current_price > 0 else 0
-            tf = lvl.get("timeframe", "")
-            strength = lvl.get("strength", 0)
-            lines.append(f"{price:,.2f} | {pct:+.2f}% | {tf} | {strength:.0f}")
-        for lvl in sorted(supports, key=lambda x: -x.get("price", 0)):
-            price = float(lvl.get("price", 0) or 0)
-            if grid_cfg.range_mode == "manual":
-                if price < grid_cfg.manual_lower or price > grid_cfg.manual_upper:
-                    continue
-            pct = ((price - current_price) / current_price * 100) if current_price > 0 else 0
-            tf = lvl.get("timeframe", "")
-            strength = lvl.get("strength", 0)
-            lines.append(f"{price:,.2f} | {pct:+.2f}% | {tf} | {strength:.0f}")
-        if not supports and not resistances:
+        lines.append("🟢 <b>买单 / 加仓 (Buy / Add Margin)</b>")
+        if buy_orders:
+            for o in sorted(buy_orders, key=lambda x: -x.get("price", 0)):
+                price = float(o.get("price", 0) or 0)
+                qty_contracts = float(o.get("contracts", 0) or o.get("base_amount", 0) or 0)
+                qty_btc = qty_contracts * contract_size if qty_contracts > 10 else qty_contracts
+                qty_usdt = qty_btc * price
+                pct = ((price - current_price) / current_price * 100) if current_price > 0 else 0
+                lines.append(f"${price:,.2f} | {pct:+.2f}% | {qty_btc:.4f} BTC (≈ ${qty_usdt:,.0f} USDT)")
+        else:
             lines.append("- 无")
+        
+        # 止损订单
+        lines.append("")
+        lines.append("🛑 <b>全部止损订单 (Stop Loss)</b>")
+        if stop_loss_price > 0 and stop_loss_contracts > 0:
+            sl_qty_btc = stop_loss_contracts * contract_size
+            sl_pct = ((stop_loss_price - current_price) / current_price * 100) if current_price > 0 else 0
+            lines.append(f"${stop_loss_price:,.2f} | {sl_pct:+.2f}% | {sl_qty_btc:.4f} BTC")
+        else:
+            lines.append("- 无")
+        
         return "\n".join(lines)
 
     async def _send_monitoring(self, update: Update) -> None:
@@ -1454,7 +1491,7 @@ class KeyLevelTelegramBot:
         
         # 菜单按钮列表（点击这些按钮时清除等待状态）
         menu_buttons = [
-            "📊 实时监控", "⚙️ 策略设置", "🛠 系统运维", "🚨 紧急全平", "❓ 帮助"
+            "📊 实时监控", "🚨 紧急全平"
         ]
         
         try:
@@ -1466,10 +1503,10 @@ class KeyLevelTelegramBot:
             # 处理菜单按钮
             if text == "📊 实时监控":
                 await self._send_monitoring(update)
-            elif text == "⚙️ 策略设置":
-                await self._send_settings(update)
-            elif text == "🛠 系统运维":
-                await self._send_ops(update)
+            # elif text == "⚙️ 策略设置":
+            #     await self._send_settings(update)
+            # elif text == "🛠 系统运维":
+            #     await self._send_ops(update)
             elif text == "🚨 紧急全平":
                 await update.message.reply_text(
                     "🚨 <b>紧急全平</b>\n\n确认将立即平仓所有头寸并撤销所有挂单？",

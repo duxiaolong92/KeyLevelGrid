@@ -92,6 +92,7 @@ class NotificationHelper:
                 "grid_min": self.position_manager.grid_config.manual_lower if self.position_manager.grid_config.range_mode == "manual" else 0,
                 "grid_max": self.position_manager.grid_config.manual_upper if self.position_manager.grid_config.range_mode == "manual" else 0,
                 "grid_floor": grid_cfg.get("grid_floor", 0),
+                "sell_quota_ratio": self.position_manager.grid_config.sell_quota_ratio,
             }
             sl_cfg = getattr(self.position_manager, "stop_loss_config", None)
             if sl_cfg:
