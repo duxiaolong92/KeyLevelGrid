@@ -62,7 +62,6 @@ grid:
 # 仓位配置
 # ============================================
 position:
-  max_leverage: 3               # 最大杠杆 (需与 trading.leverage 保持一致)
   max_capital_usage: 0.8        # 使用 80% 资金，留 20% 缓冲
 
 # ============================================
@@ -160,7 +159,7 @@ telegram:
     daily_summary_time: "20:00"
     
     # 心跳
-    heartbeat: false
+    heartbeat: true
     heartbeat_interval_hours: 4
     heartbeat_idle_sec: 3600
 

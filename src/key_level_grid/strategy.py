@@ -1284,6 +1284,14 @@ class KeyLevelGridStrategy:
             return
 
         async with self._grid_lock:
+            # 🔒 获取锁后再次检查冷却时间（防止与 force_rebuild_grid 并发导致重复挂单）
+            # 场景：force_rebuild_grid 持有锁时，本方法可能已通过冷却检查并等待锁
+            # force_rebuild_grid 更新 _recon_last_run_at 后释放锁，本方法继续执行
+            # 如果不再次检查，会导致重复挂单
+            now_ts = time.time()
+            if now_ts - self._recon_last_run_at < grid_cfg.recon_interval_sec:
+                return
+            
             # 更新持仓快照（币数量）
             prev_holdings = 0.0
             if self.position_manager.state:

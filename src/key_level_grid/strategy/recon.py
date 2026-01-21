@@ -457,15 +457,23 @@ class ReconEventManager:
                         quantity=contracts,
                         price=price,
                     )
+                    if side == "sell":
+                        order.reduce_only = True
                     order.metadata["level_id"] = level_id
                     order.metadata["reason"] = reason
                     order.metadata["order_type"] = f"Recon-{side.upper()}"
                     
-                    result = await self.executor.submit_order(order)
-                    self.logger.info(
-                        f"✅ 挂单成功: {side.upper()} {contracts}张 @ {price:.2f}, "
-                        f"level_id={level_id}, reason={reason}"
-                    )
+                    success = await self.executor.submit_order(order)
+                    if success:
+                        self.logger.info(
+                            f"✅ 挂单成功: {side.upper()} {contracts}张 @ {price:.2f}, "
+                            f"level_id={level_id}, reason={reason}"
+                        )
+                    else:
+                        self.logger.warning(
+                            f"⚠️ 挂单失败: {side.upper()} {contracts}张 @ {price:.2f}, "
+                            f"level_id={level_id}, reason={reason}"
+                        )
                     
                     # 更新水位状态
                     if self.position_manager.state:
@@ -476,10 +484,15 @@ class ReconEventManager:
                         )
                         for lvl in levels:
                             if lvl.level_id == level_id:
-                                lvl.status = LevelStatus.ACTIVE
-                                lvl.order_id = result.get("id", "") if result else ""
-                                lvl.active_order_id = lvl.order_id
-                                lvl.open_qty = qty
+                                if success:
+                                    lvl.status = LevelStatus.ACTIVE
+                                    # 从 Order 对象获取 exchange_order_id，而非从返回值
+                                    lvl.order_id = order.exchange_order_id or ""
+                                    lvl.active_order_id = lvl.order_id
+                                    lvl.open_qty = qty
+                                else:
+                                    lvl.status = LevelStatus.IDLE
+                                    lvl.last_error = "submit_failed"
                                 lvl.last_action_ts = int(time.time())
                                 break
                 

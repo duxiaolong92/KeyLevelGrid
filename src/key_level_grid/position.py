@@ -466,10 +466,19 @@ class GridPositionManager:
         self.state.avg_entry_price = max(avg_entry_price, 0.0)
     
     def build_level_mapping(self) -> Dict[int, int]:
-        """构建逐级邻位映射表"""
+        """
+        构建逐级邻位映射表
+        
+        规则：每个支撑位映射到其上方第一个价格更高的水位（支撑位或阻力位均可）
+        注意：不依赖 role 字段，直接使用 support_levels_state 判断支撑位身份
+        """
         if not self.state:
             return {}
         
+        # 获取支撑位 ID 集合（用于判断身份，不依赖 role 字段）
+        support_level_ids = {lvl.level_id for lvl in self.state.support_levels_state}
+        
+        # 合并并按价格排序所有水位
         all_levels: List[GridLevelState] = (
             self.state.support_levels_state + self.state.resistance_levels_state
         )
@@ -480,11 +489,13 @@ class GridPositionManager:
         missing_adjacent_levels: List[float] = []
         
         for i, level in enumerate(sorted_levels):
-            if level.role != "support":
+            # 使用 ID 集合判断是否为支撑位，而非 role 字段
+            if level.level_id not in support_level_ids:
                 continue
             
             min_sell_price = level.price * (1 + min_profit_pct)
             
+            # 查找上方第一个价格满足最小利润要求的水位
             target_level = None
             for j in range(i + 1, len(sorted_levels)):
                 candidate = sorted_levels[j]
@@ -494,12 +505,21 @@ class GridPositionManager:
             
             if target_level:
                 mapping[level.level_id] = target_level.level_id
+                self.logger.debug(
+                    f"📍 映射: L_{level.level_id}({level.price:.2f}) → "
+                    f"L_{target_level.level_id}({target_level.price:.2f})"
+                )
             else:
                 missing_adjacent_levels.append(level.price)
         
         if missing_adjacent_levels:
             self.logger.warning(
                 f"⚠️ [Mapping] 以下支撑位无上方邻位: {missing_adjacent_levels}"
+            )
+        
+        self.logger.info(
+            f"📍 [Mapping] 构建完成: {len(mapping)} 个映射, "
+            f"{len(missing_adjacent_levels)} 个无邻位"
         )
         
         return mapping
@@ -1290,20 +1310,19 @@ class GridPositionManager:
                 total_qty += qty
             return total_qty
 
-        # 动态角色判定
+        # 动态角色判定（基于价格位置分类，不修改原对象的 role/side 字段）
+        # 只有支撑位列表中价格低于当前价的才作为买入候选
+        # 避免污染 GridLevelState 的持久化字段
+        buy_levels = [
+            lvl for lvl in self.state.support_levels_state 
+            if lvl.price < current_price
+        ]
+        # 阻力位列表中价格高于当前价的作为卖出候选（但卖单通过 sync_mapping 处理）
+        sell_levels = [
+            lvl for lvl in self.state.resistance_levels_state 
+            if lvl.price > current_price
+        ]
         all_levels = self.state.support_levels_state + self.state.resistance_levels_state
-        for lvl in all_levels:
-            if lvl.price < current_price:
-                lvl.role = "support"
-                lvl.side = "buy"
-            elif lvl.price > current_price:
-                lvl.role = "resistance"
-                lvl.side = "sell"
-            else:
-                lvl.role = "neutral"
-
-        buy_levels = [lvl for lvl in all_levels if lvl.role == "support"]
-        sell_levels = [lvl for lvl in all_levels if lvl.role == "resistance"]
 
         # 买单处理
         for lvl in buy_levels:

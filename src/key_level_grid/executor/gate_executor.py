@@ -1557,11 +1557,13 @@ class GateExecutor(ExchangeExecutor):
             
             loop = asyncio.get_event_loop()
             
-            # 仅设置保证金模式，杠杆由后续的 set_leverage 调用设置
-            # 注意：Gate.io 的保证金模式通过 set_leverage 隐式设置
-            # leverage > 0 时自动切换到对应模式
-            self.logger.info(f"Gate.io 保证金模式: {margin_mode} (杠杆将在 set_leverage 中设置)")
-                
+            # 调用 ccxt 的 set_margin_mode 方法
+            # Gate.io 支持: 'cross' (全仓) 和 'isolated' (逐仓)
+            await loop.run_in_executor(
+                None,
+                lambda: self._exchange.set_margin_mode(margin_mode, symbol)
+            )
+            self.logger.info(f"✅ 保证金模式设置成功: {margin_mode}")
             return True
             
         except Exception as e:
@@ -1569,6 +1571,11 @@ class GateExecutor(ExchangeExecutor):
             err_str = str(e).lower()
             if "position_holding" in err_str or "can not switch" in err_str or "order" in err_str:
                 self.logger.warning(f"⚠️ 无法切换保证金模式（已有持仓或挂单）: {e}")
+                return True
+            
+            # 处理已经是目标模式的情况
+            if "same" in err_str or "already" in err_str:
+                self.logger.info(f"ℹ️ 保证金模式已经是 {margin_mode}")
                 return True
                 
             self.logger.error(f"❌ 设置保证金模式失败: {e}", exc_info=True)

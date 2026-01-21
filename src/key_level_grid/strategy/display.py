@@ -195,29 +195,42 @@ class DisplayDataGenerator:
 
             if pos.support_levels_state or pos.resistance_levels_state:
                 levels_from_grid = True
+                current_price = state.close if state else 0
+                
+                # 合并所有水位元数据
+                all_meta = {**support_meta, **resistance_meta}
+                
+                # 合并所有水位，根据当前价格动态分类
+                all_levels = list(pos.support_levels_state) + list(pos.resistance_levels_state)
+                
+                # 价格低于当前价的为支撑位
                 data["support_levels"] = [
                     {
                         "price": lvl.price,
                         "type": "support",
-                        "strength": support_meta.get(lvl.price, {}).get("strength", 0),
-                        "timeframe": support_meta.get(lvl.price, {}).get("timeframe", "4h"),
-                        "source": support_meta.get(lvl.price, {}).get("source", ""),
-                        "description": support_meta.get(lvl.price, {}).get("description", ""),
+                        "strength": all_meta.get(lvl.price, {}).get("strength", 0) if isinstance(all_meta.get(lvl.price), dict) else 0,
+                        "timeframe": all_meta.get(lvl.price, {}).get("timeframe", "4h") if isinstance(all_meta.get(lvl.price), dict) else "4h",
+                        "source": all_meta.get(lvl.price, {}).get("source", "") if isinstance(all_meta.get(lvl.price), dict) else "",
+                        "description": all_meta.get(lvl.price, {}).get("description", "") if isinstance(all_meta.get(lvl.price), dict) else "",
                         "fill_counter": int(getattr(lvl, "fill_counter", 0) or 0),
                     }
-                    for lvl in pos.support_levels_state
+                    for lvl in all_levels
+                    if lvl.price < current_price
                 ]
+                
+                # 价格高于当前价的为阻力位
                 data["resistance_levels"] = [
                     {
                         "price": lvl.price,
                         "type": "resistance",
-                        "strength": resistance_meta.get(lvl.price, {}).get("strength", 0),
-                        "timeframe": resistance_meta.get(lvl.price, {}).get("timeframe", "4h"),
-                        "source": resistance_meta.get(lvl.price, {}).get("source", ""),
-                        "description": resistance_meta.get(lvl.price, {}).get("description", ""),
+                        "strength": all_meta.get(lvl.price, {}).get("strength", 0) if isinstance(all_meta.get(lvl.price), dict) else 0,
+                        "timeframe": all_meta.get(lvl.price, {}).get("timeframe", "4h") if isinstance(all_meta.get(lvl.price), dict) else "4h",
+                        "source": all_meta.get(lvl.price, {}).get("source", "") if isinstance(all_meta.get(lvl.price), dict) else "",
+                        "description": all_meta.get(lvl.price, {}).get("description", "") if isinstance(all_meta.get(lvl.price), dict) else "",
                         "fill_counter": int(getattr(lvl, "fill_counter", 0) or 0),
                     }
-                    for lvl in pos.resistance_levels_state
+                    for lvl in all_levels
+                    if lvl.price > current_price
                 ]
             else:
                 data["resistance_levels"] = [
