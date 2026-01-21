@@ -207,8 +207,9 @@ class LevelMappingManager:
         """
         逐级邻位映射同步
         
-        遍历每个有成交的支撑位，根据邻位映射计算应挂卖单配额，
-        与实盘挂单对比，生成补单/撤单动作。
+        V3.2 变更：基于总持仓计算可卖量，按高价优先分配
+        - 可卖总量 = (总持仓 - 锁定底仓) × sell_quota_ratio
+        - 高价买入的支撑位优先卖出，低价的保留
         
         Args:
             state: 网格状态
@@ -225,6 +226,7 @@ class LevelMappingManager:
         actions: List[Dict[str, Any]] = []
         base_qty = float(state.base_amount_per_grid or 0)
         sell_quota_ratio = float(state.sell_quota_ratio or 0.7)
+        base_position_locked = float(state.base_position_locked or 0)
         
         # 索引交易所卖单
         sell_orders_by_level = self.index_orders_by_level(state, open_orders, side="sell")
@@ -232,10 +234,25 @@ class LevelMappingManager:
         # 汇总每个目标水位的期望卖单量
         expected_sell_by_level: Dict[int, float] = {}
         
-        for support_lvl in state.support_levels_state:
-            fill_count = int(support_lvl.fill_counter or 0)
-            if fill_count <= 0:
-                continue
+        # 1. 计算总持仓量（从 inventory）
+        total_holdings = sum(f.qty for f in state.active_inventory)
+        
+        # 2. 计算可卖总量（扣除锁定底仓）
+        sellable_total = max(total_holdings - base_position_locked, 0) * sell_quota_ratio
+        
+        # 3. 筛选有持仓的支撑位，按价格从高到低排序（高价优先卖出）
+        filled_supports = [
+            lvl for lvl in state.support_levels_state
+            if int(lvl.fill_counter or 0) > 0
+        ]
+        filled_supports.sort(key=lambda x: x.price, reverse=True)
+        
+        # 4. 按高价优先分配可卖量
+        remaining_sellable = sellable_total
+        
+        for support_lvl in filled_supports:
+            if remaining_sellable <= 0:
+                break
             
             # 查找邻位映射
             target_level_id = state.level_mapping.get(support_lvl.level_id)
@@ -246,11 +263,16 @@ class LevelMappingManager:
                 )
                 continue
             
-            # 计算该支撑位贡献的卖单量
-            contrib_qty = fill_count * base_qty * sell_quota_ratio
-            expected_sell_by_level[target_level_id] = (
-                expected_sell_by_level.get(target_level_id, 0) + contrib_qty
-            )
+            # 该支撑位的持仓量
+            level_holdings = int(support_lvl.fill_counter or 0) * base_qty
+            # 分配给该支撑位的卖出量（不超过其持仓量）
+            allocated = min(level_holdings, remaining_sellable)
+            remaining_sellable -= allocated
+            
+            if allocated > 0:
+                expected_sell_by_level[target_level_id] = (
+                    expected_sell_by_level.get(target_level_id, 0) + allocated
+                )
         
         # 获取所有目标水位
         all_levels = state.support_levels_state + state.resistance_levels_state
@@ -365,6 +387,10 @@ class LevelMappingManager:
         """
         买单成交后，基于逐级邻位映射增量补卖单
         
+        V3.2 变更：基于"高价优先"逻辑
+        - 只有当新买入是"最高价支撑位"时才立即挂卖单
+        - 否则由 sync_mapping 在下一个 Recon 周期统一处理
+        
         Args:
             state: 网格状态
             delta_buy_qty: 买入数量
@@ -378,54 +404,56 @@ class LevelMappingManager:
         if not state or delta_buy_qty <= 0:
             return []
         
-        delta_sell = delta_buy_qty * state.sell_quota_ratio
-        if delta_sell < exchange_min_qty_btc:
+        # 获取有持仓的支撑位
+        filled_supports = [
+            lvl for lvl in state.support_levels_state 
+            if int(lvl.fill_counter or 0) > 0
+        ]
+        if not filled_supports:
+            return []
+        
+        # 找到价格最高的支撑位
+        highest_price_lvl = max(filled_supports, key=lambda x: x.price)
+        
+        # 如果新买入的不是最高价支撑位，跳过（让 sync_mapping 统一处理）
+        if filled_support_level_id and filled_support_level_id != highest_price_lvl.level_id:
+            self.logger.debug(
+                f"⏸️ 延迟挂卖单: 新买入 L_{filled_support_level_id} 非最高价位, "
+                f"最高价位是 L_{highest_price_lvl.level_id}({highest_price_lvl.price:.2f})"
+            )
+            return []
+        
+        # 计算可卖量（基于总持仓的高价优先逻辑）
+        base_qty = float(state.base_amount_per_grid or 0)
+        sell_quota_ratio = float(state.sell_quota_ratio or 0.7)
+        base_position_locked = float(state.base_position_locked or 0)
+        
+        total_holdings = sum(f.qty for f in state.active_inventory)
+        sellable_total = max(total_holdings - base_position_locked, 0) * sell_quota_ratio
+        
+        if sellable_total < exchange_min_qty_btc:
             self.logger.warning(
-                f"⚠️ 最小卖单量不足: delta_sell={delta_sell:.6f}, "
+                f"⚠️ 最小卖单量不足: sellable={sellable_total:.6f}, "
                 f"min={exchange_min_qty_btc:.6f}"
             )
             return []
-
-        # 确定目标卖单水位
-        target_level = None
         
-        if filled_support_level_id:
-            target_level_id = state.level_mapping.get(filled_support_level_id)
-            if target_level_id:
-                target_level = self.get_level_by_id(state, target_level_id)
-                if target_level:
-                    self.logger.debug(
-                        f"⚡ [Event] 使用邻位映射: S_{filled_support_level_id} → "
-                        f"L_{target_level_id}({target_level.price:.2f})"
-                    )
-        
-        if not target_level:
-            # 回退：查找最近成交支撑位的映射
-            recent_fill = None
-            for lvl in sorted(state.support_levels_state, key=lambda x: x.price, reverse=True):
-                if lvl.fill_counter > 0 and lvl.price < current_price:
-                    recent_fill = lvl
-                    break
-            
-            if recent_fill:
-                target_level_id = state.level_mapping.get(recent_fill.level_id)
-                if target_level_id:
-                    target_level = self.get_level_by_id(state, target_level_id)
-        
-        if not target_level:
-            # 再次回退：找当前价上方最近的水位
-            all_levels = state.support_levels_state + state.resistance_levels_state
-            candidates = [lvl for lvl in all_levels if lvl.price > current_price]
-            if candidates:
-                target_level = min(candidates, key=lambda x: x.price)
-                self.logger.warning(
-                    f"⚠️ [Event] 无映射可用，使用最近上方水位: {target_level.price:.2f}"
-                )
-        
-        if not target_level:
+        # 查找目标阻力位
+        target_level_id = state.level_mapping.get(highest_price_lvl.level_id)
+        if not target_level_id:
             self.logger.warning(
-                f"⚠️ 无可用卖单水位(Event): delta_sell={delta_sell:.6f}, current={current_price:.2f}"
+                f"⚠️ [Event] 支撑位 L_{highest_price_lvl.level_id} 无邻位映射"
             )
+            return []
+        target_level = self.get_level_by_id(state, target_level_id)
+        if not target_level:
+            return []
+        
+        # 计算该支撑位应挂的卖单量
+        level_holdings = int(highest_price_lvl.fill_counter or 0) * base_qty
+        delta_sell = min(level_holdings, sellable_total)
+        
+        if delta_sell < exchange_min_qty_btc:
             return []
         
         # 检查价格缓冲

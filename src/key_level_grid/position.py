@@ -618,30 +618,58 @@ class GridPositionManager:
         open_orders: List[Dict],
         exchange_min_qty: float,
     ) -> List[Dict[str, Any]]:
-        """逐级邻位映射同步"""
+        """
+        逐级邻位映射同步
+        
+        V3.2 变更：基于总持仓计算可卖量，按高价优先分配
+        - 可卖总量 = (总持仓 - 锁定底仓) × sell_quota_ratio
+        - 高价买入的支撑位优先卖出，低价的保留
+        """
         if not self.state:
             return []
         
         actions: List[Dict[str, Any]] = []
         base_qty = float(self.state.base_amount_per_grid or 0)
         sell_quota_ratio = float(self.state.sell_quota_ratio or 0.7)
+        base_position_locked = float(self.state.base_position_locked or 0)
         
         sell_orders_by_level = self._index_orders_by_level(open_orders, side="sell")
         expected_sell_by_level: Dict[int, float] = {}
         
-        for support_lvl in self.state.support_levels_state:
-            fill_count = int(support_lvl.fill_counter or 0)
-            if fill_count <= 0:
-                continue
+        # 1. 计算总持仓量（从 inventory）
+        total_holdings = sum(f.qty for f in self.state.active_inventory)
+        
+        # 2. 计算可卖总量（扣除锁定底仓）
+        sellable_total = max(total_holdings - base_position_locked, 0) * sell_quota_ratio
+        
+        # 3. 筛选有持仓的支撑位，按价格从高到低排序（高价优先卖出）
+        filled_supports = [
+            lvl for lvl in self.state.support_levels_state
+            if int(lvl.fill_counter or 0) > 0
+        ]
+        filled_supports.sort(key=lambda x: x.price, reverse=True)
+        
+        # 4. 按高价优先分配可卖量
+        remaining_sellable = sellable_total
+        
+        for support_lvl in filled_supports:
+            if remaining_sellable <= 0:
+                break
             
             target_level_id = self.state.level_mapping.get(support_lvl.level_id)
             if not target_level_id:
                 continue
             
-            contrib_qty = fill_count * base_qty * sell_quota_ratio
-            expected_sell_by_level[target_level_id] = (
-                expected_sell_by_level.get(target_level_id, 0) + contrib_qty
-            )
+            # 该支撑位的持仓量
+            level_holdings = int(support_lvl.fill_counter or 0) * base_qty
+            # 分配给该支撑位的卖出量（不超过其持仓量）
+            allocated = min(level_holdings, remaining_sellable)
+            remaining_sellable -= allocated
+            
+            if allocated > 0:
+                expected_sell_by_level[target_level_id] = (
+                    expected_sell_by_level.get(target_level_id, 0) + allocated
+                )
         
         all_levels = self.state.support_levels_state + self.state.resistance_levels_state
         level_by_id = {lvl.level_id: lvl for lvl in all_levels}
@@ -1462,40 +1490,60 @@ class GridPositionManager:
         current_price: float,
         filled_support_level_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """买单成交后增量补卖单"""
+        """
+        买单成交后增量补卖单
+        
+        V3.2 变更：基于"高价优先"逻辑
+        - 只有当新买入是"最高价支撑位"时才立即挂卖单
+        - 否则由 sync_mapping 在下一个 Recon 周期统一处理
+        - 这避免了"挂单→撤单"的无效操作
+        """
         if not self.state or delta_buy_qty <= 0:
             return []
         
-        delta_sell = delta_buy_qty * self.state.sell_quota_ratio
-        if delta_sell < exchange_min_qty_btc:
+        # 获取有持仓的支撑位
+        filled_supports = [
+            lvl for lvl in self.state.support_levels_state 
+            if int(lvl.fill_counter or 0) > 0
+        ]
+        if not filled_supports:
             return []
-
-        target_level = None
         
-        if filled_support_level_id:
-            target_level_id = self.state.level_mapping.get(filled_support_level_id)
-            if target_level_id:
-                target_level = self._get_level_by_id(target_level_id)
+        # 找到价格最高的支撑位
+        highest_price_lvl = max(filled_supports, key=lambda x: x.price)
         
+        # 如果新买入的不是最高价支撑位，跳过（让 sync_mapping 统一处理）
+        if filled_support_level_id and filled_support_level_id != highest_price_lvl.level_id:
+            self.logger.debug(
+                f"⏸️ 延迟挂卖单: 新买入 L_{filled_support_level_id} 非最高价位, "
+                f"最高价位是 L_{highest_price_lvl.level_id}({highest_price_lvl.price:.2f})"
+            )
+            return []
+        
+        # 计算可卖量（基于总持仓的高价优先逻辑）
+        base_qty = float(self.state.base_amount_per_grid or 0)
+        sell_quota_ratio = float(self.state.sell_quota_ratio or 0.7)
+        base_position_locked = float(self.state.base_position_locked or 0)
+        
+        total_holdings = sum(f.qty for f in self.state.active_inventory)
+        sellable_total = max(total_holdings - base_position_locked, 0) * sell_quota_ratio
+        
+        if sellable_total < exchange_min_qty_btc:
+            return []
+        
+        # 查找目标阻力位
+        target_level_id = self.state.level_mapping.get(highest_price_lvl.level_id)
+        if not target_level_id:
+            return []
+        target_level = self._get_level_by_id(target_level_id)
         if not target_level:
-            recent_fill = None
-            for lvl in sorted(self.state.support_levels_state, key=lambda x: x.price, reverse=True):
-                if lvl.fill_counter > 0 and lvl.price < current_price:
-                    recent_fill = lvl
-                    break
-            
-            if recent_fill:
-                target_level_id = self.state.level_mapping.get(recent_fill.level_id)
-                if target_level_id:
-                    target_level = self._get_level_by_id(target_level_id)
+            return []
         
-        if not target_level:
-            all_levels = self.state.support_levels_state + self.state.resistance_levels_state
-            candidates = [lvl for lvl in all_levels if lvl.price > current_price]
-            if candidates:
-                target_level = min(candidates, key=lambda x: x.price)
+        # 计算该支撑位应挂的卖单量
+        level_holdings = int(highest_price_lvl.fill_counter or 0) * base_qty
+        delta_sell = min(level_holdings, sellable_total)
         
-        if not target_level:
+        if delta_sell < exchange_min_qty_btc:
             return []
         
         if current_price >= target_level.price * (1 - self.state.sell_price_buffer_pct):
@@ -1585,7 +1633,13 @@ class GridPositionManager:
                 levels[effective_idx].fill_counter += 1
 
     def release_fill_counter_by_qty(self, sell_qty: float) -> None:
-        """卖出后释放持仓记录"""
+        """
+        卖出后释放持仓记录
+        
+        V3.2 变更：按高价优先移除记录
+        - 优先移除买入价格最高的记录（与 sync_mapping 的卖出顺序一致）
+        - 使用 floor 而非 round，只移除完整单位
+        """
         if not self.state or not self.state.active_inventory:
             return
             
@@ -1594,20 +1648,30 @@ class GridPositionManager:
             return
             
         sell_qty = max(float(sell_qty or 0), 0.0)
-        count = int(round(sell_qty / base_qty))
+        # 使用 floor：只有卖出完整单位才移除记录
+        count = int(sell_qty / base_qty)
         if count <= 0:
-            count = 1
-            
+            return
+        
+        # 按买入价格从高到低排序（高价优先移除）
+        self.state.active_inventory.sort(key=lambda f: f.price, reverse=True)
+        
+        removed_count = 0
         for _ in range(count):
             if self.state.active_inventory:
-                removed = self.state.active_inventory.pop(0)
+                removed = self.state.active_inventory.pop(0)  # 移除价格最高的
                 self.state.settled_inventory.insert(0, removed)
                 if len(self.state.settled_inventory) > 10:
                     self.state.settled_inventory = self.state.settled_inventory[:10]
+                removed_count += 1
                 
-        if count > 0:
+        if removed_count > 0:
             self._update_fill_counters_from_inventory()
             self._save_state()
+            self.logger.debug(
+                f"📤 释放持仓记录: sell_qty={sell_qty:.6f}, removed={removed_count}, "
+                f"remaining={len(self.state.active_inventory)}"
+            )
     
     # ============================================
     # 止损管理
