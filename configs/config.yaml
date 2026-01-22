@@ -156,11 +156,11 @@ telegram:
     
     # 汇总通知
     daily_summary: true
-    daily_summary_time: "20:00"
+    daily_summary_time: "08:00"
     
     # 心跳
     heartbeat: true
-    heartbeat_interval_hours: 4
+    heartbeat_interval_hours: 24
     heartbeat_idle_sec: 3600
 
     # 静默模式

@@ -108,6 +108,7 @@ class NotificationManager:
         self._position_flux_task: Optional[asyncio.Task] = None
         self._last_trade_ts: float = 0
         self._last_heartbeat_ts: float = 0
+        self._last_heartbeat_date: str = ""
     
     async def _send_message(self, text: str) -> bool:
         """
@@ -341,6 +342,36 @@ class NotificationManager:
         if not self.config.heartbeat:
             return
         now_ts = time.time()
+        now_dt = datetime.now()
+        heartbeat_hours = int(getattr(self.config, "heartbeat_interval_hours", 0) or 0)
+        daily_time = getattr(self.config, "daily_summary_time", "08:00") or "08:00"
+
+        # 如果设置为每日心跳（>=24h），仅在指定时间发送一次
+        if heartbeat_hours >= 24:
+            try:
+                hour, minute = daily_time.split(":")
+                target_hour = int(hour)
+                target_minute = int(minute)
+            except ValueError:
+                target_hour, target_minute = 8, 0
+
+            if (now_dt.hour, now_dt.minute) < (target_hour, target_minute):
+                return
+
+            today = now_dt.strftime("%Y-%m-%d")
+            if self._last_heartbeat_date == today:
+                return
+
+            self._last_heartbeat_date = today
+            await self.notify_heartbeat(
+                symbol=symbol,
+                current_price=current_price,
+                position_value=position_value,
+                unrealized_pnl=unrealized_pnl,
+                uptime_hours=uptime_hours,
+            )
+            return
+
         if self._last_trade_ts and now_ts - self._last_trade_ts < self.config.heartbeat_idle_sec:
             return
         if self._last_heartbeat_ts and now_ts - self._last_heartbeat_ts < self.config.heartbeat_idle_sec:
