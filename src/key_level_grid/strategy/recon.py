@@ -368,8 +368,8 @@ class ReconEventManager:
                 realized_pnl=0,
             )
         
-        # 释放持仓记录
-        self.position_manager.release_fill_counter_by_qty(qty)
+        # 释放持仓记录（传递卖出价格，精确移除对应支撑位的持仓）
+        self.position_manager.release_fill_counter_by_qty(qty, sell_price=price)
         
         # 写入本地账本
         self.trade_store.append_trade({

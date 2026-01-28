@@ -1665,13 +1665,18 @@ class GridPositionManager:
             if effective_idx < len(levels):
                 levels[effective_idx].fill_counter += 1
 
-    def release_fill_counter_by_qty(self, sell_qty: float) -> None:
+    def release_fill_counter_by_qty(self, sell_qty: float, sell_price: float = 0) -> None:
         """
         卖出后释放持仓记录
         
-        V3.2 变更：按高价优先移除记录
-        - 优先移除买入价格最高的记录（与 sync_mapping 的卖出顺序一致）
-        - 使用 floor 而非 round，只移除完整单位
+        V3.3 变更：根据卖出价格精确移除对应支撑位的持仓
+        - 根据 sell_price 找到卖出目标水位
+        - 反向查找 level_mapping，找到映射到该目标水位的支撑位
+        - 只移除这些支撑位的持仓
+        
+        Args:
+            sell_qty: 卖出数量
+            sell_price: 卖出成交价格（用于确定应移除哪个支撑位的持仓）
         """
         if not self.state or not self.state.active_inventory:
             return
@@ -1686,17 +1691,32 @@ class GridPositionManager:
         if count <= 0:
             return
         
-        # 按买入价格从高到低排序（高价优先移除）
-        self.state.active_inventory.sort(key=lambda f: f.price, reverse=True)
+        # 根据卖出价格找到目标水位，然后反向查找应移除的支撑位
+        target_support_level_ids = self._find_source_supports_for_sell_price(sell_price)
         
-        removed_count = 0
-        for _ in range(count):
-            if self.state.active_inventory:
-                removed = self.state.active_inventory.pop(0)  # 移除价格最高的
-                self.state.settled_inventory.insert(0, removed)
-                if len(self.state.settled_inventory) > 10:
-                    self.state.settled_inventory = self.state.settled_inventory[:10]
-                removed_count += 1
+        if target_support_level_ids:
+            # 精确移除：只移除映射到该卖出价位的支撑位持仓
+            self.logger.debug(
+                f"📤 精确释放: sell_price={sell_price:.4f}, "
+                f"target_supports={target_support_level_ids}"
+            )
+            removed_count = self._remove_inventory_by_support_ids(
+                target_support_level_ids, count
+            )
+        else:
+            # 回退：按高价优先移除（兼容旧逻辑）
+            self.logger.warning(
+                f"⚠️ 未找到卖出价格 {sell_price:.4f} 对应的支撑位，回退到高价优先"
+            )
+            self.state.active_inventory.sort(key=lambda f: f.price, reverse=True)
+            removed_count = 0
+            for _ in range(count):
+                if self.state.active_inventory:
+                    removed = self.state.active_inventory.pop(0)
+                    self.state.settled_inventory.insert(0, removed)
+                    if len(self.state.settled_inventory) > 10:
+                        self.state.settled_inventory = self.state.settled_inventory[:10]
+                    removed_count += 1
                 
         if removed_count > 0:
             self._update_fill_counters_from_inventory()
@@ -1705,6 +1725,94 @@ class GridPositionManager:
                 f"📤 释放持仓记录: sell_qty={sell_qty:.6f}, removed={removed_count}, "
                 f"remaining={len(self.state.active_inventory)}"
             )
+    
+    def _find_source_supports_for_sell_price(self, sell_price: float) -> List[int]:
+        """
+        根据卖出成交价格，反向查找映射到该价位的支撑位 ID 列表
+        
+        Args:
+            sell_price: 卖出成交价格
+            
+        Returns:
+            映射到该卖出价位的支撑位 level_id 列表
+        """
+        if not self.state or sell_price <= 0:
+            return []
+        
+        # 找到成交价格对应的目标水位（支撑位或阻力位）
+        all_levels = self.state.support_levels_state + self.state.resistance_levels_state
+        target_level_id = None
+        for lvl in all_levels:
+            if self.price_matches(sell_price, lvl.price):
+                target_level_id = lvl.level_id
+                break
+        
+        if target_level_id is None:
+            return []
+        
+        # 反向查找：哪些支撑位映射到这个目标水位
+        source_support_ids = []
+        for sup_id_str, tgt_id in self.state.level_mapping.items():
+            if tgt_id == target_level_id:
+                source_support_ids.append(int(sup_id_str))
+        
+        return source_support_ids
+    
+    def _remove_inventory_by_support_ids(
+        self, 
+        support_level_ids: List[int], 
+        count: int
+    ) -> int:
+        """
+        移除指定支撑位的持仓记录
+        
+        Args:
+            support_level_ids: 要移除持仓的支撑位 ID 列表
+            count: 要移除的记录数
+            
+        Returns:
+            实际移除的记录数
+        """
+        if not self.state or not self.state.active_inventory:
+            return 0
+        
+        # 获取支撑位价格集合（用于匹配）
+        support_prices = set()
+        for lvl in self.state.support_levels_state:
+            if lvl.level_id in support_level_ids:
+                support_prices.add(lvl.price)
+        
+        if not support_prices:
+            return 0
+        
+        # 分离：属于目标支撑位的持仓 vs 其他持仓
+        target_inventory = []
+        other_inventory = []
+        for fill in self.state.active_inventory:
+            # 检查是否属于目标支撑位（通过价格匹配）
+            is_target = any(
+                self.price_matches(fill.price, sp) for sp in support_prices
+            )
+            if is_target:
+                target_inventory.append(fill)
+            else:
+                other_inventory.append(fill)
+        
+        # 从目标持仓中按高价优先移除
+        target_inventory.sort(key=lambda f: f.price, reverse=True)
+        removed_count = 0
+        for _ in range(count):
+            if target_inventory:
+                removed = target_inventory.pop(0)
+                self.state.settled_inventory.insert(0, removed)
+                if len(self.state.settled_inventory) > 10:
+                    self.state.settled_inventory = self.state.settled_inventory[:10]
+                removed_count += 1
+        
+        # 重建 inventory
+        self.state.active_inventory = target_inventory + other_inventory
+        
+        return removed_count
     
     # ============================================
     # 止损管理

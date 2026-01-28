@@ -1466,7 +1466,7 @@ class KeyLevelGridStrategy:
                             grid_index=0,
                             realized_pnl=0,
                         )
-                    self.position_manager.release_fill_counter_by_qty(qty)
+                    self.position_manager.release_fill_counter_by_qty(qty, sell_price=price)
                     
                     # 写入本地账本
                     self.trade_store.append_trade({
