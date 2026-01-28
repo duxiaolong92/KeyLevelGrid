@@ -262,12 +262,24 @@ class RiskManager:
                 self.logger.info("📊 启动同步: 交易所无现有止损单")
                 return
             
+            self.logger.debug(f"📊 获取到 {len(plan_orders)} 个计划委托")
+            
             for order in plan_orders:
                 order_id = str(order.get('id', ''))
-                size = abs(int(order.get('size', 0)))
-                is_sell = int(order.get('size', 0)) < 0
+                # Gate API 返回的 size 可能在 initial 字段中
+                initial = order.get('initial', {})
+                size_raw = order.get('size', 0) or initial.get('size', 0)
+                size = abs(int(size_raw or 0))
+                is_sell = int(size_raw or 0) < 0
+                
+                # trigger 信息
                 trigger_info = order.get('trigger', {})
                 trigger_price = float(trigger_info.get('price', 0) if isinstance(trigger_info, dict) else 0)
+                
+                self.logger.debug(
+                    f"📊 检查订单: id={order_id}, size_raw={size_raw}, "
+                    f"is_sell={is_sell}, trigger_price={trigger_price}"
+                )
                 
                 if is_sell and size > 0:
                     self.stop_loss_order_id = order_id
@@ -279,10 +291,30 @@ class RiskManager:
                     )
                     return
             
-            self.logger.info("📊 启动同步: 未找到符合条件的止损单")
+            # 未找到符合条件的止损单，但有其他计划委托
+            # 可能是格式不匹配或旧版止损单，先清理掉
+            self.logger.warning(
+                f"⚠️ 启动同步: 未找到符合条件的止损单 (共 {len(plan_orders)} 个订单)，清理残留"
+            )
+            await self._cleanup_orphan_stop_loss_orders(symbol)
             
         except Exception as e:
             self.logger.error(f"❌ 同步止损单失败: {e}", exc_info=True)
+    
+    async def _cleanup_orphan_stop_loss_orders(self, symbol: str) -> None:
+        """清理孤立的止损单（重启时使用）"""
+        if not self.executor:
+            return
+        
+        try:
+            if hasattr(self.executor, 'cancel_all_plan_orders'):
+                success = await self.executor.cancel_all_plan_orders(symbol)
+                if success:
+                    self.logger.info("🧹 已清理所有残留计划委托")
+                else:
+                    self.logger.warning("⚠️ 清理残留计划委托失败")
+        except Exception as e:
+            self.logger.error(f"❌ 清理残留计划委托异常: {e}")
     
     async def check_stop_loss_triggered(
         self,
