@@ -1372,18 +1372,22 @@ class GridPositionManager:
             return total_qty
 
         # 动态角色判定（基于价格位置分类，不修改原对象的 role/side 字段）
-        # 只有支撑位列表中价格低于当前价的才作为买入候选
-        # 避免污染 GridLevelState 的持久化字段
+        # 从所有水位中选择，根据当前价格动态判定角色
+        all_levels = self.state.support_levels_state + self.state.resistance_levels_state
+        
+        # 买入候选：所有价格低于当前价的水位（使用 buy_price_buffer_pct 缓冲）
+        # 条件：current_price > level_price * (1 + buffer)
+        buy_buffer = self.state.buy_price_buffer_pct or 0.005
         buy_levels = [
-            lvl for lvl in self.state.support_levels_state 
-            if lvl.price < current_price
+            lvl for lvl in all_levels 
+            if current_price > lvl.price * (1 + buy_buffer)
         ]
-        # 阻力位列表中价格高于当前价的作为卖出候选（但卖单通过 sync_mapping 处理）
+        
+        # 卖出候选：所有价格高于当前价的水位（但卖单通过 sync_mapping 处理）
         sell_levels = [
-            lvl for lvl in self.state.resistance_levels_state 
+            lvl for lvl in all_levels 
             if lvl.price > current_price
         ]
-        all_levels = self.state.support_levels_state + self.state.resistance_levels_state
 
         # 买单处理
         for lvl in buy_levels:
@@ -1439,7 +1443,8 @@ class GridPositionManager:
                 lvl.last_action_ts = int(time.time())
                 continue
             
-            if lvl.status == LevelStatus.ACTIVE:
+            # 交易所无订单时，重置为 IDLE（包括 ACTIVE 和 FILLED 状态）
+            if lvl.status in (LevelStatus.ACTIVE, LevelStatus.FILLED):
                 lvl.status = LevelStatus.IDLE
                 lvl.order_id = ""
                 lvl.open_qty = 0.0
