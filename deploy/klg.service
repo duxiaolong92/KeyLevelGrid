@@ -21,6 +21,8 @@
 [Unit]
 Description=Key Level Grid Trading Strategy
 After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -31,15 +33,16 @@ Environment=PATH=/opt/key-level-grid/venv/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=/opt/key-level-grid/.env
 
 # 启动命令
-ExecStart=/opt/key-level-grid/venv/bin/python scripts/run.py --config configs/config.yaml
+ExecStart=/opt/key-level-grid/venv/bin/python /opt/key-level-grid/scripts/run/single.py --config /opt/key-level-grid/configs/config.yaml --log-file /opt/key-level-grid/logs/klg.log
 
 # 重启策略
 Restart=always
-RestartSec=10
+RestartSec=5
+TimeoutStartSec=60
 
 # 日志
-StandardOutput=journal
-StandardError=journal
+StandardOutput=append:/opt/key-level-grid/logs/klg_stdout.log
+StandardError=append:/opt/key-level-grid/logs/klg_stderr.log
 SyslogIdentifier=klg
 
 # 资源限制

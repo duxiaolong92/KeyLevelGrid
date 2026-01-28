@@ -1973,6 +1973,7 @@ class KeyLevelTelegramBot:
 
 方向: {dir_emoji}
 数量: {contracts}张 ({qty:.4f} {symbol})
+仓位: {value:,.2f} USDT
 均价: {entry_price:,.4f}
 现价: {current_price:,.4f} ({pnl_pct:+.2%})
 

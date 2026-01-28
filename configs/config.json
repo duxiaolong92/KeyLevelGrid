@@ -1,8 +1,0 @@
-{
-  "grid": {
-    "range_mode": "manual",
-    "manual_lower": 80000.0,
-    "manual_upper": 98000.0,
-    "base_position_locked": 0.0
-  }
-}

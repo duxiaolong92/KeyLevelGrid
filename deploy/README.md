@@ -53,7 +53,15 @@ ssh klg 'journalctl -u klg -f'
 
 ```bash
 cd /Users/duxiaolong/Desktop/CurWorkSpace/KeyLevelGrid
-./deploy/deploy.sh
+
+# 部署默认配置
+./deploy/deploy.sh klg
+
+# 部署到指定服务器
+./deploy/deploy.sh dxl
+
+# 部署多个币种
+./deploy/deploy.sh dxl sol eth
 ```
 
 ---
@@ -127,16 +135,87 @@ sudo systemctl start klg
 
 ---
 
+## 🔀 多实例部署
+
+支持同时运行多个交易对（如 BTC、SOL、ETH），每个实例使用独立的账户和 Telegram Bot。
+
+### 部署命令
+
+```bash
+# 部署默认配置 (config.yaml → klg 服务)
+./deploy/deploy.sh dxl
+
+# 部署指定币种 (config_sol.yaml → klg-sol 服务)
+./deploy/deploy.sh dxl sol
+
+# 部署多个币种
+./deploy/deploy.sh dxl sol eth xag
+```
+
+### 实例映射规则
+
+| 参数 | 配置文件 | 服务名 |
+|------|----------|--------|
+| (空) | `configs/config.yaml` | `klg` |
+| sol | `configs/config_sol.yaml` | `klg-sol` |
+| eth | `configs/config_eth.yaml` | `klg-eth` |
+| xag | `configs/config_xag.yaml` | `klg-xag` |
+
+> 币种名称自动转小写，如 `SOL` → `sol`
+
+### 多实例环境变量配置
+
+在服务器 `.env` 文件中添加每个实例的 API 和 TG 配置：
+
+```bash
+# 主实例
+GATE_KLG_API_KEY=xxx
+GATE_KLG_API_SECRET=xxx
+TG_BOT_TOKEN=xxx
+TG_CHAT_ID=xxx
+
+# SOL 实例
+GATE_SOL_API_KEY=xxx
+GATE_SOL_API_SECRET=xxx
+TG_SOL_BOT_TOKEN=xxx
+TG_SOL_CHAT_ID=xxx
+
+# ETH 实例
+GATE_ETH_API_KEY=xxx
+GATE_ETH_API_SECRET=xxx
+TG_ETH_BOT_TOKEN=xxx
+TG_ETH_CHAT_ID=xxx
+```
+
+### 多实例管理命令
+
+```bash
+# 查看所有实例状态
+ssh dxl 'sudo systemctl status klg klg-sol klg-eth'
+
+# 重启所有实例
+ssh dxl 'sudo systemctl restart klg klg-sol klg-eth'
+
+# 查看某个实例日志
+ssh dxl 'sudo journalctl -u klg-sol -f'
+```
+
+---
+
 ## 📁 文件说明
 
 ```
 deploy/
-├── deploy.sh        # 部署脚本（本地执行，rsync + 重启）
-├── klg.service      # systemd 服务配置
+├── deploy.sh        # 部署脚本（支持单/多实例）
+├── klg.service      # 主实例 systemd 服务模板
+├── klg-sol.service  # SOL 实例 systemd 服务模板
+├── klg-eth.service  # ETH 实例 systemd 服务模板
 ├── setup-server.sh  # 服务器初始化脚本
 ├── env.example      # 环境变量模板
 └── README.md        # 本文件
 ```
+
+> 如果服务文件不存在，部署脚本会自动基于配置创建
 
 ---
 

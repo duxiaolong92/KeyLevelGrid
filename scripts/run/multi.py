@@ -58,7 +58,7 @@ def main():
 
             cmd = [
                 sys.executable,
-                "scripts/run.py",
+                "scripts/run/single.py",
                 "--config",
                 cfg,
             ]

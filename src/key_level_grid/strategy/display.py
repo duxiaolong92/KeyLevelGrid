@@ -258,20 +258,20 @@ class DisplayDataGenerator:
                     for s in pos.support_levels[:10]
                 ]
 
-        # 过滤水位
+        # 过滤水位（无论来源，统一应用 min_strength 和区间过滤）
         min_strength = getattr(resistance_config, "min_strength", 0) or 0
         lower = grid_config.manual_lower if grid_config.range_mode == "manual" else 0
         upper = grid_config.manual_upper if grid_config.range_mode == "manual" else 0
         if lower <= 0 or upper <= 0:
             lower, upper = 0, 0
 
-        if not levels_from_grid:
-            data["resistance_levels"] = self._filter_levels(
-                data.get("resistance_levels", []), min_strength, lower, upper
-            )
-            data["support_levels"] = self._filter_levels(
-                data.get("support_levels", []), min_strength, lower, upper
-            )
+        # 始终应用过滤（移除 levels_from_grid 条件）
+        data["resistance_levels"] = self._filter_levels(
+            data.get("resistance_levels", []), min_strength, lower, upper
+        )
+        data["support_levels"] = self._filter_levels(
+            data.get("support_levels", []), min_strength, lower, upper
+        )
         
         # 交易历史
         data["active_inventory"] = [f.to_dict() for f in pos.active_inventory] if pos else []
@@ -405,7 +405,9 @@ class DisplayDataGenerator:
             
             return {
                 "side": "long",
-                "qty": contracts,
+                "qty": contracts,                              # 币数量
+                "raw_contracts": gate_pos.get("raw_contracts", 0),  # 原始张数
+                "contract_size": self._contract_size,          # 合约大小
                 "avg_entry_price": entry_price,
                 "value": notional,
                 "unrealized_pnl": unrealized_pnl,
@@ -460,8 +462,10 @@ class DisplayDataGenerator:
                 orders.append({
                     "side": o.get("side", ""),
                     "price": o.get("price", 0),
-                    "amount": o.get("amount", 0),
-                    "contracts": o.get("base_amount", 0),
+                    "amount": o.get("amount", 0),           # USDT 价值
+                    "contracts": o.get("base_amount", 0),   # 币数量（用于计算张数）
+                    "raw_contracts": o.get("raw_contracts", 0),  # 原始张数（直接显示）
+                    "contract_size": o.get("contract_size", 1),  # 合约大小
                     "status": o.get("status", "pending"),
                     "source": "Gate",
                     "strength": 0,
@@ -476,7 +480,11 @@ class DisplayDataGenerator:
         pos_state = self.position_manager.state
         if pos_state:
             if pos_state.support_levels_state or pos_state.resistance_levels_state:
-                base_btc = float(getattr(pos_state, "base_amount_per_grid", 0) or 0)
+                # 优先使用配置中的 base_amount_per_grid，回退到状态中的值
+                grid_config = getattr(self.position_manager, "grid_config", None)
+                base_btc = float(getattr(grid_config, "base_amount_per_grid", 0) or 0)
+                if base_btc <= 0:
+                    base_btc = float(getattr(pos_state, "base_amount_per_grid", 0) or 0)
                 buy_orders = [
                     {
                         "side": "buy",

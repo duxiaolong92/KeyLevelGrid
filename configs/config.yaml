@@ -7,20 +7,20 @@ strategy:
   description: "基于支撑/阻力位的网格交易策略"
 
 # 运行模式
-dry_run: false                    # false = 实盘模式，true = 模拟模式
+dry_run: false                  # false = 实盘模式，true = 模拟模式
 
 # 交易配置
 trading:
-  symbol: "BTCUSDT"           # 币安合约交易对 (Gate 格式: BTC/USDT:USDT)
+  symbol: "BTCUSDT"           # BTC 合约交易对
   exchange: "gate"            # 交易所 (Gate)
   market_type: "futures"      # 合约市场 (USDT 永续)
-  margin_mode: "cross"        # 保证金模式: cross (全仓) | isolated (逐仓)
+  margin_mode: "isolated"        # 保证金模式: cross (全仓) | isolated (逐仓)
   leverage: 10                 # 杠杆倍数
   timeframe: "4h"             # 主交易周期
   aux_timeframes:             # 辅助周期 (多周期融合，最多 2 个，总共支持 1~3 个周期)
     - "1d"
     - "1w"
-  default_contract_size: 0.0001  # 合约大小后备值（仅当 API 获取失败时使用，BTC=0.0001）
+  default_contract_size: 0.0001  # 合约大小后备值（BTC=0.0001）
 
 # K线数据源配置
 kline_feed:
@@ -36,8 +36,8 @@ kline_feed:
 grid:
   # 网格区间
   range_mode: "manual"          # auto: 基于 S/R 自动计算 | manual: 手动设置
-  manual_upper: 108000           # manual 模式: 上边界
-  manual_lower: 80000           # manual 模式: 下边界
+  manual_upper: 180000           # manual 模式: 上边界 (BTC)
+  manual_lower: 80000            # manual 模式: 下边界 (BTC)
   
   # 网格数量
   count_mode: "by_levels"       # by_levels: 按有效支撑位数量 | fixed: 固定数量
@@ -51,7 +51,7 @@ grid:
   min_profit_pct: 0.0001        # 均价利润保护阈值
   buy_price_buffer_pct: 0.005   # 买单空间缓冲
   sell_price_buffer_pct: 0.002  # 卖单空间缓冲
-  base_amount_per_grid: 0.001   # 标准网格单位（btc数量）
+  base_amount_per_grid: 0.001   # 标准网格单位（BTC 合约张数）
   max_fill_per_level: 3         # 单水位最大补买次数
   base_position_locked: 0.0     # 固定底仓数量（btc数量）
   recon_interval_sec: 30        # Recon 对账周期
@@ -76,7 +76,7 @@ stop_loss:
 # ============================================
 resistance:
   # 强度阈值 (核心参数)
-  min_strength: 30              # 只使用 >= 30 分的支撑/阻力位
+  min_strength: 80               # 只使用 >= 80 分的支撑/阻力位 (进一步降低阈值用于调试)
   
   # 摆动高低点 (三尺度)
   swing_lookbacks:

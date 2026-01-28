@@ -15,6 +15,7 @@ from pathlib import Path
 # 添加 src 目录到路径 (scripts/run/single.py → 项目根目录/src)
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
+import yaml
 from dotenv import load_dotenv
 from rich.console import Console, Group
 from rich.live import Live
@@ -24,9 +25,59 @@ from rich.table import Table
 from rich.text import Text
 
 from key_level_grid.strategy import KeyLevelGridStrategy, KeyLevelGridConfig
+from key_level_grid.telegram.notify import NotificationManager, NotifyConfig
 
 
 console = Console()
+
+
+def _build_startup_notifier(config_path: str) -> NotificationManager | None:
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_config = yaml.safe_load(f) or {}
+    except Exception:
+        return None
+    
+    tg_config = raw_config.get("telegram", {}) or {}
+    if not tg_config.get("enabled", False):
+        return None
+    
+    bot_token = os.getenv(tg_config.get("bot_token_env", "TG_BOT_TOKEN"), "")
+    chat_id = os.getenv(tg_config.get("chat_id_env", "TG_CHAT_ID"), "")
+    if not bot_token or not chat_id:
+        return None
+    
+    notify_raw = tg_config.get("notifications", {}) or {}
+    notify_config = NotifyConfig(
+        startup=notify_raw.get("startup", True),
+        shutdown=notify_raw.get("shutdown", True),
+        error=notify_raw.get("error", True),
+        order_filled=notify_raw.get("order_filled", True),
+        order_placed=notify_raw.get("order_placed", False),
+        grid_rebuild=notify_raw.get("grid_rebuild", True),
+        orders_summary=notify_raw.get("orders_summary", True),
+        quota_event=notify_raw.get("quota_event", True),
+        risk_warning=notify_raw.get("risk_warning", True),
+        near_stop_loss_pct=notify_raw.get("near_stop_loss_pct", 0.02),
+        daily_summary=notify_raw.get("daily_summary", True),
+        daily_summary_time=notify_raw.get("daily_summary_time", "20:00"),
+        heartbeat=notify_raw.get("heartbeat", False),
+        heartbeat_interval_hours=notify_raw.get("heartbeat_interval_hours", 4),
+        heartbeat_idle_sec=notify_raw.get("heartbeat_idle_sec", 3600),
+        position_flux=notify_raw.get("position_flux", True),
+        order_sync=notify_raw.get("order_sync", True),
+        system_info=notify_raw.get("system_info", True),
+        system_alert=notify_raw.get("system_alert", True),
+        silent_mode=notify_raw.get("silent_mode", True),
+        merge_fill_window_sec=notify_raw.get("merge_fill_window_sec", 5),
+        min_notify_interval_sec=notify_raw.get("min_notify_interval_sec", 5),
+    )
+    
+    return NotificationManager(
+        config=notify_config,
+        bot_token=bot_token,
+        chat_id=chat_id,
+    )
 
 
 def format_price(price: float) -> str:
@@ -111,8 +162,9 @@ def create_position_panel(data: dict) -> Panel:
     else:
         pnl_pct = pos.get("unrealized_pnl_pct", 0)
     
+    base_sym = data.get("base_symbol", "BTC")
     table.add_row("方向", side_text)
-    table.add_row("数量", f"{qty:.6f} BTC (由合约张数换算)")
+    table.add_row("数量", f"{qty:.6f} {base_sym} (由合约张数换算)")
     table.add_row("价值", f"{value:.2f} USDT")
     table.add_row("均价", f"{format_price(avg_price)}")
     
@@ -144,10 +196,12 @@ def create_orders_panel(data: dict) -> Panel:
         buy_orders = [o for o in orders if o.get("side") == "buy"]
         sell_orders = [o for o in orders if o.get("side") == "sell"]
     
+    base_sym = data.get("base_symbol", "BTC")
+    
     table = Table(box=None, padding=(0, 1))
     table.add_column("档位", style="dim", justify="center")
     table.add_column("价格", justify="right")
-    table.add_column("BTC", justify="right")
+    table.add_column(base_sym, justify="right")
     table.add_column("USDT", justify="right")
     table.add_column("距当前", justify="center")
     
@@ -307,12 +361,13 @@ def create_trades_panel(data: dict) -> Panel:
     """创建基于 Inventory 的混合成交面板"""
     active = data.get("active_inventory", [])
     settled = data.get("settled_inventory", [])
+    base_sym = data.get("base_symbol", "BTC")
     
     table = Table(box=None, padding=(0, 1))
     table.add_column("状态", style="dim", justify="left")
     table.add_column("水位", justify="center")
     table.add_column("成交价", justify="right")
-    table.add_column("BTC", justify="right")
+    table.add_column(base_sym, justify="right")
     table.add_column("类型", justify="center")
     
     # 1. 显示持仓中的买入 (Active) - 取最近 10 条，倒序
@@ -425,6 +480,15 @@ def get_leverage_info(strategy: KeyLevelGridStrategy) -> str:
         return "N/A"
 
 
+def get_base_symbol(symbol: str) -> str:
+    """从交易对中提取 base 币种符号（如 XAGUSDT -> XAG）"""
+    symbol = symbol.upper()
+    for suffix in ["USDT", "USD", "BUSD", "USDC"]:
+        if symbol.endswith(suffix):
+            return symbol[:-len(suffix)]
+    return symbol
+
+
 def create_display(strategy: KeyLevelGridStrategy) -> Layout:
     """创建显示布局"""
     data = strategy.get_display_data()
@@ -432,6 +496,10 @@ def create_display(strategy: KeyLevelGridStrategy) -> Layout:
     # 统一获取当前价格并注入到 data 中
     current_price = get_current_price(data)
     data["current_price"] = current_price
+    
+    # 注入币种符号
+    data["symbol"] = strategy.config.symbol
+    data["base_symbol"] = get_base_symbol(strategy.config.symbol)
     
     layout = Layout()
     layout.split_column(
@@ -490,6 +558,17 @@ def create_display(strategy: KeyLevelGridStrategy) -> Layout:
 async def run_strategy(config_path: str, force_rebuild: bool = False, dry_run: bool = False):
     """运行策略"""
     load_dotenv()
+    notifier = _build_startup_notifier(config_path)
+    
+    async def _notify_startup_error(error: Exception, context: str) -> None:
+        if not notifier:
+            return
+        await notifier.notify_error(
+            error_type="StartupError",
+            error_msg=str(error),
+            context=context,
+            suggestion="检查服务启动脚本、配置文件路径、环境变量与依赖是否正确",
+        )
     
     mode_text = "[yellow]🔒 DRY RUN 模式[/yellow]" if dry_run else ""
     console.print(Panel.fit(
@@ -500,7 +579,11 @@ async def run_strategy(config_path: str, force_rebuild: bool = False, dry_run: b
     ))
     
     # 加载策略
-    strategy = KeyLevelGridStrategy.from_yaml(config_path)
+    try:
+        strategy = KeyLevelGridStrategy.from_yaml(config_path)
+    except Exception as e:
+        await _notify_startup_error(e, "加载配置/初始化")
+        raise
     
     # 命令行 --dry-run 参数覆盖配置文件
     if dry_run:
@@ -521,7 +604,11 @@ async def run_strategy(config_path: str, force_rebuild: bool = False, dry_run: b
     ))
     
     # 启动策略（后台任务）
-    strategy_task = asyncio.create_task(strategy.start())
+    try:
+        strategy_task = asyncio.create_task(strategy.start())
+    except Exception as e:
+        await _notify_startup_error(e, "启动策略")
+        raise
     
     # 等待初始数据
     await asyncio.sleep(3)
@@ -549,6 +636,9 @@ async def run_strategy(config_path: str, force_rebuild: bool = False, dry_run: b
         await strategy.stop()
         strategy_task.cancel()
         console.print("[green]✅ 策略已停止[/green]")
+    except Exception as e:
+        await _notify_startup_error(e, "运行中异常")
+        raise
 
 
 def main():
@@ -575,6 +665,11 @@ def main():
         action="store_true",
         help="模拟运行模式，不执行实际交易（仅显示策略输出）"
     )
+    parser.add_argument(
+        "--reset-config",
+        action="store_true",
+        help="忽略 config.json 覆盖，强制使用 config.yaml 配置"
+    )
     args = parser.parse_args()
 
     log_file = setup_file_logging(log_file=args.log_file)
@@ -582,6 +677,13 @@ def main():
     
     # 检查配置文件
     config_path = Path(args.config)
+    
+    # 如果指定 --reset-config，删除 config.json
+    if args.reset_config:
+        json_path = config_path.with_suffix(".json")
+        if json_path.exists():
+            json_path.unlink()
+            console.print(f"[yellow]🗑️ 已删除配置覆盖文件: {json_path}[/yellow]")
     if not config_path.exists():
         # 尝试相对于项目根目录
         project_root = Path(__file__).parent.parent

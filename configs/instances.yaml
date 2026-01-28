@@ -1,11 +1,18 @@
-# 多实例启动器配置示例
+# 多实例启动器配置
+# 用法: python scripts/run/multi.py --config configs/instances.yaml
 launcher:
   mode: "multi_process"        # 固定：每实例一个进程
   log_dir: "logs/instances"    # 每实例日志目录
 
 instances:
-  - name: "gate_btc"
-    config_path: "configs/config.yaml"   # 这里可替换为你的 BTC 配置
+  # BABA 实例（当前主配置）
+  - name: "gate_baba"
+    config_path: "configs/config.yaml"
 
-  # - name: "okx_eth"
-  #   config_path: "configs/okx_eth.yaml"
+  # SOL 实例（需配置 .env 中的 GATE_SOL_* 和 TG_SOL_* 变量）
+  # - name: "gate_sol"
+  #   config_path: "configs/config_sol.yaml"
+
+  # ETH 实例（需配置 .env 中的 GATE_ETH_* 和 TG_ETH_* 变量）
+  # - name: "gate_eth"
+  #   config_path: "configs/config_eth.yaml"

@@ -697,6 +697,26 @@ class KeyLevelGridStrategy:
         # 启动数据源
         await self.kline_feed.start()
         
+        # 初始化合约大小（从交易所获取，dry_run 模式下也可用）
+        try:
+            self._contract_size = await self._exchange_sync.init_contract_size()
+        except Exception as e:
+            self.logger.warning(f"初始化合约大小失败: {e}")
+            self._contract_size = self.config.default_contract_size
+        
+        # 启动时设置保证金模式和杠杆（非 dry_run 模式）
+        if not self.config.dry_run and self._executor:
+            try:
+                gate_symbol = self._convert_to_gate_symbol(self.config.symbol)
+                margin_mode = self.config.margin_mode
+                leverage = self.config.leverage
+                self.logger.info(f"🔧 启动时设置保证金模式: {margin_mode}, 杠杆: {leverage}x")
+                await self._executor.set_margin_mode(gate_symbol, margin_mode)
+                await self._executor.set_leverage(gate_symbol, leverage)
+                self.logger.info(f"✅ 保证金模式设置完成: {margin_mode}, {leverage}x")
+            except Exception as e:
+                self.logger.warning(f"⚠️ 设置保证金模式/杠杆失败 (可能已有持仓): {e}")
+        
         # 启动 WebSocket 订阅
         self.kline_feed.start_ws_subscription(self._on_kline_close)
         
@@ -725,6 +745,12 @@ class KeyLevelGridStrategy:
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                # 检查是否由 CancelledError 引起（通常是正常停止导致的网络请求中断）
+                is_cancelled = isinstance(e.__cause__, asyncio.CancelledError)
+                if is_cancelled:
+                    self.logger.info(f"⏹️ 网络请求被取消（可能是正常停止）: {type(e).__name__}")
+                    break
+                
                 self.logger.error(f"策略更新异常: {e}", exc_info=True)
                 # 发送错误通知
                 await self._notification_helper.notify_error("StrategyError", str(e), "主循环更新")
@@ -791,8 +817,14 @@ class KeyLevelGridStrategy:
             self.config.kline_config.primary_timeframe
         )
         
-        if len(klines) < 170:
-            return
+        # 检查 K 线数量（记录警告但不阻止运行，心理关口等基础水位不依赖 K 线历史）
+        min_klines = 50
+        if len(klines) < min_klines:
+            self.logger.warning(
+                f"K线数据不足: {len(klines)} < {min_klines}，部分指标可能不可用，"
+                f"但心理关口等基础水位仍可生成"
+            )
+            # 不再直接 return，允许策略继续运行使用心理关口
         
         # 首次运行：先获取账户余额，用真实余额覆盖配置的 total_capital
         import time
@@ -961,8 +993,11 @@ class KeyLevelGridStrategy:
                 self.config.kline_config.primary_timeframe
             )
             if len(klines) < 50:
-                self.logger.warning("K线数据不足，无法重置")
-                return False
+                self.logger.warning(
+                    f"K线数据不足({len(klines)} < 50)，部分指标可能不可用，"
+                    f"但心理关口等基础水位仍可生成"
+                )
+                # 不再阻止重置，继续使用可用的数据
 
             klines_dict = self._build_klines_by_timeframe(klines)
             
@@ -1834,7 +1869,7 @@ class KeyLevelGridStrategy:
                 self.config.kline_config.primary_timeframe
             )
             
-            if len(klines) < 170:
+            if len(klines) < 50:
                 return
             
             # 计算通道状态

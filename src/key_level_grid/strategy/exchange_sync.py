@@ -291,12 +291,37 @@ class ExchangeSyncManager:
         
         return self.trades
     
+    async def init_contract_size(self) -> float:
+        """
+        初始化合约大小（从交易所获取）
+        
+        这个方法可以在 dry_run 模式下调用，因为只需要市场信息不需要账户权限
+        """
+        if self.contract_size > 0 and self.contract_size != 1.0:
+            return self.contract_size
+        
+        gate_symbol = self._convert_to_gate_symbol(self.config.symbol)
+        self.contract_size = await self._get_contract_size(gate_symbol)
+        self.logger.info(f"📐 合约大小: {self.contract_size} {self._get_base_symbol()}/张 ({gate_symbol})")
+        return self.contract_size
+    
+    def _get_base_symbol(self) -> str:
+        """获取基础币种"""
+        symbol = self.config.symbol.upper()
+        for suffix in ["USDT", "USD", "BUSD", "USDC"]:
+            if symbol.endswith(suffix):
+                return symbol[:-len(suffix)]
+        return symbol
+    
     async def _get_contract_size(self, gate_symbol: str) -> float:
         """获取合约大小"""
         if self.contract_size > 0 and self.contract_size != 1.0:
             return self.contract_size
         
         try:
+            if not self.executor or not self.executor._exchange:
+                raise ValueError("交易所未初始化")
+            
             markets = self.executor._exchange.markets
             if not markets:
                 await asyncio.get_event_loop().run_in_executor(
@@ -304,11 +329,15 @@ class ExchangeSyncManager:
                 )
                 markets = self.executor._exchange.markets
             market = markets.get(gate_symbol, {})
-            contract_size = market.get('contractSize', 1.0) or 1.0
-            return contract_size
+            contract_size = market.get('contractSize', 0) or 0
+            
+            if contract_size > 0:
+                return contract_size
+            else:
+                raise ValueError(f"未找到合约 {gate_symbol} 的 contractSize")
         except Exception as e:
             default_size = getattr(self.config, 'default_contract_size', 1.0)
-            self.logger.warning(f"获取 contractSize 失败，使用默认值 {default_size}: {e}")
+            self.logger.warning(f"获取 contractSize 失败，使用配置值 {default_size}: {e}")
             return default_size
     
     def get_exchange_min_contracts(self) -> float:

@@ -34,15 +34,24 @@ class KeyLevelGridIndicator:
         计算市场状态
         
         Args:
-            klines: K线列表 (至少需要 macd_slow + adx_period 根)
+            klines: K线列表 (推荐至少 macd_slow + adx_period 根，但不强制)
             
         Returns:
             KeyLevelGridState 对象
         """
+        # 如果 K 线数据不足，返回简化的状态（只有基本价格信息）
+        if not klines:
+            self.logger.warning("K线数据为空，返回默认状态")
+            return KeyLevelGridState(
+                timestamp=0, symbol=self.symbol,
+                open=0, high=0, low=0, close=0, volume=0
+            )
+        
         min_required = max(self.config.macd_slow, self.config.adx_period) + 20
         if len(klines) < min_required:
-            raise ValueError(
-                f"K线数量不足: 需要 {min_required} 根，实际 {len(klines)} 根"
+            self.logger.warning(
+                f"K线数量不足（{len(klines)} < {min_required}），仅返回基本价格信息，"
+                f"指标计算将被跳过，但心理关口等基础水位仍可生成"
             )
         
         closes = [k.close for k in klines]

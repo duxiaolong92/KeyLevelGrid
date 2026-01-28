@@ -1,0 +1,148 @@
+# Key Level Grid Strategy 配置 - XAG (白银)
+# 纯支撑/阻力位网格交易策略
+
+strategy:
+  name: "KeyLevelGrid"
+  version: "2.0.0"
+  description: "基于支撑/阻力位的网格交易策略 - XAG"
+
+# 运行模式
+dry_run: false                  # false = 实盘模式，true = 模拟模式
+
+# 交易配置
+trading:
+  symbol: "XAGUSDT"             # XAG 合约交易对 (白银)
+  exchange: "gate"              # 交易所 (Gate)
+  market_type: "futures"        # 合约市场 (USDT 永续)
+  margin_mode: "isolated"       # 保证金模式: cross (全仓) | isolated (逐仓)
+  leverage: 10                  # 杠杆倍数
+  timeframe: "1h"               # 主交易周期（XAG 数据较少，使用 1h）
+  aux_timeframes:               # 辅助周期
+    - "4h"
+    - "1d"
+  default_contract_size: 1      # 合约大小后备值（启动时从交易所获取）
+
+# K线数据源配置
+kline_feed:
+  history_bars: 500
+  update_interval_sec: 5
+  use_websocket: true
+  max_retries: 3
+  request_timeout_sec: 10.0
+
+# ============================================
+# 网格配置 (核心)
+# ============================================
+grid:
+  # 网格区间 (XAG 当前约 $113.85)
+  range_mode: "manual"
+  manual_upper: 200             # 上边界
+  manual_lower: 70              # 下边界
+  
+  # 网格数量
+  count_mode: "by_levels"
+  max_grids: 50
+  
+  # 网格底线 (止损线)
+  floor_buffer: 0.005
+  
+  # 核心参数
+  sell_quota_ratio: 0.7
+  min_profit_pct: 0.0001
+  buy_price_buffer_pct: 0.005
+  sell_price_buffer_pct: 0.002
+  base_amount_per_grid: 0.18    # 标准网格单位（约 0.18 XAG ≈ 20U）
+  max_fill_per_level: 3
+  base_position_locked: 0.0
+  recon_interval_sec: 30
+  order_action_timeout_sec: 10
+  restore_state_enabled: true
+
+# ============================================
+# 仓位配置
+# ============================================
+position:
+  max_capital_usage: 0.8
+
+# ============================================
+# 止损配置
+# ============================================
+stop_loss:
+  mode: "total"
+  trigger: "grid_floor"
+
+# ============================================
+# 支撑/阻力位计算
+# ============================================
+resistance:
+  min_strength: 0
+  
+  swing_lookbacks:
+    - 5
+    - 13
+    - 34
+  
+  fib_ratios:
+    - 0.382
+    - 0.5
+    - 0.618
+    - 1.0
+    - 1.618
+  
+  psychological_enabled: true
+  
+  volume_profile_enabled: true
+  volume_buckets: 50
+  volume_top_n: 5
+  volume_bucket_pct: 0.01
+  volume_top_pct: 0.20
+  
+  mtf_boost: 0.30
+  merge_tolerance: 0.005
+  min_distance_pct: 0.0001
+  max_distance_pct: 0.80       # XAG 区间较宽 (70-200)，需要更大的距离限制
+
+# ============================================
+# 日志配置
+# ============================================
+logging:
+  level: "DEBUG"
+  file: "logs/klg_xag.log"
+  console: true
+
+# 接口配置（使用独立账户，需在 .env 中配置）
+api:
+  key_env: "GATE_XAG_API_KEY"
+  secret_env: "GATE_XAG_API_SECRET"
+  passphrase_env: ""
+
+# ============================================
+# Telegram 通知配置
+# ============================================
+telegram:
+  enabled: true
+  bot_token_env: "TG_XAG_BOT_TOKEN"    # XAG 独立 Bot
+  chat_id_env: "TG_XAG_CHAT_ID"
+  
+  notifications:
+    startup: true
+    shutdown: true
+    error: true
+    order_filled: true
+    order_placed: false
+    orders_summary: true
+    quota_event: true
+    position_flux: true
+    order_sync: false           # dry_run 模式下关闭，避免重复通知
+    system_info: true
+    system_alert: true
+    risk_warning: true
+    near_stop_loss_pct: 0.02
+    daily_summary: true
+    daily_summary_time: "08:00"
+    heartbeat: true
+    heartbeat_interval_hours: 24
+    heartbeat_idle_sec: 3600
+    silent_mode: true
+    merge_fill_window_sec: 5
+    min_notify_interval_sec: 5

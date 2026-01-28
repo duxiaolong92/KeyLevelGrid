@@ -1,6 +1,6 @@
 # 📚 Key Level Grid 规格文档导航
 
-> **最后更新**: 2026-01-17  
+> **最后更新**: 2026-01-20  
 > **维护者**: KeyLevelGrid Core Team
 
 ---
@@ -13,7 +13,8 @@ spec/
 ├── CONSTITUTION.md                # 🔒 项目宪法（最高准则）
 │
 ├── core/                          # 核心架构
-│   └── OVERVIEW.md                # 系统架构与核心逻辑
+│   ├── OVERVIEW.md                # 系统架构与核心逻辑
+│   └── EXECUTION_FLOW.md          # 执行流程图与参数详解
 │
 ├── features/                      # 功能规格
 │   ├── LEVEL_LIFECYCLE.md         # 水位生命周期
@@ -41,6 +42,7 @@ spec/
 | 🔴 **最高** | `CONSTITUTION.md` | 项目宪法，所有代码必须遵守 |
 | 🟠 **高** | `features/*.md` | 功能规格，开发时的主要参考 |
 | 🟡 **中** | `core/OVERVIEW.md` | 系统架构概览 |
+| 🟡 **中** | `core/EXECUTION_FLOW.md` | 执行流程与参数 |
 | 🟢 **参考** | `plans/*.md` | 重构计划，了解演进方向 |
 | 🔵 **参考** | `tech/TECH_STACK.md` | 技术选型记录 |
 
@@ -51,6 +53,7 @@ spec/
 ### 核心文档
 - [📜 项目宪法](./CONSTITUTION.md) - 逐级邻位止盈、动态仓位保留等核心原则
 - [🏗️ 系统架构概览](./core/OVERVIEW.md) - 双轨异步驱动、状态机设计
+- [📊 执行流程图](./core/EXECUTION_FLOW.md) - 完整执行流程与配置参数详解
 
 ### 功能规格
 - [🔄 水位生命周期](./features/LEVEL_LIFECYCLE.md) - ACTIVE/RETIRED/DEAD 三态管理
