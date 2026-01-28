@@ -8,6 +8,7 @@
 
 import json
 import time
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -128,9 +129,22 @@ class GridPositionManager:
         # 1. 汇总所有原始价位，统一进行全局去重
         all_raw_levels = support_levels + resistance_levels
         
+        self.logger.info(
+            f"🔍 [Grid] 原始价位数: supports={len(support_levels)}, resistances={len(resistance_levels)}, total={len(all_raw_levels)}"
+        )
+        if all_raw_levels:
+            strengths = [l.strength for l in all_raw_levels]
+            self.logger.info(
+                f"🔍 [Grid] 强度分布: min={min(strengths):.1f}, max={max(strengths):.1f}, avg={sum(strengths)/len(strengths):.1f}"
+            )
+        
         # 过滤强度
         min_strength = self.resistance_config.min_strength
         qualified_levels = [l for l in all_raw_levels if l.strength >= min_strength]
+        
+        self.logger.info(
+            f"🔍 [Grid] 强度过滤 (>={min_strength}): {len(all_raw_levels)} -> {len(qualified_levels)}"
+        )
         
         # 全局去重：相近价位保留强度更高者
         def _deduplicate_all(levels: List[PriceLevel]) -> List[PriceLevel]:
@@ -180,12 +194,18 @@ class GridPositionManager:
 
         # 手动区间过滤
         if self.grid_config.range_mode == "manual" and upper_price > 0 and lower_price > 0:
+            before_filter = (len(strong_supports), len(strong_resistances))
             strong_supports = [
                 s for s in strong_supports if lower_price <= s.price <= upper_price
             ]
             strong_resistances = [
                 r for r in strong_resistances if lower_price <= r.price <= upper_price
             ]
+            self.logger.info(
+                f"🔍 [Grid] 区间过滤 [{lower_price:.2f}, {upper_price:.2f}]: "
+                f"supports {before_filter[0]} -> {len(strong_supports)}, "
+                f"resistances {before_filter[1]} -> {len(strong_resistances)}"
+            )
         
         # 网格底线
         grid_floor = lower_price * (1 - self.grid_config.floor_buffer)
@@ -193,6 +213,14 @@ class GridPositionManager:
         # 生成买入订单
         num_grids = len(strong_supports)
         max_position_usdt = self.position_config.max_position_usdt
+        
+        # 保护：如果没有支撑位，返回 None
+        if num_grids == 0:
+            self.logger.warning(
+                f"❌ [Grid] 区间内没有支撑位！"
+                f"区间=[{lower_price:.2f}, {upper_price:.2f}], 当前价={current_price:.2f}"
+            )
+            return None
 
         if self.position_config.allocation_mode == "weighted":
             total_strength = sum(max(s.strength, 0) for s in strong_supports)
@@ -656,7 +684,8 @@ class GridPositionManager:
             if remaining_sellable <= 0:
                 break
             
-            target_level_id = self.state.level_mapping.get(support_lvl.level_id)
+            # 注意：level_mapping 的键是字符串类型，需要转换
+            target_level_id = self.state.level_mapping.get(str(support_lvl.level_id))
             if not target_level_id:
                 continue
             
@@ -1147,7 +1176,10 @@ class GridPositionManager:
         locked_qty = float(self.state.base_position_locked or 0)
         grid_holdings = max(holdings_btc - locked_qty, 0.0)
         
-        expected = int(round(grid_holdings / base_qty))
+        # 使用 Decimal 精确计算，向下取整避免浮点误差
+        d_holdings = Decimal(str(grid_holdings))
+        d_base = Decimal(str(base_qty))
+        expected = int((d_holdings / d_base).quantize(Decimal('1'), rounding=ROUND_DOWN))
         current = len(self.state.active_inventory)
         
         # 持仓为 0 时清空
@@ -1531,8 +1563,8 @@ class GridPositionManager:
         if sellable_total < exchange_min_qty_btc:
             return []
         
-        # 查找目标阻力位
-        target_level_id = self.state.level_mapping.get(highest_price_lvl.level_id)
+        # 查找目标阻力位（注意：level_mapping 的键是字符串类型）
+        target_level_id = self.state.level_mapping.get(str(highest_price_lvl.level_id))
         if not target_level_id:
             return []
         target_level = self._get_level_by_id(target_level_id)

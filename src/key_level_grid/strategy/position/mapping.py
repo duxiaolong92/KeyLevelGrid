@@ -254,8 +254,8 @@ class LevelMappingManager:
             if remaining_sellable <= 0:
                 break
             
-            # 查找邻位映射
-            target_level_id = state.level_mapping.get(support_lvl.level_id)
+            # 查找邻位映射（注意：level_mapping 的键是字符串类型）
+            target_level_id = state.level_mapping.get(str(support_lvl.level_id))
             if not target_level_id:
                 self.logger.warning(
                     f"⚠️ [SyncMapping] 支撑位 L_{support_lvl.level_id}({support_lvl.price:.2f}) "
@@ -438,8 +438,8 @@ class LevelMappingManager:
             )
             return []
         
-        # 查找目标阻力位
-        target_level_id = state.level_mapping.get(highest_price_lvl.level_id)
+        # 查找目标阻力位（注意：level_mapping 的键是字符串类型）
+        target_level_id = state.level_mapping.get(str(highest_price_lvl.level_id))
         if not target_level_id:
             self.logger.warning(
                 f"⚠️ [Event] 支撑位 L_{highest_price_lvl.level_id} 无邻位映射"
