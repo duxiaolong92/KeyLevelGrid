@@ -2045,7 +2045,7 @@ class KeyLevelTelegramBot:
         resistance = data.get("resistance_levels", [])
         support = data.get("support_levels", [])
         
-        # 获取网格状态中的 fill_counter
+        # 获取网格状态中的 fill_counter（支撑位和阻力位都需要）
         pos_state = getattr(self.strategy, "position_manager", None)
         pos_state = pos_state.state if pos_state else None
         
@@ -2057,9 +2057,17 @@ class KeyLevelTelegramBot:
             if grid_config:
                 max_fill = getattr(grid_config, 'max_fill_per_level', 3)
             
+            # 从支撑位收集 fill_counter
             if pos_state.support_levels_state:
                 for lvl in pos_state.support_levels_state:
                     fill_counter_map[lvl.price] = int(getattr(lvl, "fill_counter", 0) or 0)
+            
+            # 从阻力位也收集 fill_counter（支撑位转换而来的阻力位可能有买入记录）
+            if pos_state.resistance_levels_state:
+                for lvl in pos_state.resistance_levels_state:
+                    fc = int(getattr(lvl, "fill_counter", 0) or 0)
+                    if fc > 0:  # 只记录有买入的
+                        fill_counter_map[lvl.price] = fc
         
         # 应用 min_strength 过滤
         resistance_config = getattr(self.strategy.config, "resistance_config", None)
@@ -2076,15 +2084,17 @@ class KeyLevelTelegramBot:
 现价: {current_price:,.4f}
 
 🔴 <b>阻力位</b>
-价格        距离    评分
-──────────────────────"""
+价格        距离    评分   持仓
+────────────────────────────"""
         
         if resistance:
             for r in resistance:
                 r_price = r.get("price", 0)
                 strength = int(r.get("strength", 0))
                 pct = ((r_price - current_price) / current_price * 100) if current_price > 0 else 0
-                text += f"\n{r_price:<10.4f} {pct:>+5.1f}%   {strength:>3}"
+                fill_count = fill_counter_map.get(r_price, r.get("fill_counter", 0))
+                fill_count = int(fill_count) if fill_count else 0
+                text += f"\n{r_price:<10.4f} {pct:>+5.1f}%   {strength:>3}   {fill_count}/{max_fill}"
         else:
             text += "\n无阻力位数据"
         
