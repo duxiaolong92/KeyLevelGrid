@@ -77,7 +77,8 @@ class LevelMappingManager:
                     break
             
             if target_level:
-                mapping[support_lvl.level_id] = target_level.level_id
+                # 使用字符串键，与 JSON 序列化保持一致
+                mapping[str(support_lvl.level_id)] = target_level.level_id
                 self.logger.debug(
                     f"📍 映射: L_{support_lvl.level_id}({support_lvl.price:.2f}) → L_{target_level.level_id}({target_level.price:.2f})"
                 )

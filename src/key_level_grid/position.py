@@ -532,7 +532,8 @@ class GridPositionManager:
                     break
             
             if target_level:
-                mapping[level.level_id] = target_level.level_id
+                # 使用字符串键，与 JSON 序列化保持一致
+                mapping[str(level.level_id)] = target_level.level_id
                 self.logger.debug(
                     f"📍 映射: L_{level.level_id}({level.price:.2f}) → "
                     f"L_{target_level.level_id}({target_level.price:.2f})"
@@ -1875,10 +1876,8 @@ class GridPositionManager:
                 settled_inventory=[
                     ActiveFill.from_dict(f) for f in grid_data.get("settled_inventory", [])
                 ],
-                # JSON 的键总是字符串，需要转换为整数
-                level_mapping={
-                    int(k): v for k, v in grid_data.get("level_mapping", {}).items()
-                },
+                # JSON 的键总是字符串，保持字符串类型以便统一查找
+                level_mapping=grid_data.get("level_mapping", {}),
                 per_grid_contracts=grid_data.get("per_grid_contracts", 0),
                 contract_size=grid_data.get("contract_size", 0.0001),
                 num_grids=grid_data.get("num_grids", 0),
