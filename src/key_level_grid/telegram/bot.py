@@ -82,6 +82,9 @@ class KeyLevelTelegramBot:
         # 待确认的信号
         self._pending_confirmations: Dict[str, dict] = {}
         
+        # 缓存 base 币种符号
+        self._base_symbol_cache: str = ""
+        
         # 回调处理器
         self._on_confirm: Optional[Callable] = None
         self._on_reject: Optional[Callable] = None
@@ -92,6 +95,24 @@ class KeyLevelTelegramBot:
     def set_strategy(self, strategy: "KeyLevelGridStrategy") -> None:
         """设置策略引用"""
         self.strategy = strategy
+        self._base_symbol_cache = ""  # 清除缓存
+    
+    def _get_base_symbol(self) -> str:
+        """获取 base 币种符号（如 XAGUSDT -> XAG）"""
+        if self._base_symbol_cache:
+            return self._base_symbol_cache
+        
+        if not self.strategy:
+            return "BTC"
+        
+        symbol = self.strategy.config.symbol.upper()
+        for suffix in ["USDT", "USD", "BUSD", "USDC"]:
+            if symbol.endswith(suffix):
+                self._base_symbol_cache = symbol[:-len(suffix)]
+                return self._base_symbol_cache
+        
+        self._base_symbol_cache = symbol
+        return self._base_symbol_cache
     
     async def start(self) -> None:
         """启动 Bot"""
@@ -157,7 +178,8 @@ class KeyLevelTelegramBot:
     def _get_main_menu(self) -> ReplyKeyboardMarkup:
         """获取主菜单键盘"""
         keyboard = [
-            [KeyboardButton("📊 实时监控"), KeyboardButton("🚨 紧急全平")],
+            [KeyboardButton("📊 挂单"), KeyboardButton("📈 持仓"), KeyboardButton("💰 账户")],
+            [KeyboardButton("🎯 价位"), KeyboardButton("⚠️ 全平")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -654,12 +676,25 @@ class KeyLevelTelegramBot:
         """处理 /start 命令"""
         user = update.effective_user
         self.logger.info(f"收到 /start 命令，用户: {user.id} ({user.username})")
-        await self._send_home_dashboard(update)
+        # 发送欢迎消息和底部菜单
+        symbol = self._get_base_symbol()
+        text = f"🚀 <b>Key Level Grid</b> | {symbol}\n\n请使用底部菜单查看信息"
+        await update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=self._get_main_menu()
+        )
         self.logger.info("已发送主菜单")
 
     async def _cmd_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理 /menu 命令"""
-        await self._send_home_dashboard(update)
+        symbol = self._get_base_symbol()
+        text = f"🚀 <b>Key Level Grid</b> | {symbol}\n\n请使用底部菜单查看信息"
+        await update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=self._get_main_menu()
+        )
     
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理 /help 命令"""
@@ -705,7 +740,7 @@ class KeyLevelTelegramBot:
             f"保证金模式: {margin_mode} | 杠杆: {leverage}x\n\n"
             f"账户权益: {equity:,.2f} USDT\n"
             f"可用余额: {available:,.2f} USDT\n\n"
-            f"持仓数量: {qty:.6f} BTC\n"
+            f"持仓数量: {qty:.6f} {self._get_base_symbol()}\n"
             f"持仓均价: ${avg_price:,.2f}\n"
             f"未实现盈亏: {pnl:+,.2f} USDT\n\n"
             f"风险预警: 止损触发价 ${sl_trigger:,.2f}"
@@ -764,7 +799,7 @@ class KeyLevelTelegramBot:
             # 持仓量
             if value_usdt <= 0 and avg_price > 0:
                 value_usdt = qty_btc * avg_price
-            lines.append(f"持仓量: {qty_btc:.4f} BTC (≈ ${value_usdt:,.2f} USDT)")
+            lines.append(f"持仓量: {qty_btc:.4f} {self._get_base_symbol()} (≈ ${value_usdt:,.2f} USDT)")
             
             # 均本和盈亏
             pnl_pct = (unrealized_pnl / value_usdt * 100) if value_usdt > 0 else 0
@@ -793,10 +828,10 @@ class KeyLevelTelegramBot:
                 price = float(o.get("price", 0) or 0)
                 # 获取数量（优先使用 contracts，否则用 base_amount）
                 qty_contracts = float(o.get("contracts", 0) or o.get("base_amount", 0) or 0)
-                qty_btc = qty_contracts * contract_size if qty_contracts > 10 else qty_contracts  # 判断是张数还是BTC
-                qty_usdt = qty_btc * price
+                qty_base = qty_contracts * contract_size if qty_contracts > 10 else qty_contracts  # 判断是张数还是币数
+                qty_usdt = qty_base * price
                 pct = ((price - current_price) / current_price * 100) if current_price > 0 else 0
-                lines.append(f"${price:,.2f} | {pct:+.2f}% | {qty_btc:.4f} BTC (≈ ${qty_usdt:,.0f} USDT)")
+                lines.append(f"${price:,.2f} | {pct:+.2f}% | {qty_base:.4f} {self._get_base_symbol()} (≈ ${qty_usdt:,.0f} USDT)")
         else:
             lines.append("- 无")
         
@@ -807,10 +842,10 @@ class KeyLevelTelegramBot:
             for o in sorted(buy_orders, key=lambda x: -x.get("price", 0)):
                 price = float(o.get("price", 0) or 0)
                 qty_contracts = float(o.get("contracts", 0) or o.get("base_amount", 0) or 0)
-                qty_btc = qty_contracts * contract_size if qty_contracts > 10 else qty_contracts
-                qty_usdt = qty_btc * price
+                qty_base = qty_contracts * contract_size if qty_contracts > 10 else qty_contracts
+                qty_usdt = qty_base * price
                 pct = ((price - current_price) / current_price * 100) if current_price > 0 else 0
-                lines.append(f"${price:,.2f} | {pct:+.2f}% | {qty_btc:.4f} BTC (≈ ${qty_usdt:,.0f} USDT)")
+                lines.append(f"${price:,.2f} | {pct:+.2f}% | {qty_base:.4f} {self._get_base_symbol()} (≈ ${qty_usdt:,.0f} USDT)")
         else:
             lines.append("- 无")
         
@@ -818,9 +853,9 @@ class KeyLevelTelegramBot:
         lines.append("")
         lines.append("🛑 <b>全部止损订单 (Stop Loss)</b>")
         if stop_loss_price > 0 and stop_loss_contracts > 0:
-            sl_qty_btc = stop_loss_contracts * contract_size
+            sl_qty_base = stop_loss_contracts * contract_size
             sl_pct = ((stop_loss_price - current_price) / current_price * 100) if current_price > 0 else 0
-            lines.append(f"${stop_loss_price:,.2f} | {sl_pct:+.2f}% | {sl_qty_btc:.4f} BTC")
+            lines.append(f"${stop_loss_price:,.2f} | {sl_pct:+.2f}% | {sl_qty_base:.4f} {self._get_base_symbol()}")
         else:
             lines.append("- 无")
         
@@ -839,7 +874,7 @@ class KeyLevelTelegramBot:
         return (
             "⚙️ <b>策略设置</b>\n\n"
             f"网格区间: {grid_cfg.manual_lower:.2f} - {grid_cfg.manual_upper:.2f}\n"
-            f"底仓保留: {grid_cfg.base_position_locked:.6f} BTC\n"
+            f"底仓保留: {grid_cfg.base_position_locked:.6f} {self._get_base_symbol()}\n"
             f"全局止损: {sl_pct:.2%}\n"
             f"保证金模式: {self.strategy.config.margin_mode} | 杠杆: {self.strategy.config.leverage}x"
         )
@@ -974,7 +1009,7 @@ class KeyLevelTelegramBot:
 💼 <b>当前持仓</b>
 
 ├ 方向: {dir_emoji} {direction.upper()}
-├ 数量: {qty:.6f} BTC (由合约张数换算)
+├ 数量: {qty:.6f} {self._get_base_symbol()} (由合约张数换算)
 ├ 价值: {value:,.2f} USDT
 ├ 均价: ${entry_price:,.2f}
 ├ 当前价: ${current_price:,.2f}
@@ -1103,6 +1138,13 @@ class KeyLevelTelegramBot:
                 }
                 for lvl in pos_state.resistance_levels_state
             ]
+        
+        # 应用 min_strength 过滤
+        resistance_config = getattr(self.strategy.config, "resistance_config", None)
+        min_strength = getattr(resistance_config, "min_strength", 0) if resistance_config else 0
+        if min_strength > 0:
+            support = [s for s in support if s.get("strength", 0) >= min_strength]
+            resistance = [r for r in resistance if r.get("strength", 0) >= min_strength]
         
         text = self._format_levels_text(
             symbol="当前标的",
@@ -1274,7 +1316,7 @@ class KeyLevelTelegramBot:
                         "type": r.level_type.value if hasattr(r.level_type, 'value') else str(r.level_type),
                     }
                     for r in resistances if r.strength >= min_strength
-                ][:10]
+                ]  # 显示全部，不再限制 10 条
                 
                 support_list = [
                     {
@@ -1283,7 +1325,7 @@ class KeyLevelTelegramBot:
                         "type": s.level_type.value if hasattr(s.level_type, 'value') else str(s.level_type),
                     }
                     for s in supports if s.strength >= min_strength
-                ][:10]
+                ]  # 显示全部，不再限制 10 条
                 
                 # 如果有足够的结果，使用当前阈值
                 if len(resistance_list) >= 3 or len(support_list) >= 3:
@@ -1380,10 +1422,10 @@ class KeyLevelTelegramBot:
             except (TypeError, ValueError):
                 return "-"
         
-        # 阻力位按价格降序排列
-        resistance = sorted(resistance, key=lambda x: -x.get("price", 0))[:10]
-        # 支撑位按价格降序排列
-        support = sorted(support, key=lambda x: -x.get("price", 0))[:10]
+        # 阻力位按价格降序排列（显示全部）
+        resistance = sorted(resistance, key=lambda x: -x.get("price", 0))
+        # 支撑位按价格降序排列（显示全部）
+        support = sorted(support, key=lambda x: -x.get("price", 0))
         
         tf_str = f"（{' + '.join(timeframes)}）" if timeframes else ""
         text = f"📍 <b>{symbol} 关键价位</b>{tf_str}\n\n当前价: ${price:,.2f}\n\n"
@@ -1491,7 +1533,7 @@ class KeyLevelTelegramBot:
         
         # 菜单按钮列表（点击这些按钮时清除等待状态）
         menu_buttons = [
-            "📊 实时监控", "🚨 紧急全平"
+            "📊 挂单", "📈 持仓", "💰 账户", "🎯 价位", "⚠️ 全平"
         ]
         
         try:
@@ -1501,18 +1543,16 @@ class KeyLevelTelegramBot:
                     del self._user_states[user_id]
             
             # 处理菜单按钮
-            if text == "📊 实时监控":
-                await self._send_monitoring(update)
-            # elif text == "⚙️ 策略设置":
-            #     await self._send_settings(update)
-            # elif text == "🛠 系统运维":
-            #     await self._send_ops(update)
-            elif text == "🚨 紧急全平":
-                await update.message.reply_text(
-                    "🚨 <b>紧急全平</b>\n\n确认将立即平仓所有头寸并撤销所有挂单？",
-                    parse_mode="HTML",
-                    reply_markup=self._get_emergency_keyboard(),
-                )
+            if text == "📊 挂单":
+                await self._send_orders_v2(update)
+            elif text == "📈 持仓":
+                await self._send_position_v2(update)
+            elif text == "💰 账户":
+                await self._send_account_v2(update)
+            elif text == "🎯 价位":
+                await self._send_levels_v2(update)
+            elif text == "⚠️ 全平":
+                await self._send_emergency_confirm(update)
             elif text == "❓ 帮助":
                 await self._cmd_help(update, context)
             else:
@@ -1781,3 +1821,332 @@ class KeyLevelTelegramBot:
             reply_markup=reply_markup
         )
 
+    # ========================================
+    # 新版菜单命令 (v2)
+    # ========================================
+
+    async def _send_orders_v2(self, update: Update) -> None:
+        """发送当前挂单信息 (v2 格式)"""
+        if not self.strategy:
+            await update.message.reply_text("❌ 策略未连接")
+            return
+        
+        # 强制刷新挂单数据，确保显示最新状态
+        if hasattr(self.strategy, "_update_gate_orders"):
+            try:
+                await self.strategy._update_gate_orders()
+            except Exception as e:
+                self.logger.warning(f"刷新挂单数据失败: {e}")
+        
+        data = self.strategy.get_display_data()
+        pending_orders = data.get("pending_orders", [])
+        symbol = self._get_base_symbol()
+        
+        if not pending_orders:
+            await update.message.reply_text(f"📊 当前挂单 | {symbol}\n\n📭 暂无挂单")
+            return
+        
+        # 获取策略运行时的合约大小（从交易所获取，更准确）
+        runtime_contract_size = getattr(self.strategy, "_contract_size", 0)
+        # 回退到配置中的默认值
+        config_contract_size = getattr(self.strategy.config, "default_contract_size", 1)
+        contract_size = runtime_contract_size if runtime_contract_size > 0 else config_contract_size
+        if contract_size <= 0:
+            contract_size = 1
+        
+        # 获取配置中的 base_amount_per_grid (币数量)
+        grid_config = getattr(self.strategy.config, "grid_config", None)
+        base_amount_per_grid = getattr(grid_config, "base_amount_per_grid", 0) if grid_config else 0
+        
+        # 分类买单和卖单
+        buy_orders = [o for o in pending_orders if o.get("side") == "buy"]
+        sell_orders = [o for o in pending_orders if o.get("side") == "sell"]
+        
+        text = f"📊 <b>当前挂单</b> | {symbol}\n"
+        
+        total_value = 0
+        
+        def calc_contracts_and_value(order):
+            """计算订单的张数和 USDT 价值"""
+            price = order.get("price", 0)
+            
+            # 优先使用 raw_contracts（原始张数，来自交易所）
+            raw_contracts = order.get("raw_contracts", 0)
+            if raw_contracts > 0:
+                num_contracts = int(raw_contracts)
+                coin_qty = raw_contracts * contract_size
+            else:
+                # 回退：使用 contracts 字段（币数量），计算张数
+                coin_qty = order.get("contracts", 0) or base_amount_per_grid
+                num_contracts = int(coin_qty / contract_size) if contract_size > 0 else 0
+            
+            value = coin_qty * price  # USDT 价值 = 币数量 × 价格
+            return num_contracts, value
+        
+        # 卖单在上，按价格降序
+        if sell_orders:
+            text += f"\n🔴 <b>卖单</b> ({len(sell_orders)}档)\n"
+            sell_orders_sorted = sorted(sell_orders, key=lambda x: -x.get("price", 0))
+            for i, order in enumerate(sell_orders_sorted):
+                price = order.get("price", 0)
+                num_contracts, value = calc_contracts_and_value(order)
+                total_value += value
+                prefix = "└" if i == len(sell_orders_sorted) - 1 else "├"
+                text += f"{prefix} {price:,.4f}  × {num_contracts}张  ≈ {value:.1f}U\n"
+        
+        # 买单在下，按价格降序
+        if buy_orders:
+            text += f"\n🟢 <b>买单</b> ({len(buy_orders)}档)\n"
+            buy_orders_sorted = sorted(buy_orders, key=lambda x: -x.get("price", 0))
+            for i, order in enumerate(buy_orders_sorted):
+                price = order.get("price", 0)
+                num_contracts, value = calc_contracts_and_value(order)
+                total_value += value
+                prefix = "└" if i == len(buy_orders_sorted) - 1 else "├"
+                text += f"{prefix} {price:,.4f}  × {num_contracts}张  ≈ {value:.1f}U\n"
+        
+        text += f"\n共 {len(pending_orders)} 档 | 挂单金额 {total_value:.1f}U"
+        
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    async def _send_position_v2(self, update: Update) -> None:
+        """发送当前持仓信息 (v2 格式)"""
+        if not self.strategy:
+            await update.message.reply_text("❌ 策略未连接")
+            return
+        
+        data = self.strategy.get_display_data()
+        position = data.get("position", {})
+        symbol = self._get_base_symbol()
+        
+        # 检查是否有持仓
+        value = position.get("value", 0)
+        qty = position.get("qty", 0)
+        if not position or (value <= 0 and qty <= 0):
+            await update.message.reply_text(f"📈 当前持仓 | {symbol}\n\n📭 暂无持仓")
+            return
+        
+        # 获取数据
+        direction = position.get("side", "long")
+        dir_emoji = "🟢 做多" if direction == "long" else "🔴 做空"
+        entry_price = position.get("avg_entry_price", 0)
+        
+        price_obj = data.get("price", {})
+        current_price = price_obj.get("current", 0) if isinstance(price_obj, dict) else 0
+        
+        # 计算盈亏
+        pnl = position.get("unrealized_pnl", 0)
+        if entry_price > 0 and current_price > 0:
+            pnl_pct = (current_price - entry_price) / entry_price if direction == "long" else (entry_price - current_price) / entry_price
+        else:
+            pnl_pct = 0
+        
+        # 已实现盈亏（从 settled_inventory 计算）
+        settled = data.get("settled_inventory", [])
+        realized_pnl = sum(t.get("pnl", 0) for t in settled) if settled else 0
+        total_pnl = pnl + realized_pnl
+        
+        # 网格底线
+        grid_floor = position.get("grid_floor", 0)
+        grid_config = getattr(self.strategy.position_manager, 'grid_config', None)
+        if grid_config and grid_config.range_mode == "manual" and grid_config.manual_lower > 0:
+            grid_floor = grid_config.manual_lower
+        
+        # 距底线百分比
+        floor_pct = (current_price - grid_floor) / current_price * 100 if current_price > 0 and grid_floor > 0 else 0
+        floor_dist = current_price - grid_floor if grid_floor > 0 else 0
+        
+        # 合约张数 - 优先使用 raw_contracts（原始张数），否则计算
+        raw_contracts = position.get("raw_contracts", 0)
+        if raw_contracts > 0:
+            contracts = int(raw_contracts)
+        else:
+            # 回退：使用运行时 contract_size 或配置值
+            runtime_contract_size = getattr(self.strategy, "_contract_size", 0)
+            config_contract_size = getattr(self.strategy.config, "default_contract_size", 1)
+            contract_size = runtime_contract_size if runtime_contract_size > 0 else config_contract_size
+            if contract_size <= 0:
+                contract_size = 1
+            contracts = int(qty / contract_size) if contract_size > 0 else 0
+        
+        text = f"""📈 <b>当前持仓</b> | {symbol}
+
+方向: {dir_emoji}
+数量: {contracts}张 ({qty:.4f} {symbol})
+均价: {entry_price:,.4f}
+现价: {current_price:,.4f} ({pnl_pct:+.2%})
+
+💵 <b>盈亏</b>
+├ 浮盈: {pnl:+,.2f}U ({pnl_pct:+.2%})
+├ 已实现: {realized_pnl:+,.2f}U
+└ 总盈亏: {total_pnl:+,.2f}U
+
+📐 <b>风控</b>
+├ 网格底线: {grid_floor:,.4f} ({-floor_pct:.1f}%)
+└ 距底线: {floor_dist:,.4f}"""
+        
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    async def _send_account_v2(self, update: Update) -> None:
+        """发送账户信息 (v2 格式)"""
+        if not self.strategy:
+            await update.message.reply_text("❌ 策略未连接")
+            return
+        
+        data = self.strategy.get_display_data()
+        account = data.get("account", {})
+        symbol = self._get_base_symbol()
+        
+        # 资金信息
+        equity = account.get("total_balance", 0)
+        available = account.get("available", 0)
+        used = equity - available if equity > available else 0
+        used_pct = (used / equity * 100) if equity > 0 else 0
+        frozen = account.get("frozen", 0)
+        
+        # 杠杆信息
+        leverage = getattr(self.strategy.config, "leverage", 10)
+        margin_mode = getattr(self.strategy.config, "margin_mode", "isolated")
+        margin_mode_cn = "逐仓" if margin_mode == "isolated" else "全仓"
+        
+        # 保证金率（从持仓计算）
+        position = data.get("position", {})
+        position_value = position.get("value", 0)
+        margin = position_value / leverage if leverage > 0 else 0
+        margin_ratio = (equity / margin * 100) if margin > 0 else 0
+        
+        text = f"""💰 <b>账户信息</b> | {symbol}
+
+💵 <b>资金</b>
+├ 总权益: {equity:,.2f}U
+├ 可用: {available:,.2f}U
+├ 已用: {used:,.2f}U ({used_pct:.1f}%)
+└ 冻结: {frozen:,.2f}U
+
+📊 <b>杠杆</b>
+├ 倍数: {leverage}x ({margin_mode_cn})
+├ 保证金: {margin:,.2f}U
+└ 保证金率: {margin_ratio:.0f}%"""
+        
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    async def _send_levels_v2(self, update: Update) -> None:
+        """发送关键价位信息 (v2 格式)"""
+        if not self.strategy:
+            await update.message.reply_text("❌ 策略未连接")
+            return
+        
+        data = self.strategy.get_display_data()
+        symbol = self._get_base_symbol()
+        
+        price_obj = data.get("price", {})
+        current_price = price_obj.get("current", 0) if isinstance(price_obj, dict) else 0
+        
+        resistance = data.get("resistance_levels", [])
+        support = data.get("support_levels", [])
+        
+        # 获取网格状态中的 fill_counter
+        pos_state = getattr(self.strategy, "position_manager", None)
+        pos_state = pos_state.state if pos_state else None
+        
+        fill_counter_map = {}
+        max_fill = 3  # 默认最大买入次数
+        
+        if pos_state:
+            grid_config = getattr(self.strategy.position_manager, 'grid_config', None)
+            if grid_config:
+                max_fill = getattr(grid_config, 'max_fill_per_level', 3)
+            
+            if pos_state.support_levels_state:
+                for lvl in pos_state.support_levels_state:
+                    fill_counter_map[lvl.price] = int(getattr(lvl, "fill_counter", 0) or 0)
+        
+        # 应用 min_strength 过滤
+        resistance_config = getattr(self.strategy.config, "resistance_config", None)
+        min_strength = getattr(resistance_config, "min_strength", 0) if resistance_config else 0
+        if min_strength > 0:
+            support = [s for s in support if s.get("strength", 0) >= min_strength]
+            resistance = [r for r in resistance if r.get("strength", 0) >= min_strength]
+        
+        # 按价格排序（显示全部价位）
+        resistance = sorted(resistance, key=lambda x: -x.get("price", 0))
+        support = sorted(support, key=lambda x: -x.get("price", 0))
+        
+        text = f"""🎯 <b>关键价位</b> | {symbol}
+现价: {current_price:,.4f}
+
+🔴 <b>阻力位</b>
+价格        距离    评分
+──────────────────────"""
+        
+        if resistance:
+            for r in resistance:
+                r_price = r.get("price", 0)
+                strength = int(r.get("strength", 0))
+                pct = ((r_price - current_price) / current_price * 100) if current_price > 0 else 0
+                text += f"\n{r_price:<10.4f} {pct:>+5.1f}%   {strength:>3}"
+        else:
+            text += "\n无阻力位数据"
+        
+        text += f"""
+
+🟢 <b>支撑位</b>
+价格        距离    评分   买入
+────────────────────────────"""
+        
+        if support:
+            for s in support:
+                s_price = s.get("price", 0)
+                strength = int(s.get("strength", 0))
+                pct = ((s_price - current_price) / current_price * 100) if current_price > 0 else 0
+                fill_count = fill_counter_map.get(s_price, s.get("fill_counter", 0))
+                fill_count = int(fill_count) if fill_count else 0
+                text += f"\n{s_price:<10.4f} {pct:>+5.1f}%   {strength:>3}   {fill_count}/{max_fill}"
+        else:
+            text += "\n无支撑位数据"
+        
+        text += f"\n\n📊 支撑 {len(support)}档 | 阻力 {len(resistance)}档"
+        
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    async def _send_emergency_confirm(self, update: Update) -> None:
+        """发送紧急全平确认信息"""
+        if not self.strategy:
+            await update.message.reply_text("❌ 策略未连接")
+            return
+        
+        data = self.strategy.get_display_data()
+        symbol = self._get_base_symbol()
+        position = data.get("position", {})
+        pending_orders = data.get("pending_orders", [])
+        
+        qty = position.get("qty", 0)
+        direction = position.get("side", "long")
+        dir_cn = "做多" if direction == "long" else "做空"
+        
+        price_obj = data.get("price", {})
+        current_price = price_obj.get("current", 0) if isinstance(price_obj, dict) else 0
+        
+        pnl = position.get("unrealized_pnl", 0)
+        
+        contract_size = getattr(self.strategy.config, "default_contract_size", 1)
+        contracts = int(qty / contract_size) if contract_size > 0 else 0
+        
+        text = f"""⚠️ <b>紧急全平确认</b> | {symbol}
+
+即将平仓:
+├ 方向: {dir_cn}
+├ 数量: {contracts}张 ({qty:.4f} {symbol})
+├ 现价: {current_price:,.4f}
+└ 预计盈亏: {pnl:+,.2f}U
+
+⚠️ 此操作将:
+• 撤销所有挂单 ({len(pending_orders)}档)
+• 市价平掉全部持仓
+• 停止网格策略"""
+        
+        await update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=self._get_emergency_keyboard()
+        )
